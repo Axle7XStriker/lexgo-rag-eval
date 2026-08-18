@@ -50,3 +50,14 @@ data/interim/
 # Logs
 *.log
 logs/
+
+# uv
+.uv-cache/
+uv.lock.bak
+
+# Ruff
+.ruff_cache/
+
+# Eval run artifacts (results, per-run llm_calls snapshots, summaries)
+evals/runs/*
+!evals/runs/.gitkeep

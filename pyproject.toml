@@ -1,0 +1,41 @@
+[project]
+name = "lexgo-rag-eval"
+version = "0.1.0"
+description = "Rigorously-evaluated multi-source RAG over MIT 6.006 (Algorithms) + MIT 6.830 (Databases). 4 pipelines, 100 golden Q&As, honest numbers."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [{ name = "Aman Bansal" }]
+
+dependencies = [
+    "streamlit>=1.40",
+    "anthropic>=0.40",
+    "voyageai>=0.3",
+    "cohere>=5.13",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "python-dotenv>=1.0",
+    "structlog>=24.4",
+    "tenacity>=9.0",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.8",
+]
+
+[tool.uv]
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+pythonpath = ["."]

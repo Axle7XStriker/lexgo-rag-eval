@@ -27,7 +27,20 @@
 
 ## Reproduce
 
-*Setup + run instructions land as the pipeline stabilizes.*
+Requires Python 3.12 and [uv](https://docs.astral.sh/uv/). Postgres+pgvector is only needed once the retrieval pipeline lands in W3.
+
+```bash
+git clone https://github.com/Axle7XStriker/lexgo-rag-eval.git
+cd lexgo-rag-eval
+
+cp .env.example .env         # then fill in ANTHROPIC_API_KEY, VOYAGE_API_KEY, COHERE_API_KEY
+
+make setup                   # uv sync — creates .venv, installs pinned deps
+make app                     # streamlit run app.py
+make eval                    # run the eval loop (W3)
+```
+
+`make help` lists all targets.
 
 ---
 
