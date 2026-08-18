@@ -1,9 +1,7 @@
 """Configuration loaded from environment (.env in dev, real env in prod-ish).
 
 Strict validation at startup — a missing required key raises before Streamlit
-serves a request. Model IDs are overridable via env; defaults match CLAUDE.md's
-declared stack and should be re-verified against the provider SDKs before the
-first real API call.
+serves a request. Model IDs are overridable via env.
 """
 
 from functools import lru_cache
@@ -27,11 +25,13 @@ class Settings(BaseSettings):
     voyage_api_key: SecretStr = Field(..., description="Voyage AI API key (embeddings).")
     cohere_api_key: SecretStr = Field(..., description="Cohere API key (rerank).")
 
+    # TODO(#3): wire this into a Postgres+pgvector connection helper.
     database_url: str = Field(
         default="postgresql://localhost:5432/lexgo",
-        description="Postgres+pgvector connection string. Unused until W3 pipeline lands.",
+        description="Postgres+pgvector connection string.",
     )
 
+    # TODO(#2): verify these IDs against the provider SDKs at first API call.
     chat_model: str = "claude-sonnet-4-6"
     judge_model: str = "claude-sonnet-4-6"
     embedding_model: str = "voyage-3-large"

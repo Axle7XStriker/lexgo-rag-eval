@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup app eval test lint fmt clean
+.PHONY: help setup app eval test lint format clean
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -21,7 +21,7 @@ lint: ## Ruff check + format check
 	uv run ruff check .
 	uv run ruff format --check .
 
-fmt: ## Ruff auto-format
+format: ## Ruff auto-format
 	uv run ruff format .
 	uv run ruff check --fix .
 

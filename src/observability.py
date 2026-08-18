@@ -4,10 +4,9 @@ Two responsibilities:
 1. Configure structlog for JSON logs to stderr (correlation IDs propagated via
    contextvars).
 2. Provide `log_llm_call` — appends a single JSON record per LLM call to
-   logs/llm_calls.jsonl. Cost visibility is a story element for the blog post
-   per CLAUDE.md, so this is load-bearing infra, not an add-on.
-
-Named `observability` (not `logging`) to avoid shadowing the stdlib module.
+   logs/llm_calls.jsonl. Every eval number depends on knowing which calls
+   produced it, so per-call provenance is load-bearing infra, not an add-on;
+   token + cost accounting comes along for the ride.
 """
 
 import json
@@ -63,7 +62,9 @@ def log_llm_call(
     write — no batching, no async. If the log dir doesn't exist, creates it.
     """
     log_path.parent.mkdir(parents=True, exist_ok=True)
+    # Canonical fields listed last so they win any key collision with `extra`.
     record: dict[str, Any] = {
+        **(extra or {}),
         "ts": datetime.now(UTC).isoformat(),
         "provider": provider,
         "model": model,
@@ -75,7 +76,5 @@ def log_llm_call(
         "run_id": run_id,
         "prompt_version": prompt_version,
     }
-    if extra:
-        record["extra"] = extra
     with log_path.open("a") as f:
         f.write(json.dumps(record) + "\n")
