@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup app eval test lint format clean
+.PHONY: help setup app corpus validate eval test lint format clean
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -7,8 +7,14 @@ help: ## Show available targets
 setup: ## Install deps (creates .venv via uv)
 	uv sync
 
-app: ## Run the Streamlit demo
+app: ## Run the Streamlit app (Demo + Author pages)
 	uv run streamlit run app.py
+
+corpus: ## Download MIT OCW PDFs into corpus/ (idempotent)
+	uv run python -m scripts.fetch_corpus
+
+validate: ## Lint the golden Q&A set (evals/golden/qa.jsonl)
+	uv run python -m evals.validate_golden
 
 eval: ## Run the eval loop (lands W3)
 	@echo "Eval loop lands in W3 — see evals/README.md for planned layout."

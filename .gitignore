@@ -61,3 +61,6 @@ uv.lock.bak
 # Eval run artifacts (results, per-run llm_calls snapshots, summaries)
 evals/runs/*
 !evals/runs/.gitkeep
+
+# Corpus PDFs (downloaded via scripts/fetch_corpus.py — reproducible, not source)
+corpus/
