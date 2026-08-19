@@ -67,6 +67,12 @@ report = validate_golden(QA_PATH)
 
 # ── Progress dashboard ─────────────────────────────────────────────
 def render_progress_dashboard() -> None:
+    """Render 6 tiles (5 QAType + 1 total) with st.metric + st.progress.
+
+    Each tile shows `<count> / <target>`, a signed delta (e.g. `+2`, `-3`,
+    or `on target`), and a proportional progress bar clamped to [0, 1].
+    Reads from the outer `report` closure so callers don't need to pass it.
+    """
     cols = st.columns(len(TARGET_DISTRIBUTION) + 1)
     for i, (qa_type, target) in enumerate(TARGET_DISTRIBUTION.items()):
         count = report.counts.get(qa_type, 0)
@@ -108,6 +114,8 @@ st.divider()
 
 # ── Helpers ────────────────────────────────────────────────────────
 def _empty_citation_row() -> dict[str, Any]:
+    """Seed row for the citation editor. Uses the first manifest path as the
+    default doc_path selection so the dropdown always renders a valid value."""
     return {"doc_path": CORPUS_DOC_PATHS[0], "page_or_section": "", "quote": ""}
 
 
@@ -173,8 +181,7 @@ def _build_record(
         )
         for row in kept
     ]
-    # Sources are auto-derived from each citation's doc_path prefix.
-    derived_sources = sorted({c.source_id for c in citations}, key=lambda s: s.value)
+    # `sources` on QARecord is a derived @cached_property computed from citations.
     now = datetime.now(UTC)
     return QARecord(
         id=id_,
@@ -182,7 +189,6 @@ def _build_record(
         question=question.strip(),
         gold_answer=gold_answer.strip(),
         gold_citations=citations,
-        sources=derived_sources,
         notes=(notes.strip() or None) if notes else None,
         created_at=created_at or now,
         updated_at=now,
@@ -190,6 +196,12 @@ def _build_record(
 
 
 def _save_and_rerun(new_records: list[QARecord], msg: str) -> None:
+    """Atomic-rewrite qa.jsonl and force a Streamlit rerun.
+
+    The canonical write path used by add / edit / delete — keeping one code
+    path means every mutation gets the same crash-safety guarantees and the
+    same dashboard-refresh behavior.
+    """
     save_jsonl_atomic(QA_PATH, new_records)
     st.success(msg)
     st.rerun()

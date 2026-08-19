@@ -30,7 +30,6 @@ def _factual(id_: str, doc_path: str) -> QARecord:
             "recursively splits the input in half and merges in linear time."
         ),
         gold_citations=[Citation(doc_path=doc_path, page_or_section="slide 12")],
-        sources=[Citation(doc_path=doc_path, page_or_section="x").source_id],
     )
 
 

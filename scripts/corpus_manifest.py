@@ -19,7 +19,8 @@ for papers that lack a reliably-open host (R*-Tree in particular).
 from dataclasses import dataclass
 from typing import Literal
 
-SourceIdLiteral = Literal["A1", "A2", "A3", "B1", "B2", "B3"]
+from src.qa_schema import SourceId
+
 KindLiteral = Literal["ocw_resource_page", "direct_pdf"]
 
 OCW_006_BASE = "https://ocw.mit.edu/courses/6-006-introduction-to-algorithms-fall-2011/resources"
@@ -28,7 +29,24 @@ OCW_830_BASE = "https://ocw.mit.edu/courses/6-830-database-systems-fall-2010/res
 
 @dataclass(frozen=True)
 class ManifestEntry:
-    source_id: SourceIdLiteral
+    """One corpus PDF as tracked by the fetcher.
+
+    Fields:
+      source_id: which of the 6 buckets this PDF belongs to (SourceId enum,
+        shared with src/qa_schema.py — single source of truth).
+      description: human-readable label for logs / error messages.
+      kind: "ocw_resource_page" means the URL is an OCW landing page whose
+        HTML must be parsed to find the actual PDF href; "direct_pdf" means
+        the URL points at the PDF bytes directly.
+      urls: fallback list — the fetcher tries them in order and takes the
+        first that returns a valid PDF (magic bytes %PDF).
+      dest_path: where to store it under corpus/, relative. Filenames start
+        with the source_id (e.g. A1_lec03.pdf) so `ls` groups by bucket.
+      optional: if True, a full-list failure is logged but does not fail
+        the run (used for papers with no reliably-open host).
+    """
+
+    source_id: SourceId
     description: str
     kind: KindLiteral
     urls: tuple[str, ...]
@@ -38,7 +56,7 @@ class ManifestEntry:
 
 def _ocw_006_lec(n: int) -> ManifestEntry:
     return ManifestEntry(
-        source_id="A1",
+        source_id=SourceId.A1,
         description=f"6.006 F11 lecture {n:02d} notes",
         kind="ocw_resource_page",
         urls=(f"{OCW_006_BASE}/mit6_006f11_lec{n:02d}/",),
@@ -48,7 +66,7 @@ def _ocw_006_lec(n: int) -> ManifestEntry:
 
 def _ocw_006_rec(n: int, *, optional: bool = False) -> ManifestEntry:
     return ManifestEntry(
-        source_id="A2",
+        source_id=SourceId.A2,
         description=f"6.006 F11 recitation {n:02d} notes",
         kind="ocw_resource_page",
         urls=(f"{OCW_006_BASE}/mit6_006f11_rec{n:02d}/",),
@@ -61,7 +79,7 @@ def _ocw_006_ps(n: int, sol: bool) -> ManifestEntry:
     suffix = "_sol" if sol else ""
     label = "solutions" if sol else "problems"
     return ManifestEntry(
-        source_id="A3",
+        source_id=SourceId.A3,
         description=f"6.006 F11 problem set {n} — {label}",
         kind="ocw_resource_page",
         urls=(f"{OCW_006_BASE}/mit6_006f11_ps{n}{suffix}/",),
@@ -71,7 +89,7 @@ def _ocw_006_ps(n: int, sol: bool) -> ManifestEntry:
 
 def _ocw_830_lec(slug: str, dest_stem: str, *, optional: bool = False) -> ManifestEntry:
     return ManifestEntry(
-        source_id="B1",
+        source_id=SourceId.B1,
         description=f"6.830 F10 lecture — {slug}",
         kind="ocw_resource_page",
         urls=(f"{OCW_830_BASE}/{slug}/",),
@@ -112,7 +130,7 @@ _MIT_6830_CACHE = "https://people.csail.mit.edu/tdanford/6830papers"
 # ── B2: 3 papers on storage / indexing / access methods
 _B2: list[ManifestEntry] = [
     ManifestEntry(
-        source_id="B2",
+        source_id=SourceId.B2,
         description="Chou & DeWitt — Evaluation of Buffer Management Strategies (VLDB 1985)",
         kind="direct_pdf",
         urls=(
@@ -122,7 +140,7 @@ _B2: list[ManifestEntry] = [
         dest_path="6.830/papers/B2_chou_dewitt_buffer.pdf",
     ),
     ManifestEntry(
-        source_id="B2",
+        source_id=SourceId.B2,
         description="Beckmann et al. — The R*-Tree (SIGMOD 1990)",
         kind="direct_pdf",
         urls=(
@@ -132,7 +150,7 @@ _B2: list[ManifestEntry] = [
         dest_path="6.830/papers/B2_rstar_tree.pdf",
     ),
     ManifestEntry(
-        source_id="B2",
+        source_id=SourceId.B2,
         description="Stonebraker et al. — C-Store: A Column-oriented DBMS (VLDB 2005)",
         kind="direct_pdf",
         urls=(f"{_MIT_6830_CACHE}/stonebraker-cstore.pdf",),
@@ -143,7 +161,7 @@ _B2: list[ManifestEntry] = [
 # ── B3: 4 papers on query proc / transactions / concurrency
 _B3: list[ManifestEntry] = [
     ManifestEntry(
-        source_id="B3",
+        source_id=SourceId.B3,
         description="Selinger et al. — Access Path Selection in a Relational DBMS (SIGMOD 1979)",
         kind="direct_pdf",
         urls=(
@@ -153,7 +171,7 @@ _B3: list[ManifestEntry] = [
         dest_path="6.830/papers/B3_selinger.pdf",
     ),
     ManifestEntry(
-        source_id="B3",
+        source_id=SourceId.B3,
         description="Franklin — Concurrency Control and Recovery (1997)",
         kind="direct_pdf",
         urls=(
@@ -163,14 +181,14 @@ _B3: list[ManifestEntry] = [
         dest_path="6.830/papers/B3_franklin.pdf",
     ),
     ManifestEntry(
-        source_id="B3",
+        source_id=SourceId.B3,
         description="Kung & Robinson — On Optimistic Methods for Concurrency Control (TODS 1981)",
         kind="direct_pdf",
         urls=(f"{_MIT_6830_CACHE}/kung-optimistic-methods.pdf",),
         dest_path="6.830/papers/B3_kung_robinson.pdf",
     ),
     ManifestEntry(
-        source_id="B3",
+        source_id=SourceId.B3,
         description="Gray et al. — Granularity of Locks and Degrees of Consistency (1976)",
         kind="direct_pdf",
         urls=(f"{_MIT_6830_CACHE}/gray-lock-granularity.pdf",),

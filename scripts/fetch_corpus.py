@@ -43,18 +43,31 @@ from src.observability import configure_logging, get_logger
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CORPUS_ROOT = REPO_ROOT / "corpus"
-USER_AGENT = "lexgo-rag-eval/0.1 (portfolio project; contact via github.com/Axle7XStriker)"
+# Identifying User-Agent so OCW's ops team can trace the traffic if needed and
+# so a WAF is less likely to categorize us as a bot. The +URL suffix follows the
+# common "user-agent with contact URL" convention.
+USER_AGENT = "lexgo-rag-eval/0.1 (+https://github.com/Axle7XStriker/lexgo-rag-eval)"
 POLITENESS_SLEEP_S = 1.0
 REQUEST_TIMEOUT_S = 30
 PDF_MAGIC = b"%PDF"
 
 
 class FetchError(RuntimeError):
-    """A single URL failed to produce a valid PDF."""
+    """Raised when a single URL attempt fails to produce a valid PDF.
+
+    Wraps three distinct failure modes so `fetch_entry` can uniformly log-and-
+    fall-back to the next URL in an entry's `urls` tuple:
+      - non-2xx HTTP status,
+      - no `<a href="*.pdf">` on an OCW resource page (HTML changed?),
+      - response bytes don't begin with the %PDF magic (server returned an
+        HTML error page with a 200 OK, or a redirected to a different asset).
+    """
 
 
 @dataclass
 class FetchResult:
+    """Outcome of one manifest entry — one of ok / skipped_present / failed / missing_optional."""
+
     entry: ManifestEntry
     status: str  # "ok" | "skipped_present" | "failed" | "missing_optional"
     url_used: str | None = None
@@ -62,9 +75,16 @@ class FetchResult:
 
 
 def _headers() -> dict[str, str]:
+    """HTTP headers sent with every request.
+
+    The Accept header lists PDF first (q=1.0 implicit) because that's the
+    payload we ultimately want. We still accept HTML with lower priority
+    (q=0.9) because OCW "resource" URLs first return an HTML landing page
+    that we parse for the actual PDF href — see `_download_one`.
+    """
     return {
         "User-Agent": USER_AGENT,
-        "Accept": ("application/pdf,text/html;q=0.9,application/xhtml+xml;q=0.9,*/*;q=0.5"),
+        "Accept": "application/pdf,text/html;q=0.9,application/xhtml+xml;q=0.9,*/*;q=0.5",
     }
 
 
@@ -75,6 +95,11 @@ def _headers() -> dict[str, str]:
     reraise=True,
 )
 def _http_get(url: str) -> bytes:
+    """Fetch the body of `url` as bytes; raise FetchError on non-2xx.
+
+    Wrapped by tenacity: 3 attempts, exponential backoff 1-10s, retries on
+    transient network failures + FetchError (which we raise on 4xx/5xx).
+    """
     req = urllib.request.Request(url, headers=_headers())
     with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
         status = getattr(resp, "status", 200)
@@ -84,7 +109,12 @@ def _http_get(url: str) -> bytes:
 
 
 def _extract_pdf_href(html: str, base_url: str) -> str:
-    """Find the first .pdf href on an OCW resource page and return an absolute URL."""
+    """Return the first .pdf href on `html` as an absolute URL, else raise.
+
+    OCW resource pages list one canonical PDF asset via `<a href="....pdf">`.
+    We take the first match, allowing a query string suffix (`?foo=bar`), and
+    resolve it against `base_url` since OCW hrefs are typically relative.
+    """
     hrefs = findall(r'href="([^"]+\.pdf(?:\?[^"]*)?)"', html, IGNORECASE)
     if not hrefs:
         raise FetchError(f"no .pdf href found on {base_url}")
@@ -92,6 +122,13 @@ def _extract_pdf_href(html: str, base_url: str) -> str:
 
 
 def _download_one(entry: ManifestEntry, url: str) -> bytes:
+    """Fetch one candidate `url` for `entry` and return its PDF bytes.
+
+    For OCW resource pages, this does two GETs (page HTML → parse href → PDF).
+    For direct_pdf entries, one GET. Either way, verifies the response starts
+    with the %PDF magic — some misconfigured URLs return an HTML error page
+    with 200 OK, and we don't want to silently write that to disk.
+    """
     if entry.kind == "ocw_resource_page":
         page_bytes = _http_get(url)
         page_html = page_bytes.decode("utf-8", errors="replace")
@@ -105,6 +142,11 @@ def _download_one(entry: ManifestEntry, url: str) -> bytes:
 
 
 def _atomic_write(dest: Path, data: bytes) -> None:
+    """Write `data` to `dest` via a .part sidecar + os.replace.
+
+    Prevents half-written files from tripping the idempotency check on a
+    subsequent run (which skips any dest that already exists non-empty).
+    """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     with tmp.open("wb") as f:
@@ -114,7 +156,15 @@ def _atomic_write(dest: Path, data: bytes) -> None:
     os.replace(tmp, dest)
 
 
-def fetch_entry(entry: ManifestEntry, *, force: bool = False, log=None) -> FetchResult:
+def fetch_entry(entry: ManifestEntry, *, force: bool = False, logger=None) -> FetchResult:
+    """Fetch a single manifest entry, trying its URLs in order until one works.
+
+    Idempotency: returns `skipped_present` without any HTTP work when the dest
+    already exists non-empty (unless force=True). Each URL is downloaded via
+    `_download_one`, which fails through to the next candidate on any FetchError.
+    If all URLs fail, the result status is `failed` (or `missing_optional` when
+    entry.optional is True, so the outer run can still exit 0).
+    """
     dest = CORPUS_ROOT / entry.dest_path
     if not force and dest.exists() and dest.stat().st_size > 0:
         return FetchResult(entry, status="skipped_present")
@@ -124,8 +174,8 @@ def fetch_entry(entry: ManifestEntry, *, force: bool = False, log=None) -> Fetch
             pdf_bytes = _download_one(entry, url)
         except (FetchError, urllib.error.URLError, TimeoutError, RetryError) as e:
             last_error = f"{type(e).__name__}: {e}"
-            if log:
-                log.warning(
+            if logger:
+                logger.warning(
                     "fetch_url_failed",
                     source_id=entry.source_id,
                     dest_path=entry.dest_path,
@@ -140,6 +190,18 @@ def fetch_entry(entry: ManifestEntry, *, force: bool = False, log=None) -> Fetch
 
 
 def _print_summary(results: list[FetchResult]) -> None:
+    """Print an ok/skipped/failed tally to stdout, then list any failures.
+
+    Sample output::
+
+        ── fetch_corpus summary ─────────────────────────────────────
+          ok:               57    skipped:    2    failed:     0    missing (optional): 2
+
+          Optional missing (source manually if needed):
+            - A2/6.006/recitations/A2_rec03.pdf
+            - A2/6.006/recitations/A2_rec04.pdf
+        ─────────────────────────────────────────────────────────────
+    """
     buckets: dict[str, list[FetchResult]] = {
         "ok": [],
         "skipped_present": [],
@@ -168,6 +230,13 @@ def _print_summary(results: list[FetchResult]) -> None:
 
 
 def main() -> int:
+    """CLI entry: iterate MANIFEST, fetch each entry, print progress + summary.
+
+    Prints one line per entry as it's processed (✓ ok, · skipped, ✗ failed,
+    ? optional-missing), sleeps 1s between real downloads, then prints the
+    aggregate summary via `_print_summary`. Returns 1 iff any non-optional
+    entry failed; otherwise 0.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--dry-run",
@@ -192,10 +261,12 @@ def main() -> int:
     args = parser.parse_args()
 
     configure_logging(args.log_level)
-    log = get_logger("fetch_corpus")
+    logger = get_logger("fetch_corpus")
 
     entries = [e for e in MANIFEST if not args.only or e.source_id == args.only]
-    log.info("fetch_corpus_start", n_entries=len(entries), dry_run=args.dry_run, force=args.force)
+    logger.info(
+        "fetch_corpus_start", n_entries=len(entries), dry_run=args.dry_run, force=args.force
+    )
 
     if args.dry_run:
         for e in entries:
@@ -206,7 +277,7 @@ def main() -> int:
 
     results: list[FetchResult] = []
     for i, entry in enumerate(entries):
-        result = fetch_entry(entry, force=args.force, log=log)
+        result = fetch_entry(entry, force=args.force, logger=logger)
         results.append(result)
         marker = {
             "ok": "✓",

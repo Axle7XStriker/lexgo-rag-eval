@@ -122,7 +122,14 @@ class Citation(BaseModel):
 
 
 class QARecord(BaseModel):
-    """A single hand-authored golden Q&A record."""
+    """A single hand-authored golden Q&A record.
+
+    `sources` is a derived property (unique `source_id`s across
+    `gold_citations`) — never stored on disk. This eliminates the drift risk
+    of keeping a redundant field in sync with citations, and grep-by-bucket
+    still works via `doc_path` (which encodes source_id as its filename prefix,
+    e.g. `A1_lec03.pdf`).
+    """
 
     model_config = ConfigDict(extra="forbid")
 
@@ -130,18 +137,20 @@ class QARecord(BaseModel):
     # Type-prefixed slug: f001, x012, p003, o004, a002. Prefix ↔ type is enforced below.
     id: str = Field(pattern=r"^[fxpoa]\d{3}$")
     type: QAType
-    question: str = Field(min_length=8, max_length=1000)
-    # Char bounds instead of sentence counting — regex sentence splitters are brittle,
-    # and "2-4 sentences" is a human judgment made at authoring time. Bounds catch
-    # the real failure modes: too-short "answers" and essay-length dumps.
+    # question / gold_answer share the same 800-char ceiling. Bounds catch the
+    # real failure modes (empty stubs and essay-length dumps) — the "2-4 sentence"
+    # gold-answer heuristic is a human judgment at author time, not a regex.
+    question: str = Field(min_length=8, max_length=800)
     gold_answer: str = Field(min_length=50, max_length=800)
     gold_citations: list[Citation] = Field(default_factory=list)
-    # `sources` is derivable from citations, but stored explicitly so `grep '"B2"'`
-    # over qa.jsonl works. Validator enforces exact equality with citation source_ids.
-    sources: list[SourceId] = Field(default_factory=list)
     notes: str | None = Field(default=None, max_length=1000)
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+
+    @cached_property
+    def sources(self) -> list[SourceId]:
+        """Unique source buckets referenced by this record's citations, sorted."""
+        return sorted({c.source_id for c in self.gold_citations}, key=lambda s: s.value)
 
     @model_validator(mode="after")
     def _cross_field_invariants(self) -> QARecord:
@@ -154,28 +163,18 @@ class QARecord(BaseModel):
             )
 
         cited_sources = {c.source_id for c in self.gold_citations}
-        declared_sources = set(self.sources)
 
-        # 2. out_of_corpus: no citations, no sources
+        # 2. out_of_corpus: no citations
         if self.type == QAType.OUT_OF_CORPUS:
             if self.gold_citations:
                 raise ValueError("out_of_corpus questions must have no citations")
-            if self.sources:
-                raise ValueError("out_of_corpus questions must have no sources")
             return self
 
         # 3. everything else: at least one citation
         if not self.gold_citations:
             raise ValueError(f"type {self.type.value} requires at least one citation")
 
-        # 4. sources must equal citation source_ids exactly
-        if declared_sources != cited_sources:
-            raise ValueError(
-                f"sources {sorted(s.value for s in declared_sources)} != "
-                f"citation sources {sorted(s.value for s in cited_sources)}"
-            )
-
-        # 5. cross_source_synthesis: >= 2 distinct sources
+        # 4. cross_source_synthesis: >= 2 distinct source buckets
         if self.type == QAType.CROSS_SOURCE_SYNTHESIS and len(cited_sources) < 2:
             raise ValueError(
                 "cross_source_synthesis requires >= 2 distinct source_ids in citations"
