@@ -21,14 +21,14 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from re import IGNORECASE, findall
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from tenacity import (
     RetryError,
@@ -50,17 +50,49 @@ USER_AGENT = "lexgo-rag-eval/0.1 (+https://github.com/Axle7XStriker/lexgo-rag-ev
 POLITENESS_SLEEP_S = 1.0
 REQUEST_TIMEOUT_S = 30
 PDF_MAGIC = b"%PDF"
+# Only http/https are safe — urllib would otherwise happily open file:// or
+# ftp://, so a bad manifest edit could exfiltrate local files into corpus/.
+ALLOWED_SCHEMES = frozenset({"http", "https"})
+# Retriable status codes: 429 (rate-limited) + all 5xx (server-side transient).
+# 4xx (client error) is NOT retriable — the URL is wrong or gone, not busy.
+_RETRIABLE_STATUS = frozenset({429, *range(500, 600)})
+
+# Matches PDF hrefs in HTML: double-quoted, single-quoted, or unquoted.
+# The three alternation groups let `findall` return the URL from whichever
+# form actually matched (see `_extract_pdf_href` for the flatten step).
+_PDF_HREF_RE = re.compile(
+    r"""
+    href \s* = \s*
+    (?:
+        " ( [^"]+ \.pdf (?:\?[^"]*)? ) "     # double-quoted
+      | ' ( [^']+ \.pdf (?:\?[^']*)? ) '     # single-quoted
+      | ( [^\s'"<>]+ \.pdf (?:\?\S*)? )      # unquoted (bare)
+    )
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 
 
 class FetchError(RuntimeError):
-    """Raised when a single URL attempt fails to produce a valid PDF.
+    """A single URL attempt failed for a deterministic (non-retriable) reason.
 
-    Wraps three distinct failure modes so `fetch_entry` can uniformly log-and-
-    fall-back to the next URL in an entry's `urls` tuple:
-      - non-2xx HTTP status,
-      - no `<a href="*.pdf">` on an OCW resource page (HTML changed?),
+    Wraps failure modes that will not resolve by retrying, so `fetch_entry` can
+    fall back to the next URL in the entry's `urls` tuple immediately:
+      - 4xx HTTP status (URL is gone or wrong),
+      - no `<a href="*.pdf">` on an OCW resource page (HTML shape changed),
       - response bytes don't begin with the %PDF magic (server returned an
-        HTML error page with a 200 OK, or a redirected to a different asset).
+        HTML error page with 200 OK, or a redirect to a different asset),
+      - URL scheme is not http/https.
+
+    See `TransientHTTPError` for the retriable counterpart.
+    """
+
+
+class TransientHTTPError(RuntimeError):
+    """HTTP 429 or 5xx — worth retrying with backoff.
+
+    Kept separate from FetchError so tenacity's retry predicate can target
+    only the transient cases and avoid burning ~15s on deterministic 4xx.
     """
 
 
@@ -91,48 +123,85 @@ def _headers() -> dict[str, str]:
 @retry(
     stop=stop_after_attempt(3),
     wait=wait_exponential(multiplier=1, min=1, max=10),
-    retry=retry_if_exception_type((urllib.error.URLError, TimeoutError, FetchError)),
+    # Only retry the network-transient cases. `FetchError` (deterministic 4xx,
+    # no PDF href, wrong scheme, bad magic bytes) fails fast on the first try.
+    retry=retry_if_exception_type((TransientHTTPError, TimeoutError)),
     reraise=True,
 )
 def _http_get(url: str) -> bytes:
-    """Fetch the body of `url` as bytes; raise FetchError on non-2xx.
+    """Fetch the body of `url` as bytes.
 
-    Wrapped by tenacity: 3 attempts, exponential backoff 1-10s, retries on
-    transient network failures + FetchError (which we raise on 4xx/5xx).
+    Raises:
+      FetchError — for deterministic failures (bad scheme, 4xx). Not retried.
+      TransientHTTPError — 429 or 5xx. Retried up to 3x with 1-10s backoff.
+      TimeoutError — socket timeout. Retried the same way.
+
+    Note: urllib raises `HTTPError` (subclass of URLError) *before* returning
+    on any 4xx/5xx, so we translate rather than checking `resp.status` after
+    the fact (that branch would be dead code).
     """
+    if urlparse(url).scheme not in ALLOWED_SCHEMES:
+        raise FetchError(f"unsupported URL scheme in {url!r}; only http/https are allowed")
     req = urllib.request.Request(url, headers=_headers())
-    with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
-        status = getattr(resp, "status", 200)
-        if status >= 400:
-            raise FetchError(f"HTTP {status} for {url}")
-        return resp.read()
+    try:
+        with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
+            return resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code in _RETRIABLE_STATUS:
+            raise TransientHTTPError(f"HTTP {e.code} for {url}") from e
+        raise FetchError(f"HTTP {e.code} for {url}") from e
 
 
-def _extract_pdf_href(html: str, base_url: str) -> str:
-    """Return the first .pdf href on `html` as an absolute URL, else raise.
+def _extract_pdf_href(html: str, base_url: str, prefer_containing: str | None = None) -> str:
+    """Return a .pdf href from `html` as an absolute URL, else raise.
 
-    OCW resource pages list one canonical PDF asset via `<a href="....pdf">`.
-    We take the first match, allowing a query string suffix (`?foo=bar`), and
-    resolve it against `base_url` since OCW hrefs are typically relative.
+    Handles double-quoted, single-quoted, and unquoted `href` attributes, and
+    tolerates a `?query` suffix. If `prefer_containing` is given, prefers the
+    first href whose path contains that string (case-insensitive). This lets us
+    pick the actual asset (e.g. `mit6_006f11_lec03.pdf`) over unrelated PDFs
+    that OCW pages sometimes link to in nav / sidebars.
     """
-    hrefs = findall(r'href="([^"]+\.pdf(?:\?[^"]*)?)"', html, IGNORECASE)
+    # findall with alternation returns tuples of 3 groups; only one is non-empty
+    # per match. Flatten and drop empties to get a flat list of hrefs.
+    hrefs = [g for triple in _PDF_HREF_RE.findall(html) for g in triple if g]
     if not hrefs:
         raise FetchError(f"no .pdf href found on {base_url}")
+    if prefer_containing:
+        needle = prefer_containing.lower()
+        for h in hrefs:
+            if needle in h.lower():
+                return urljoin(base_url, h)
     return urljoin(base_url, hrefs[0])
+
+
+def _slug_from_resource_url(url: str) -> str | None:
+    """Extract the OCW resource slug from a URL like `.../resources/mit6_006f11_lec03/`.
+
+    Returned string is passed to `_extract_pdf_href(prefer_containing=...)` so
+    we grab `mit6_006f11_lec03.pdf` rather than any incidental PDF on the page.
+    """
+    parts = [p for p in urlparse(url).path.split("/") if p]
+    return parts[-1] if parts else None
 
 
 def _download_one(entry: ManifestEntry, url: str) -> bytes:
     """Fetch one candidate `url` for `entry` and return its PDF bytes.
 
-    For OCW resource pages, this does two GETs (page HTML → parse href → PDF).
-    For direct_pdf entries, one GET. Either way, verifies the response starts
-    with the %PDF magic — some misconfigured URLs return an HTML error page
-    with 200 OK, and we don't want to silently write that to disk.
+    For OCW resource pages, this does two GETs (page HTML → parse href → PDF)
+    and prefers hrefs whose filename contains the resource slug so an unrelated
+    PDF in the page's nav doesn't get picked up. For direct_pdf entries, one
+    GET. Either way, verifies the response starts with the %PDF magic — some
+    misconfigured URLs return an HTML error page with 200 OK, and we don't
+    want to silently write that to disk.
     """
     if entry.kind == "ocw_resource_page":
         page_bytes = _http_get(url)
         page_html = page_bytes.decode("utf-8", errors="replace")
-        pdf_url = _extract_pdf_href(page_html, base_url=url)
+        pdf_url = _extract_pdf_href(
+            page_html,
+            base_url=url,
+            prefer_containing=_slug_from_resource_url(url),
+        )
         pdf_bytes = _http_get(pdf_url)
     else:
         pdf_bytes = _http_get(url)
@@ -146,14 +215,21 @@ def _atomic_write(dest: Path, data: bytes) -> None:
 
     Prevents half-written files from tripping the idempotency check on a
     subsequent run (which skips any dest that already exists non-empty).
+    The .part sidecar is cleaned up in a `finally` if the write fails
+    (disk full, fsync error, etc.) — otherwise a partial file with a
+    ".part" suffix would linger indefinitely.
     """
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    with tmp.open("wb") as f:
-        f.write(data)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, dest)
+    try:
+        with tmp.open("wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dest)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def fetch_entry(entry: ManifestEntry, *, force: bool = False, logger=None) -> FetchResult:
@@ -172,7 +248,13 @@ def fetch_entry(entry: ManifestEntry, *, force: bool = False, logger=None) -> Fe
     for url in entry.urls:
         try:
             pdf_bytes = _download_one(entry, url)
-        except (FetchError, urllib.error.URLError, TimeoutError, RetryError) as e:
+        except (
+            FetchError,
+            TransientHTTPError,
+            urllib.error.URLError,
+            TimeoutError,
+            RetryError,
+        ) as e:
             last_error = f"{type(e).__name__}: {e}"
             if logger:
                 logger.warning(

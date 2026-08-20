@@ -1,8 +1,10 @@
 """Logging + LLM-call accounting.
 
 Two responsibilities:
-1. Configure structlog for JSON logs to stderr (correlation IDs propagated via
-   contextvars).
+1. Configure structlog for stderr — colorized console rendering when stderr
+   is a TTY (interactive CLI + `streamlit run` in a terminal), JSON when
+   redirected (CI, log-collection pipelines). Correlation IDs propagated
+   via contextvars.
 2. Provide `log_llm_call` — appends a single JSON record per LLM call to
    logs/llm_calls.jsonl. Every eval number depends on knowing which calls
    produced it, so per-call provenance is load-bearing infra, not an add-on;
@@ -20,7 +22,22 @@ import structlog
 
 
 def configure_logging(log_level: str = "INFO") -> None:
-    """Configure structlog for JSON output to stderr. Idempotent."""
+    """Configure structlog. Idempotent.
+
+    Renderer is chosen by whether stderr is a TTY:
+      - TTY  → structlog.dev.ConsoleRenderer (colorized, human-readable).
+        This is what you get during interactive CLI runs (`make corpus`,
+        `streamlit run`) where JSON-per-line would drown out the
+        progress printouts.
+      - non-TTY → JSONRenderer (CI, redirection, log-collection pipelines
+        that expect one JSON record per line).
+    """
+    is_tty = sys.stderr.isatty()
+    renderer: Any = (
+        structlog.dev.ConsoleRenderer(colors=True)
+        if is_tty
+        else structlog.processors.JSONRenderer()
+    )
     structlog.configure(
         processors=[
             structlog.contextvars.merge_contextvars,
@@ -28,7 +45,7 @@ def configure_logging(log_level: str = "INFO") -> None:
             structlog.processors.TimeStamper(fmt="iso", utc=True),
             structlog.processors.StackInfoRenderer(),
             structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer(),
+            renderer,
         ],
         wrapper_class=structlog.make_filtering_bound_logger(
             getattr(logging, log_level.upper(), logging.INFO)

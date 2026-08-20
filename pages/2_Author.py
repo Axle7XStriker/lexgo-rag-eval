@@ -24,7 +24,7 @@ from typing import Any
 import streamlit as st
 from pydantic import ValidationError
 
-from evals.validate_golden import validate_golden
+from evals.validate_golden import build_report
 from scripts.corpus_manifest import MANIFEST
 from src.qa_schema import (
     GOLDEN_TOTAL,
@@ -56,13 +56,27 @@ render_page_header(
     "`evals/golden/qa.jsonl` and is the load-bearing artifact of the whole eval.",
 )
 
+# Consume any flash message left by the previous rerun (see `_save_and_rerun`).
+# st.success/warning called before st.rerun() never render — the delta queue is
+# discarded when the rerun aborts the script — so we defer confirmation into the
+# next run and pop it here as a toast.
+_flash = st.session_state.pop("author_flash", None)
+if _flash:
+    st.toast(_flash["message"], icon=_flash.get("icon"))
+
 QA_PATH.parent.mkdir(parents=True, exist_ok=True)
 if not QA_PATH.exists():
     QA_PATH.touch()
 
 # ── Load state ─────────────────────────────────────────────────────
+# Capture mtime BEFORE reading so `_save_and_rerun` can detect an intervening
+# write (another tab of this page, or a shell edit). Optimistic-concurrency —
+# cheap because a single Streamlit rerun is short-lived.
+_load_mtime_ns = QA_PATH.stat().st_mtime_ns if QA_PATH.exists() else 0
 records, load_errors = load_jsonl(QA_PATH)
-report = validate_golden(QA_PATH)
+# Reuse the just-parsed records instead of re-parsing the file inside
+# `validate_golden(path)` — every widget interaction reruns this whole script.
+report = build_report(records, load_errors)
 
 
 # ── Progress dashboard ─────────────────────────────────────────────
@@ -86,12 +100,17 @@ def render_progress_dashboard() -> None:
             )
             st.progress(min(count / target, 1.0) if target else 0.0)
     with cols[-1]:
+        total_delta = report.total_records - GOLDEN_TOTAL
         st.metric(
             label="**total**",
             value=f"{report.total_records} / {GOLDEN_TOTAL}",
-            delta=f"{report.total_records - GOLDEN_TOTAL:+d}"
-            if report.total_records != GOLDEN_TOTAL
-            else "complete",
+            delta=f"{total_delta:+d}" if total_delta != 0 else "complete",
+            # Overshoot is a design-violating failure mode (breaks the 40/25/20/10/5
+            # split), so a positive delta should render RED, not green. Undershoot
+            # is neutral (still in progress).
+            delta_color=(
+                "normal" if total_delta == 0 else ("inverse" if total_delta > 0 else "off")
+            ),
         )
         st.progress(min(report.total_records / GOLDEN_TOTAL, 1.0))
 
@@ -201,10 +220,36 @@ def _save_and_rerun(new_records: list[QARecord], msg: str) -> None:
     The canonical write path used by add / edit / delete — keeping one code
     path means every mutation gets the same crash-safety guarantees and the
     same dashboard-refresh behavior.
+
+    Refuses to write if qa.jsonl was modified externally between page load
+    and this call (another tab of this page, or a shell edit) — optimistic
+    concurrency via mtime. Confirmation is deferred to the next rerun via
+    `author_flash` since st.success called just before st.rerun() never
+    renders (the delta queue is dropped when the script aborts).
     """
+    current_mtime = QA_PATH.stat().st_mtime_ns if QA_PATH.exists() else 0
+    if current_mtime != _load_mtime_ns:
+        st.error(
+            "`qa.jsonl` was modified externally after this page loaded "
+            "(another tab, or a shell edit). Refresh and retry — your input "
+            "is still in the form."
+        )
+        return
     save_jsonl_atomic(QA_PATH, new_records)
-    st.success(msg)
+    st.session_state["author_flash"] = {"message": msg, "icon": "✅"}
     st.rerun()
+
+
+def _record_widget_salt(record: QARecord) -> str:
+    """Salt appended to per-record widget keys.
+
+    Includes `created_at` so a delete-and-re-add cycle (where
+    `next_id_for_type` may reuse the same id) yields fresh session_state
+    for the edit-panel widgets. Without this, Streamlit would keep serving
+    the pre-delete cached text on subsequent renders — an actual data-loss
+    bug when the user then clicks Save.
+    """
+    return f"{record.id}_{int(record.created_at.timestamp())}"
 
 
 # ── Tabs ───────────────────────────────────────────────────────────
@@ -238,10 +283,9 @@ with tab_add:
         citation_rows: list[dict[str, Any]] = []
     else:
         st.markdown("**Citations** — one row per source cited. Empty rows are ignored.")
-        initial_rows: list[dict[str, Any]] = st.session_state.get("add_citations_initial") or [
-            _empty_citation_row()
-        ]
-        citation_rows = _citation_editor("add_citations_editor", initial_rows)
+        # `st.data_editor` preserves its own state under `key="add_citations_editor"`
+        # across reruns, so we only need a fresh seed on the very first render.
+        citation_rows = _citation_editor("add_citations_editor", [_empty_citation_row()])
 
     # Preview derived sources (auto-computed from doc_path filename prefix).
     if citation_rows:
@@ -368,17 +412,18 @@ with tab_browse:
             st.info("Select a row above to edit or delete.")
         else:
             selected_record = filtered[selected_rows[0]]
-            _render_edit_panel_kwargs = dict(
-                record=selected_record,
-                all_records=records,
-            )
+            # salt includes created_at so a delete+re-add of the same id yields
+            # fresh widget state (Streamlit's session_state persists per-key —
+            # a stale key would silently show the old text and let a Save overwrite
+            # the newly-added record with abandoned edits).
+            salt = _record_widget_salt(selected_record)
             st.markdown(f"#### Edit `{selected_record.id}`")
 
             edit_type_str = st.selectbox(
                 "Type",
                 options=[t.value for t in QAType],
                 index=[t.value for t in QAType].index(selected_record.type.value),
-                key=f"edit_type_{selected_record.id}",
+                key=f"edit_type_{salt}",
                 help="Changing type also changes the id prefix — new id will be auto-generated.",
             )
             edit_type = QAType(edit_type_str)
@@ -397,38 +442,34 @@ with tab_browse:
                     for c in selected_record.gold_citations
                 ] or [_empty_citation_row()]
                 edit_citation_rows = _citation_editor(
-                    f"edit_citations_{selected_record.id}",
+                    f"edit_citations_{salt}",
                     initial_edit_rows,
                 )
 
             edit_question = st.text_area(
                 "Question",
                 value=selected_record.question,
-                key=f"edit_q_{selected_record.id}",
+                key=f"edit_q_{salt}",
                 height=80,
             )
             edit_gold_answer = st.text_area(
                 "Gold answer",
                 value=selected_record.gold_answer,
-                key=f"edit_a_{selected_record.id}",
+                key=f"edit_a_{salt}",
                 height=140,
             )
             edit_notes = st.text_area(
                 "Notes",
                 value=selected_record.notes or "",
-                key=f"edit_n_{selected_record.id}",
+                key=f"edit_n_{salt}",
                 height=60,
             )
 
             col_save, col_delete, col_spacer = st.columns([1, 1, 4])
             with col_save:
-                save_clicked = st.button(
-                    "💾 Save changes", type="primary", key=f"save_{selected_record.id}"
-                )
+                save_clicked = st.button("💾 Save changes", type="primary", key=f"save_{salt}")
             with col_delete:
-                delete_clicked = st.button(
-                    "🗑️ Delete", type="secondary", key=f"delete_{selected_record.id}"
-                )
+                delete_clicked = st.button("🗑️ Delete", type="secondary", key=f"delete_{salt}")
 
             pending_delete = st.session_state.get("pending_delete_id")
 
@@ -467,13 +508,11 @@ with tab_browse:
                 st.warning(f"Really delete **{selected_record.id}**? This cannot be undone.")
                 col_yes, col_no, _ = st.columns([1, 1, 4])
                 with col_yes:
-                    if st.button(
-                        "Yes, delete", type="primary", key=f"confirm_del_{selected_record.id}"
-                    ):
+                    if st.button("Yes, delete", type="primary", key=f"confirm_del_{salt}"):
                         new_records = [r for r in records if r.id != selected_record.id]
                         st.session_state.pop("pending_delete_id", None)
                         _save_and_rerun(new_records, f"Deleted {selected_record.id}")
                 with col_no:
-                    if st.button("Cancel", key=f"cancel_del_{selected_record.id}"):
+                    if st.button("Cancel", key=f"cancel_del_{salt}"):
                         st.session_state.pop("pending_delete_id", None)
                         st.rerun()

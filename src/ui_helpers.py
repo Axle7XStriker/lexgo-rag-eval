@@ -1,7 +1,9 @@
 """Shared Streamlit widgets and startup helpers.
 
-Both `pages/1_📚_Demo.py` and `pages/2_✍️_Author.py` need the same settings
+Both `pages/1_Demo.py` and `pages/2_Author.py` need the same settings
 bootstrap and sidebar. Putting them here avoids two page files drifting apart.
+Per-page browser-tab icons live on each page's `st.set_page_config(page_icon=...)`
+call — filenames stay plain so `git`, `ls`, and shell completion stay ergonomic.
 """
 
 from __future__ import annotations

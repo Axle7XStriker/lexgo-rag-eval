@@ -205,6 +205,26 @@ class TestQARecordDerivedSources:
         # `sources` must NOT appear on disk — grep-by-bucket uses `doc_path` instead.
         assert "sources" not in r.model_dump()
 
+    def test_sources_recomputed_on_copy_with_new_citations(self) -> None:
+        # Regression guard: cached_property on a Pydantic v2 model must NOT carry
+        # a stale cached value across model_copy(update=...). If this ever fails,
+        # switch `sources` to @property (recompute-on-access) — cost is negligible.
+        r = QARecord.model_validate(_valid_cross_source())
+        assert r.sources == [SourceId.B1, SourceId.B2]  # warm the cache
+        r2 = r.model_copy(
+            update={
+                "gold_citations": [
+                    Citation(
+                        doc_path="6.006/lectures/A1_lec03.pdf",
+                        page_or_section="slide 12",
+                    )
+                ]
+            }
+        )
+        assert r2.sources == [SourceId.A1], (
+            f"expected [A1] after model_copy with A1-only citations, got {r2.sources}"
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────
 class TestPersistence:

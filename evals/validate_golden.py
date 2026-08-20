@@ -6,16 +6,19 @@ Two entry points share the same validation logic:
   - `main() -> int` — CLI wrapper (`make validate` / `python -m evals.validate_golden`).
 
 Exit codes (CLI only):
-  0 — nothing broken. This includes:
+  0 — nothing broken. This means:
       * the file is empty or has fewer than 100 records (authoring in progress);
-      * exactly 100 records AND the distribution matches TARGET_DISTRIBUTION.
-  1 — something needs fixing. This fires when ANY of:
+      * exactly 100 records AND per-type distribution matches TARGET_DISTRIBUTION.
+  1 — something needs fixing. Fires when ANY of:
       * a line failed to parse as JSON or violated the QARecord schema;
       * two records share the same id;
       * a citation's doc_path is not in scripts/corpus_manifest.py
-        (retrieval will not index it, so the eval would be broken);
-      * total_records == 100 AND the per-type distribution ≠ 40/25/20/10/5
-        (the split IS the eval design — silent drift would falsify results).
+        (retrieval won't index it — the eval would be broken);
+      * total_records > 100 (overshoot means we've drifted past the plan);
+      * any per-type count > its TARGET_DISTRIBUTION target
+        (silent overshoot for one type falsifies the 40/25/20/10/5 split
+        the whole eval design rests on);
+      * total_records == 100 AND per-type distribution ≠ 40/25/20/10/5.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from src.qa_schema import (
     GOLDEN_TOTAL,
     TARGET_DISTRIBUTION,
     LineError,
+    QARecord,
     QAType,
     counts_by_type,
     load_jsonl,
@@ -76,6 +80,20 @@ class ValidationReport:
         return self.total_records == GOLDEN_TOTAL
 
     @property
+    def is_overfull(self) -> bool:
+        """True iff we're past the plan on total OR on any per-type target.
+
+        Overshoot is a real failure mode: a stray extra `factual` record at
+        41/40 silently poisons the eval by shifting the sample mix relative
+        to the design. Distinct from `is_complete` because it can fire even
+        when total_records != 100 (e.g. an extra factual with a missing
+        adversarial still overshoots one bucket while undershooting another).
+        """
+        if self.total_records > GOLDEN_TOTAL:
+            return True
+        return any(self.counts.get(t, 0) > target for t, target in TARGET_DISTRIBUTION.items())
+
+    @property
     def distribution_ok(self) -> bool:
         """True iff per-type counts exactly match TARGET_DISTRIBUTION (40/25/20/10/5)."""
         return self.counts == TARGET_DISTRIBUTION
@@ -86,16 +104,35 @@ def validate_golden(path: Path) -> ValidationReport:
 
     Missing file is treated the same as an empty file: total_records=0 with
     no errors. Both the CLI and the Streamlit dashboard call this — the
-    returned dataclass is the shared surface.
+    returned dataclass is the shared surface. See `build_report` for the
+    pure-computation variant that skips the file read (used by the UI to
+    avoid re-parsing qa.jsonl twice per rerun).
     """
     records, errors = load_jsonl(path)
+    return build_report(records, errors)
+
+
+def build_report(records: list[QARecord], errors: list[LineError]) -> ValidationReport:
+    """Compute a ValidationReport from pre-parsed records + line errors.
+
+    Split out from `validate_golden` so a caller that already has the parsed
+    records (Streamlit's Author page) doesn't parse the file twice per rerun.
+    """
     id_counter = Counter(r.id for r in records)
     duplicate_ids = sorted(id_ for id_, n in id_counter.items() if n > 1)
+    # Dedupe: same bad doc_path cited twice within a record (or across records)
+    # should not inflate the count — one entry per (record_id, doc_path).
+    seen: set[str] = set()
     unknown_doc_paths: list[str] = []
     for r in records:
         for c in r.gold_citations:
-            if c.doc_path not in KNOWN_DOC_PATHS:
-                unknown_doc_paths.append(f"{r.id} → {c.doc_path}")
+            if c.doc_path in KNOWN_DOC_PATHS:
+                continue
+            key = f"{r.id} → {c.doc_path}"
+            if key in seen:
+                continue
+            seen.add(key)
+            unknown_doc_paths.append(key)
     return ValidationReport(
         total_records=len(records),
         errors=errors,
@@ -163,7 +200,12 @@ def _print_report(report: ValidationReport, path: Path) -> None:
         print(f"    {qa_type.value:<26} {count:>3d} / {target:<3d}  {_bar(count, target)} {marker}")
     print()
 
-    if report.is_complete and not report.distribution_ok:
+    if report.is_overfull:
+        print(
+            f"  ⚠ overshoot — total={report.total_records}/{GOLDEN_TOTAL} "
+            "or some per-type count exceeds its target"
+        )
+    elif report.is_complete and not report.distribution_ok:
         print("  ⚠ 100 records but distribution ≠ target (40/25/20/10/5)")
     elif report.is_complete and report.distribution_ok:
         print("  ✓ 100 records, distribution matches target")
@@ -172,6 +214,8 @@ def _print_report(report: ValidationReport, path: Path) -> None:
 def _typed_report_exit_code(report: ValidationReport) -> int:
     """Map a ValidationReport to the CLI exit code — see module docstring."""
     if not report.is_clean:
+        return 1
+    if report.is_overfull:
         return 1
     if report.is_complete and not report.distribution_ok:
         return 1

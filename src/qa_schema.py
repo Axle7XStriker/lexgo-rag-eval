@@ -19,7 +19,6 @@ import re
 from collections import Counter
 from datetime import UTC, datetime
 from enum import StrEnum
-from functools import cached_property
 from pathlib import Path
 from typing import NamedTuple
 
@@ -72,7 +71,6 @@ ID_PREFIX_FOR_TYPE: dict[QAType, str] = {
     QAType.OUT_OF_CORPUS: "o",
     QAType.ADVERSARIAL: "a",
 }
-TYPE_FOR_ID_PREFIX: dict[str, QAType] = {v: k for k, v in ID_PREFIX_FOR_TYPE.items()}
 
 
 # doc_path is relative to corpus/ and must match the filename pattern used by
@@ -112,9 +110,15 @@ class Citation(BaseModel):
             )
         return self
 
-    @cached_property
+    @property
     def source_id(self) -> SourceId:
-        """Auto-derived from the filename prefix of doc_path (e.g. A1_lec03.pdf → A1)."""
+        """Auto-derived from the filename prefix of doc_path (e.g. A1_lec03.pdf → A1).
+
+        Plain @property (not cached_property) — Pydantic v2 preserves cached
+        values across `model_copy(update=...)`, which would return the wrong
+        source_id if a caller copied a Citation with a new doc_path. Recompute
+        cost is a single regex match; negligible.
+        """
         m = DOC_PATH_PATTERN.match(self.doc_path)
         if not m:  # unreachable — the validator would have fired
             raise ValueError(f"cannot derive source_id from {self.doc_path!r}")
@@ -140,7 +144,7 @@ class QARecord(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
 
-    @cached_property
+    @property
     def sources(self) -> list[SourceId]:
         """Unique source buckets referenced by this record's citations, sorted.
 
@@ -148,6 +152,11 @@ class QARecord(BaseModel):
         `gold_citations` would create a drift risk (two places to update on
         every citation edit). Grep-by-bucket still works via `doc_path`,
         which encodes source_id as its filename prefix (e.g. `A1_lec03.pdf`).
+
+        Plain @property (not cached_property) — Pydantic v2 preserves cached
+        values across `model_copy(update={"gold_citations": ...})`, which would
+        return stale sources. Recompute cost is a set-comprehension over
+        ≤5 citations; negligible.
         """
         return sorted({c.source_id for c in self.gold_citations}, key=lambda s: s.value)
 
@@ -196,13 +205,19 @@ def load_jsonl(path: Path) -> tuple[list[QARecord], list[LineError]]:
 
     Empty lines are skipped silently. Malformed JSON and schema violations
     each yield one LineError with the 1-indexed line number.
+
+    Decoding uses `errors="replace"` — a stray non-UTF-8 byte (e.g. a smart
+    quote pasted from a PDF) becomes U+FFFD on that one line and is caught
+    by the per-line JSON/schema handler. Without this, a single bad byte
+    would raise UnicodeDecodeError and mask *every* other record from the
+    dashboard until it was fixed by hand.
     """
     records: list[QARecord] = []
     errors: list[LineError] = []
     if not path.exists():
         return records, errors
 
-    with path.open("r", encoding="utf-8") as f:
+    with path.open("r", encoding="utf-8", errors="replace") as f:
         for line_no, raw in enumerate(f, start=1):
             stripped = raw.strip()
             if not stripped:
@@ -235,7 +250,9 @@ def save_jsonl_atomic(path: Path, records: list[QARecord], *, backup: bool = Tru
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         for r in records:
-            f.write(r.model_dump_json())
+            # exclude_none keeps optional fields (currently `quote`, `notes`) out
+            # of the JSONL when unset — smaller diffs, less visual noise.
+            f.write(r.model_dump_json(exclude_none=True))
             f.write("\n")
         f.flush()
         os.fsync(f.fileno())
