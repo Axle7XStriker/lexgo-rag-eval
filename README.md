@@ -36,9 +36,18 @@ cd lexgo-rag-eval
 cp .env.example .env         # then fill in ANTHROPIC_API_KEY, VOYAGE_API_KEY, COHERE_API_KEY
 
 make setup                   # uv sync — creates .venv, installs pinned deps
-make app                     # streamlit run app.py
+make corpus                  # download MIT OCW PDFs into corpus/ (idempotent, ~2 min)
+make app                     # streamlit run app.py — Demo + Author pages in the sidebar
+make validate                # lint the golden Q&A set (evals/golden/qa.jsonl)
 make eval                    # run the eval loop (W3)
 ```
+
+The Streamlit app ships two pages:
+
+- **Demo** — RAG query UI (pipeline lands W3).
+- **Author** — hand-curation UI for the 100-Q&A golden set with live progress
+  against the 40/25/20/10/5 distribution targets. Reads/writes
+  `evals/golden/qa.jsonl` with atomic file-rewrite semantics.
 
 `make help` lists all targets.
 

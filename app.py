@@ -1,74 +1,61 @@
-"""Streamlit demo — query → answer + citations + retrieved chunks.
+"""lexgo — RAG eval demo (Streamlit entrypoint).
 
-Skeleton only. The retrieval + generation pipeline lands in W3; this file
-proves the app boots, config loads, and the UI shell is laid out.
+This file is the landing page. Two subpages live in `pages/`:
+  - Demo — query the RAG pipeline (lands W3)
+  - Author — hand-curate the 100-Q&A golden set
+
+Streamlit auto-discovers the `pages/` directory and renders navigation in
+the sidebar. Booting via `make app` opens all three pages.
+
+Per-page browser-tab icons are set via `st.set_page_config(page_icon=...)`
+inside each page file — kept out of the filenames so `git`, `ls`, and shell
+completion stay ergonomic.
 """
 
 import streamlit as st
-from pydantic import ValidationError
 
-from src.config import get_settings
-from src.observability import configure_logging
+from src.ui_helpers import load_settings_or_stop, render_sidebar
 
 st.set_page_config(
-    page_title="lexgo — RAG eval demo",
-    page_icon="📚",
+    page_title="lexgo — RAG eval",
+    page_icon="🔎",
     layout="wide",
 )
 
+settings = load_settings_or_stop()
+render_sidebar(settings)
 
-def _load_settings_or_stop():
-    try:
-        settings = get_settings()
-    except ValidationError as e:
-        st.error("Config failed to load — missing or invalid environment variables.")
-        st.code(str(e))
-        st.info("Copy `.env.example` to `.env` and fill in the required API keys.")
-        st.stop()
-    configure_logging(settings.log_level)
-    return settings
-
-
-settings = _load_settings_or_stop()
-
-st.title("lexgo — RAG eval demo")
+st.title("lexgo — RAG eval")
 st.caption(
-    "Rigorously-evaluated RAG over MIT 6.006 (Algorithms) + MIT 6.830 (Databases). "
-    "Query → answer + citations + retrieved chunks. Pipeline lands W3."
+    "Rigorously-evaluated multi-source RAG over MIT 6.006 (Algorithms) + "
+    "MIT 6.830 (Databases). 4 pipeline variants, 100 hand-authored golden Q&As, "
+    "honest numbers."
 )
 
-with st.sidebar:
-    st.subheader("Pipeline variant")
-    st.selectbox(
-        "Variant",
-        ["V1 baseline", "V2 semantic", "V3 hybrid", "V4 hybrid+rerank"],
-        index=0,
-        disabled=True,
-        help="Selector enabled once the retrieval pipeline lands (W3).",
-    )
+st.markdown(
+    """
+    ### Pages
 
-    st.subheader("Config")
-    st.write(f"**Chat:** `{settings.chat_model}`")
-    st.write(f"**Embed:** `{settings.embedding_model}`")
-    st.write(f"**Rerank:** `{settings.rerank_model}`")
+    - **Demo** — ask the RAG pipeline a question, see the answer + citations
+      + retrieved chunks. Pipeline itself lands in W3; the shell is up now.
+    - **Author** — the hand-curation UI for the 100-Q&A golden set. Add,
+      browse, edit, delete records against `evals/golden/qa.jsonl` with live
+      distribution tracking (40 factual / 25 cross-source synthesis / 20
+      paraphrase / 10 out-of-corpus / 5 adversarial).
 
-    st.subheader("Health")
-    st.success("Config loaded — all required keys present.")
-
-query = st.text_area(
-    "Ask a question about MIT 6.006 or 6.830",
-    placeholder="e.g. What's the worst-case complexity of quicksort with median-of-medians pivot?",
-    disabled=True,
-    help="Enabled once the pipeline lands (W3).",
+    Both pages are in the sidebar.
+    """
 )
-st.button("Answer", disabled=True)
 
 st.divider()
 
-col_answer, col_chunks = st.columns([2, 1])
-with col_answer:
-    st.subheader("Answer")
-    st.info("Answer + inline citations render here once V1 lands.")
-with col_chunks:
-    st.subheader("Retrieved chunks")
-    st.info("Top-k retrieved chunks (with scores) render here.")
+st.markdown(
+    """
+    ### Project context
+
+    Full scoping, corpus breakdown, working conventions, and 4-week schedule
+    live in [`CLAUDE.md`](https://github.com/Axle7XStriker/lexgo-rag-eval/blob/main/CLAUDE.md).
+
+    Repo: [github.com/Axle7XStriker/lexgo-rag-eval](https://github.com/Axle7XStriker/lexgo-rag-eval)
+    """
+)

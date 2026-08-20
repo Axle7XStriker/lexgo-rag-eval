@@ -34,6 +34,11 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
+# RUF001 flags ambiguous unicode characters in string literals — we use
+# em-dashes ("—"), arrows ("→"), and section marks ("§") in help text and
+# error messages throughout the repo. These are intentional and readable;
+# suppressing repo-wide is cleaner than a `# noqa: RUF001` per occurrence.
+ignore = ["RUF001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
