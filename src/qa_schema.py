@@ -122,14 +122,7 @@ class Citation(BaseModel):
 
 
 class QARecord(BaseModel):
-    """A single hand-authored golden Q&A record.
-
-    `sources` is a derived property (unique `source_id`s across
-    `gold_citations`) — never stored on disk. This eliminates the drift risk
-    of keeping a redundant field in sync with citations, and grep-by-bucket
-    still works via `doc_path` (which encodes source_id as its filename prefix,
-    e.g. `A1_lec03.pdf`).
-    """
+    """A single hand-authored golden Q&A record."""
 
     model_config = ConfigDict(extra="forbid")
 
@@ -149,7 +142,13 @@ class QARecord(BaseModel):
 
     @cached_property
     def sources(self) -> list[SourceId]:
-        """Unique source buckets referenced by this record's citations, sorted."""
+        """Unique source buckets referenced by this record's citations, sorted.
+
+        Derived rather than stored: keeping `sources` as a field alongside
+        `gold_citations` would create a drift risk (two places to update on
+        every citation edit). Grep-by-bucket still works via `doc_path`,
+        which encodes source_id as its filename prefix (e.g. `A1_lec03.pdf`).
+        """
         return sorted({c.source_id for c in self.gold_citations}, key=lambda s: s.value)
 
     @model_validator(mode="after")
