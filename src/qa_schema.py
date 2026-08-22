@@ -32,8 +32,8 @@ class SourceId(StrEnum):
     A2 = "A2"  # 6.006 recitations 1-12
     A3 = "A3"  # 6.006 problem sets + solutions (PS1-PS4)
     B1 = "B1"  # 6.830 lectures
-    B2 = "B2"  # 6.830 papers: storage / indexing / access methods
-    B3 = "B3"  # 6.830 papers: query proc / txn / concurrency
+    B2 = "B2"  # 6.830 quizzes + solutions (quiz 1-2)
+    B3 = "B3"  # 6.830 papers: query proc / txn / concurrency / column stores
 
 
 SOURCE_LABELS: dict[SourceId, str] = {
@@ -41,8 +41,8 @@ SOURCE_LABELS: dict[SourceId, str] = {
     SourceId.A2: "MIT 6.006 — Recitation notes",
     SourceId.A3: "MIT 6.006 — Problem sets + solutions",
     SourceId.B1: "MIT 6.830 — Lecture notes",
-    SourceId.B2: "MIT 6.830 — Papers: storage / indexing",
-    SourceId.B3: "MIT 6.830 — Papers: query proc / txn / cc",
+    SourceId.B2: "MIT 6.830 — Quizzes + solutions",
+    SourceId.B3: "MIT 6.830 — Papers: query proc / txn / cc / column stores",
 }
 
 
