@@ -60,10 +60,8 @@ If any of the following comes up, STOP and flag before proceeding:
 
 **Course B — MIT 6.830 (Database Systems):**
 - **B1:** Lecture notes (bundled — they synthesize the papers)
-- **B2:** Quizzes + solutions (OCW-hosted 2008 quiz 1 & quiz 2, both with solutions)
+- **B2:** Quizzes + solutions (OCW-hosted Fall 2010 quiz 1 & quiz 2, both with solutions)
 - **B3:** Papers bundle — 5 papers spanning query processing, transactions, concurrency, and column stores (Selinger, Franklin, Kung/Robinson, Gray, C-Store)
-
-**Why B2 = quizzes (not another paper bundle):** the original scope had B2/B3 as two paper bundles differentiated only by topic. Both bucket types looked nearly identical to a chunker/retriever (same prose style, same terminology density), which weakened V1↔V3 differentiation. Swapping B2 to quizzes gives Course B three distinct format types (lectures / short-form Q+solution / long-form papers), symmetric with Course A, and gives BM25 (V3) a genuinely different retrieval surface to shine on. Decided 2026-08-21.
 
 **Q&A authoring strategy for 6.830:**
 - **Lectures first (B1)** — they simplify the papers and anchor most factual/paraphrase Q&As.

@@ -54,17 +54,17 @@ def _valid_cross_source() -> dict:
         "id": "x001",
         "type": QAType.CROSS_SOURCE_SYNTHESIS.value,
         "question": (
-            "How does the buffer management approach in Chou-DeWitt compare to what "
-            "the lecture recommends?"
+            "How does the join-cost derivation in the quiz solution align with the "
+            "cost model the Selinger lecture introduces?"
         ),
         "gold_answer": (
-            "Chou-DeWitt argues query-plan-aware buffer management outperforms LRU on "
-            "certain workloads, matching the lecture's point that access-pattern hints "
-            "beat generic replacement policies."
+            "The quiz solution applies the same selectivity-based estimation the "
+            "Selinger lecture presents — cardinality of each input drives the join "
+            "cost, and plan choice follows from comparing those estimates."
         ),
         "gold_citations": [
-            {"doc_path": "6.830/lectures/B1_lec04.pdf", "page_or_section": "§2"},
-            {"doc_path": "6.830/papers/B2_chou_dewitt_buffer.pdf", "page_or_section": "§3.2"},
+            {"doc_path": "6.830/lectures/B1_lec09_selinger.pdf", "page_or_section": "§3"},
+            {"doc_path": "6.830/exams/B2_quiz01_sol.pdf", "page_or_section": "Q4"},
         ],
     }
 

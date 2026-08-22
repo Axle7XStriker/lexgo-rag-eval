@@ -13,7 +13,8 @@ Kinds:
 takes the first that returns a valid PDF (magic bytes `%PDF`).
 
 `optional=True` means the fetcher logs the miss and exits 0 anyway — used
-for papers that lack a reliably-open host (R*-Tree in particular).
+for sources whose host currently 5xxs (6.006 rec03/rec04 in particular,
+which return 503 from OCW).
 """
 
 from dataclasses import dataclass
@@ -142,10 +143,7 @@ _MIT_6830_CACHE = "https://people.csail.mit.edu/tdanford/6830papers"
 # ── B2: 6.830 exams (2 quizzes × {problems, solutions})
 _B2: list[ManifestEntry] = [_ocw_830_quiz(n, sol) for n in (1, 2) for sol in (False, True)]
 
-# ── B3: 5 papers on query proc / transactions / concurrency / column stores.
-# C-Store lives here (rather than a separate storage/indexing bucket) so B3
-# is the single "papers" source — B2 was repurposed to exams for source-type
-# diversity (see CLAUDE.md Corpus section).
+# ── B3: 5 papers on query proc / transactions / concurrency / column stores
 _B3: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.B3,
