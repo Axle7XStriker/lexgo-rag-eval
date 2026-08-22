@@ -13,7 +13,8 @@ Kinds:
 takes the first that returns a valid PDF (magic bytes `%PDF`).
 
 `optional=True` means the fetcher logs the miss and exits 0 anyway — used
-for papers that lack a reliably-open host (R*-Tree in particular).
+for sources whose host currently 5xxs (6.006 rec03/rec04 in particular,
+which return 503 from OCW).
 """
 
 from dataclasses import dataclass
@@ -98,6 +99,18 @@ def _ocw_830_lec(slug: str, dest_stem: str, *, optional: bool = False) -> Manife
     )
 
 
+def _ocw_830_quiz(n: int, sol: bool) -> ManifestEntry:
+    suffix = "_sol" if sol else ""
+    label = "solutions" if sol else "problems"
+    return ManifestEntry(
+        source_id=SourceId.B2,
+        description=f"6.830 quiz {n} — {label}",
+        kind="ocw_resource_page",
+        urls=(f"{OCW_830_BASE}/mit6_830f10_quiz{n:02d}{suffix}/",),
+        dest_path=f"6.830/exams/B2_quiz{n:02d}{suffix}.pdf",
+    )
+
+
 # ── A1: 6.006 lectures 1-12 (models → sorting → trees → hashing → numerics)
 _A1: list[ManifestEntry] = [_ocw_006_lec(n) for n in range(1, 13)]
 
@@ -127,38 +140,10 @@ _B1: list[ManifestEntry] = [_ocw_830_lec(slug, stem) for slug, stem in _B1_LECTU
 # Kept as the primary URL for every paper below; third-party mirrors are fallbacks.
 _MIT_6830_CACHE = "https://people.csail.mit.edu/tdanford/6830papers"
 
-# ── B2: 3 papers on storage / indexing / access methods
-_B2: list[ManifestEntry] = [
-    ManifestEntry(
-        source_id=SourceId.B2,
-        description="Chou & DeWitt — Evaluation of Buffer Management Strategies (VLDB 1985)",
-        kind="direct_pdf",
-        urls=(
-            f"{_MIT_6830_CACHE}/chou-dewitt-eval-buffer-management.pdf",
-            "https://www.vldb.org/conf/1985/P127.PDF",
-        ),
-        dest_path="6.830/papers/B2_chou_dewitt_buffer.pdf",
-    ),
-    ManifestEntry(
-        source_id=SourceId.B2,
-        description="Beckmann et al. — The R*-Tree (SIGMOD 1990)",
-        kind="direct_pdf",
-        urls=(
-            f"{_MIT_6830_CACHE}/beckmann-r-star-tree.pdf",
-            "https://infolab.usc.edu/csci599/Fall2001/paper/rstar-tree.pdf",
-        ),
-        dest_path="6.830/papers/B2_rstar_tree.pdf",
-    ),
-    ManifestEntry(
-        source_id=SourceId.B2,
-        description="Stonebraker et al. — C-Store: A Column-oriented DBMS (VLDB 2005)",
-        kind="direct_pdf",
-        urls=(f"{_MIT_6830_CACHE}/stonebraker-cstore.pdf",),
-        dest_path="6.830/papers/B2_cstore.pdf",
-    ),
-]
+# ── B2: 6.830 exams (2 quizzes × {problems, solutions})
+_B2: list[ManifestEntry] = [_ocw_830_quiz(n, sol) for n in (1, 2) for sol in (False, True)]
 
-# ── B3: 4 papers on query proc / transactions / concurrency
+# ── B3: 5 papers on query proc / transactions / concurrency / column stores
 _B3: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.B3,
@@ -193,6 +178,13 @@ _B3: list[ManifestEntry] = [
         kind="direct_pdf",
         urls=(f"{_MIT_6830_CACHE}/gray-lock-granularity.pdf",),
         dest_path="6.830/papers/B3_gray_granularity.pdf",
+    ),
+    ManifestEntry(
+        source_id=SourceId.B3,
+        description="Stonebraker et al. — C-Store: A Column-oriented DBMS (VLDB 2005)",
+        kind="direct_pdf",
+        urls=(f"{_MIT_6830_CACHE}/stonebraker-cstore.pdf",),
+        dest_path="6.830/papers/B3_cstore.pdf",
     ),
 ]
 

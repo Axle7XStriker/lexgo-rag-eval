@@ -2,7 +2,7 @@
 
 **What this file is:** project-level context for Claude Code sessions in this repo. Auto-loaded when Claude works here.
 
-**Last updated:** 2026-08-15
+**Last updated:** 2026-08-21
 
 ---
 
@@ -60,10 +60,15 @@ If any of the following comes up, STOP and flag before proceeding:
 
 **Course B — MIT 6.830 (Database Systems):**
 - **B1:** Lecture notes (bundled — they synthesize the papers)
-- **B2:** Papers bundle A — 3-4 papers from storage / indexing / access methods
-- **B3:** Papers bundle B — 3-4 papers from query processing / transactions / concurrency
+- **B2:** Quizzes + solutions (OCW-hosted Fall 2010 quiz 1 & quiz 2, both with solutions)
+- **B3:** Papers bundle — 5 papers spanning query processing, transactions, concurrency, and column stores (Selinger, Franklin, Kung/Robinson, Gray, C-Store)
 
-**Q&A authoring strategy for 6.830:** most Q&As from lectures first (they simplify the papers); use papers primarily for cross-source synthesis questions ("how does this paper's approach to X compare to what the lecture recommends?"). Design 6.006 Q&As around concepts and complexity claims, not "what does line 47 do."
+**Q&A authoring strategy for 6.830:**
+- **Lectures first (B1)** — they simplify the papers and anchor most factual/paraphrase Q&As.
+- **Quizzes (B2)** — mine for factual-recall Q&As grounded in the *solutions* (never treat the quiz question as a golden Q&A verbatim — it must be re-authored so the golden Q wording differs from the corpus wording, or it becomes a trivial retrieval test). Great for cross-source synthesis: "the quiz tests X; how does the lecture explain it / the paper deepen it."
+- **Papers (B3)** — primarily for cross-source synthesis ("how does this paper's approach to X compare to the lecture recommendation?").
+
+Design 6.006 Q&As around concepts and complexity claims, not "what does line 47 do."
 
 **Format verified 2026-08-15:** OCW PDFs copy-paste cleanly into text editor.
 
