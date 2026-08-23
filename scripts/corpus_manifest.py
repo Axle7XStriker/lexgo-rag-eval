@@ -1,8 +1,9 @@
-"""Pinned corpus manifest — the 6 source docs behind the RAG eval.
+"""Pinned corpus manifest — the source docs behind the RAG eval.
 
-Two source courses, three source_ids per course. Filenames are prefixed with
-their source_id so `ls corpus/` and `grep A2 evals/golden/qa.jsonl` are both
-self-documenting. Zero-padded lecture numbers preserve alphanumeric sort.
+Two source courses. 6.006 has four buckets (A1..A4); 6.830 has five (B1..B5).
+Filenames are prefixed with their source_id so `ls corpus/` and
+`grep A2 evals/golden/qa.jsonl` are both self-documenting. Zero-padded
+lecture numbers preserve alphanumeric sort.
 
 Kinds:
   - "ocw_resource_page": URL points to an OCW resource landing page; the
@@ -15,6 +16,12 @@ takes the first that returns a valid PDF (magic bytes `%PDF`).
 `optional=True` means the fetcher logs the miss and exits 0 anyway — used
 for sources whose host currently 5xxs (6.006 rec03/rec04 in particular,
 which return 503 from OCW).
+
+`reference_only=True` means the fetcher never issues an HTTP request for
+this entry — used for copyrighted textbooks (CLRS, Red Book) whose URL is
+recorded for citation/authoring purposes only. If a human legally obtains
+a PDF and places it at `dest_path`, the standard `dest.exists()`
+short-circuit picks it up on the next run and no other code path changes.
 """
 
 from dataclasses import dataclass
@@ -33,18 +40,23 @@ class ManifestEntry:
     """One corpus PDF as tracked by the fetcher.
 
     Fields:
-      source_id: which of the 6 buckets this PDF belongs to (SourceId enum,
-        shared with src/qa_schema.py — single source of truth).
+      source_id: which bucket this PDF belongs to (SourceId enum, shared with
+        src/qa_schema.py — single source of truth).
       description: human-readable label for logs / error messages.
       kind: "ocw_resource_page" means the URL is an OCW landing page whose
         HTML must be parsed to find the actual PDF href; "direct_pdf" means
         the URL points at the PDF bytes directly.
       urls: fallback list — the fetcher tries them in order and takes the
-        first that returns a valid PDF (magic bytes %PDF).
+        first that returns a valid PDF (magic bytes %PDF). For reference-only
+        entries this is the reference URL(s) — not fetched.
       dest_path: where to store it under corpus/, relative. Filenames start
         with the source_id (e.g. A1_lec03.pdf) so `ls` groups by bucket.
       optional: if True, a full-list failure is logged but does not fail
         the run (used for papers with no reliably-open host).
+      reference_only: if True, the fetcher never issues an HTTP request; the
+        entry exists solely to register a citable doc_path + reference URL.
+        A manually-placed PDF at `dest_path` is still picked up by the
+        standard `dest.exists()` short-circuit — no other branching needed.
     """
 
     source_id: SourceId
@@ -53,6 +65,7 @@ class ManifestEntry:
     urls: tuple[str, ...]
     dest_path: str  # relative to corpus/
     optional: bool = False
+    reference_only: bool = False
 
 
 def _ocw_006_lec(n: int) -> ManifestEntry:
@@ -111,18 +124,34 @@ def _ocw_830_quiz(n: int, sol: bool) -> ManifestEntry:
     )
 
 
-# ── A1: 6.006 lectures 1-12 (models → sorting → trees → hashing → numerics)
-_A1: list[ManifestEntry] = [_ocw_006_lec(n) for n in range(1, 13)]
+# ── A1: 6.006 lectures 1-24 (full F11 set; typed PDFs only — the `_orig`
+# handwritten scans are skipped for cleaner text extraction downstream)
+_A1: list[ManifestEntry] = [_ocw_006_lec(n) for n in range(1, 25)]
 
-# ── A2: 6.006 recitations 1-12. rec03/rec04 currently return 503 from OCW
-# (Fastly cache errors — may resolve later; marked optional so they don't
-# block the fetcher). Verified against the recitations page: the other 10
-# resource pages exist and render correctly.
-_OPTIONAL_A2 = {3, 4}
-_A2: list[ManifestEntry] = [_ocw_006_rec(n, optional=n in _OPTIONAL_A2) for n in range(1, 13)]
+# ── A2: 6.006 recitations 1-24. rec03/rec04 return 503 from OCW (Fastly
+# cache errors — may resolve later). rec13..rec24 are newly added and not
+# yet fetch-verified — marked optional pessimistically; downgrade to
+# required in a follow-up commit once first successful fetch confirms them.
+_OPTIONAL_A2 = {3, 4, *range(13, 25)}
+_A2: list[ManifestEntry] = [_ocw_006_rec(n, optional=n in _OPTIONAL_A2) for n in range(1, 25)]
 
 # ── A3: 6.006 PS1-PS4 with solutions (8 PDFs)
 _A3: list[ManifestEntry] = [_ocw_006_ps(n, sol) for n in range(1, 5) for sol in (False, True)]
+
+# ── A4: CLRS 3rd ed textbook. Copyrighted MIT Press title; not distributed
+# from this repo. URL points to the publisher's canonical page. If a human
+# legally obtains a copy and places it at dest_path, the fetcher's
+# `dest.exists()` short-circuit picks it up transparently.
+_A4: list[ManifestEntry] = [
+    ManifestEntry(
+        source_id=SourceId.A4,
+        description="Cormen, Leiserson, Rivest, Stein — Introduction to Algorithms, 3rd ed (CLRS)",
+        kind="direct_pdf",  # placeholder — reference_only short-circuits before any GET
+        urls=("https://mitpress.mit.edu/9780262033848/introduction-to-algorithms/",),
+        dest_path="6.006/textbook/A4_clrs_3ed.pdf",
+        reference_only=True,
+    ),
+]
 
 # ── B1: 6.830 lectures. Enumerated against the OCW lecture-notes index —
 # lec08 is genuinely skipped in the published materials (jumps 07/07b → 09/09_selinger).
@@ -188,4 +217,39 @@ _B3: list[ManifestEntry] = [
     ),
 ]
 
-MANIFEST: list[ManifestEntry] = _A1 + _A2 + _A3 + _B1 + _B2 + _B3
+# ── B4: Red Book 4th ed (Hellerstein & Stonebraker). Copyrighted MIT Press
+# title; not distributed. URL points to the book's public companion site.
+_B4: list[ManifestEntry] = [
+    ManifestEntry(
+        source_id=SourceId.B4,
+        description="Hellerstein & Stonebraker — Readings in Database Systems, 4th ed (Red Book)",
+        kind="direct_pdf",  # placeholder — reference_only short-circuits before any GET
+        urls=("http://www.redbook.io/",),
+        dest_path="6.830/textbook/B4_red_book_4ed.pdf",
+        reference_only=True,
+    ),
+]
+
+# ── B5: Ramakrishnan & Gehrke, Database Management Systems, 3rd ed.
+# User-supplied URL: a copyrighted McGraw-Hill title mirrored on a personal
+# GitHub repo of uncertain legal provenance. Kept `optional=True` so a
+# takedown / 404 never breaks CI. `corpus/` is gitignored — the PDF is
+# never redistributed from this repo. See plan file for the full risk note.
+# NOTE: use raw.githubusercontent.com (not github.com/.../blob/...) so we
+# get PDF bytes rather than the GitHub file-viewer HTML page.
+_B5: list[ManifestEntry] = [
+    ManifestEntry(
+        source_id=SourceId.B5,
+        description="Ramakrishnan & Gehrke — Database Management Systems, 3rd ed (DMS)",
+        kind="direct_pdf",
+        urls=(
+            "https://raw.githubusercontent.com/Iabhinavydv/"
+            "Ramakrishnan---Database-Management-Systems-3rd-Edition./main/"
+            "Ramakrishnan%20-%20Database%20Management%20Systems%203rd%20Edition.pdf",
+        ),
+        dest_path="6.830/textbook/B5_dms_3ed.pdf",
+        optional=True,
+    ),
+]
+
+MANIFEST: list[ManifestEntry] = _A1 + _A2 + _A3 + _A4 + _B1 + _B2 + _B3 + _B4 + _B5

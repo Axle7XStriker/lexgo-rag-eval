@@ -20,7 +20,7 @@ A rigorously-evaluated multi-source RAG system over academic course materials, w
 
 ### In
 
-- Corpus: MIT 6.006 (Algorithms) + MIT 6.830 (Databases), 3 sources per course = 6 total
+- Corpus: MIT 6.006 (Algorithms) = A1..A4 (A4 = CLRS textbook, reference-only). MIT 6.830 (Databases) = B1..B5 (B4 = Red Book, reference-only; B5 = DMS textbook, user-supplied URL, optional).
 - 4 retrieval variants (matrix below), single answer-generation prompt held constant
 - 100 hand-curated Q&As with source citations
 - Metrics: answer accuracy, citation precision, retrieval recall@5
@@ -54,14 +54,21 @@ If any of the following comes up, STOP and flag before proceeding:
 ## Corpus
 
 **Course A — MIT 6.006 (Intro Algorithms):**
-- **A1:** Lecture notes (coherent subset, e.g. lectures 1-12 or 13-24)
-- **A2:** Recitation notes
-- **A3:** Problem sets with solutions
+- **A1:** Lecture notes — full F11 set, lectures 1-24
+- **A2:** Recitation notes — full F11 set, recitations 1-24 (rec03/rec04 + rec13-24 optional pending first fetch)
+- **A3:** Problem sets with solutions (PS1-PS4)
+- **A4:** CLRS 3rd ed textbook — reference-only. Copyrighted MIT Press title, not distributed from this repo. Manifest entry exists so citations resolve; PDF must be manually placed at `corpus/6.006/textbook/A4_clrs_3ed.pdf` to participate in retrieval.
 
 **Course B — MIT 6.830 (Database Systems):**
 - **B1:** Lecture notes (bundled — they synthesize the papers)
 - **B2:** Quizzes + solutions (OCW-hosted Fall 2010 quiz 1 & quiz 2, both with solutions)
 - **B3:** Papers bundle — 5 papers spanning query processing, transactions, concurrency, and column stores (Selinger, Franklin, Kung/Robinson, Gray, C-Store)
+- **B4:** Red Book 4th ed (Hellerstein/Stonebraker) — reference-only. Copyrighted MIT Press title, not distributed. Same manual-placement contract as A4.
+- **B5:** Ramakrishnan/Gehrke DMS 3rd ed — fetched from a user-supplied URL (see manifest for legal-provenance note). Marked `optional` so a takedown never breaks CI.
+
+**Note:** OCW 6.830 has no recitations — no B-bucket for them. (Do not invent one.)
+
+**Reference-only semantics:** entries marked `reference_only=True` in the manifest are citation-only placeholders. The fetcher never hits the network for them; they exist so `evals/validate_golden.py` accepts citations to canonical textbook material. Downstream chunking/retrieval will skip missing files.
 
 **Q&A authoring strategy for 6.830:**
 - **Lectures first (B1)** — they simplify the papers and anchor most factual/paraphrase Q&As.

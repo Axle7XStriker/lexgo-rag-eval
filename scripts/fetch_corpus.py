@@ -98,10 +98,16 @@ class TransientHTTPError(RuntimeError):
 
 @dataclass
 class FetchResult:
-    """Outcome of one manifest entry — one of ok / skipped_present / failed / missing_optional."""
+    """Outcome of one manifest entry.
+
+    One of: ok / skipped_present / failed / missing_optional / reference_only.
+    `reference_only` is a short-circuit for entries marked as such in the manifest —
+    the fetcher never issues an HTTP request for them; they exist so that the
+    doc_path is a valid citation target (see ManifestEntry.reference_only).
+    """
 
     entry: ManifestEntry
-    status: str  # "ok" | "skipped_present" | "failed" | "missing_optional"
+    status: str  # "ok" | "skipped_present" | "failed" | "missing_optional" | "reference_only"
     url_used: str | None = None
     error: str | None = None
 
@@ -244,6 +250,11 @@ def fetch_entry(entry: ManifestEntry, *, force: bool = False, logger=None) -> Fe
     dest = CORPUS_ROOT / entry.dest_path
     if not force and dest.exists() and dest.stat().st_size > 0:
         return FetchResult(entry, status="skipped_present")
+    # Reference-only entries never hit the network. Ordering matters: the
+    # `dest.exists()` check runs FIRST so a manually-placed textbook PDF is
+    # treated as `skipped_present` (normal) rather than `reference_only`.
+    if entry.reference_only:
+        return FetchResult(entry, status="reference_only")
     last_error: str | None = None
     for url in entry.urls:
         try:
@@ -277,11 +288,15 @@ def _print_summary(results: list[FetchResult]) -> None:
     Sample output::
 
         ── fetch_corpus summary ─────────────────────────────────────
-          ok:               57    skipped:    2    failed:     0    missing (optional): 2
+          ok:               57    skipped:    2    failed:     0
+          missing (optional): 2    reference-only: 2
 
           Optional missing (source manually if needed):
             - A2/6.006/recitations/A2_rec03.pdf
             - A2/6.006/recitations/A2_rec04.pdf
+
+          Reference-only (never fetched — source manually if needed):
+            - A4/6.006/textbook/A4_clrs_3ed.pdf → https://mitpress.mit.edu/...
         ─────────────────────────────────────────────────────────────
     """
     buckets: dict[str, list[FetchResult]] = {
@@ -289,6 +304,7 @@ def _print_summary(results: list[FetchResult]) -> None:
         "skipped_present": [],
         "failed": [],
         "missing_optional": [],
+        "reference_only": [],
     }
     for r in results:
         buckets[r.status].append(r)
@@ -298,7 +314,10 @@ def _print_summary(results: list[FetchResult]) -> None:
         f"  ok:               {len(buckets['ok']):3d}"
         f"    skipped:  {len(buckets['skipped_present']):3d}"
         f"    failed:   {len(buckets['failed']):3d}"
-        f"    missing (optional): {len(buckets['missing_optional']):3d}"
+    )
+    print(
+        f"  missing (optional): {len(buckets['missing_optional']):3d}"
+        f"    reference-only: {len(buckets['reference_only']):3d}"
     )
     if buckets["failed"]:
         print("\n  REQUIRED failures (fetcher exits 1):")
@@ -308,6 +327,11 @@ def _print_summary(results: list[FetchResult]) -> None:
         print("\n  Optional missing (source manually if needed):")
         for r in buckets["missing_optional"]:
             print(f"    - {r.entry.source_id}/{r.entry.dest_path}")
+    if buckets["reference_only"]:
+        print("\n  Reference-only (never fetched — source manually if needed):")
+        for r in buckets["reference_only"]:
+            urls = " | ".join(r.entry.urls)
+            print(f"    - {r.entry.source_id}/{r.entry.dest_path} → {urls}")
     print("─────────────────────────────────────────────────────────────\n")
 
 
@@ -327,7 +351,7 @@ def main() -> int:
     )
     parser.add_argument(
         "--only",
-        choices=["A1", "A2", "A3", "B1", "B2", "B3"],
+        choices=["A1", "A2", "A3", "A4", "B1", "B2", "B3", "B4", "B5"],
         help="Restrict to entries with this source_id.",
     )
     parser.add_argument(
@@ -354,7 +378,13 @@ def main() -> int:
         for e in entries:
             print(f"  {e.source_id}  {e.dest_path}")
             for u in e.urls:
-                print(f"      -> {u}{' (optional)' if e.optional else ''}")
+                if e.reference_only:
+                    tag = " (REFERENCE ONLY — not downloaded)"
+                elif e.optional:
+                    tag = " (optional)"
+                else:
+                    tag = ""
+                print(f"      -> {u}{tag}")
         return 0
 
     results: list[FetchResult] = []
@@ -366,6 +396,7 @@ def main() -> int:
             "skipped_present": "·",
             "failed": "✗",
             "missing_optional": "?",
+            "reference_only": "⇢",
         }[result.status]
         print(f"  {marker} [{entry.source_id}] {entry.dest_path}  ({result.status})")
         # Sleep between downloads that actually hit the network.
