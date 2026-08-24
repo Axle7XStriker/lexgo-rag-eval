@@ -13,14 +13,8 @@ Kinds:
 `urls` is a tuple of fallback URLs; the fetcher tries them in order and
 takes the first that returns a valid PDF (magic bytes `%PDF`).
 
-`optional=True` means the fetcher logs the miss and exits 0 anyway — used
-for (a) sources whose host currently 5xxs (6.006 rec03/rec04 return 503
-from OCW; rec13-24 not yet fetch-verified), and (b) copyrighted textbook
-entries (CLRS, Red Book) whose URLs point to publisher pages rather than
-PDFs — the fetcher attempts them, fast-fails the %PDF check, and reports
-`missing_optional`. If a human legally obtains a copy and places the PDF
-at `dest_path`, the standard `dest.exists()` short-circuit picks it up
-transparently on the next run.
+`optional=True` means the fetcher logs the miss and exits 0 anyway — for
+entries where inclusion of the document in the corpus is not required.
 """
 
 from dataclasses import dataclass

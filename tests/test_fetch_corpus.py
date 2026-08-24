@@ -19,12 +19,6 @@ from src.qa_schema import SourceId
 
 @pytest.fixture
 def optional_entry() -> ManifestEntry:
-    """A generic `optional=True` manifest entry pointing at an unresolvable host.
-
-    Kept abstract on purpose — the tests here assert generic fetcher
-    behavior (short-circuits and status reporting), not the specifics of
-    any real corpus source.
-    """
     return ManifestEntry(
         source_id=SourceId.A1,
         description="test fixture — optional entry",
