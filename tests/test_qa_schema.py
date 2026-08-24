@@ -125,6 +125,19 @@ class TestCitation:
                 }
             )
 
+    @pytest.mark.parametrize(
+        "doc_path",
+        [
+            "6.006/lectures/A0_lec01.pdf",  # A[1-4] range: 0 rejected
+            "6.006/lectures/A5_lec01.pdf",  # A[1-4] range: 5 rejected
+            "6.830/lectures/B6_lec01.pdf",  # B[1-5] range: 6 rejected
+            "6.830/lectures/B0_lec01.pdf",  # B[1-5] range: 0 rejected
+        ],
+    )
+    def test_doc_path_rejects_out_of_range_ids(self, doc_path: str) -> None:
+        with pytest.raises(ValidationError, match="doc_path"):
+            Citation.model_validate({"doc_path": doc_path, "page_or_section": "x"})
+
 
 # ─────────────────────────────────────────────────────────────────────
 class TestQARecordInvariants:
@@ -275,5 +288,8 @@ class TestHelpers:
     def test_target_distribution_sums_to_100(self) -> None:
         assert sum(TARGET_DISTRIBUTION.values()) == GOLDEN_TOTAL == 100
 
-    def test_source_id_covers_all_six(self) -> None:
-        assert {s.value for s in SourceId} == {"A1", "A2", "A3", "B1", "B2", "B3"}
+    def test_source_id_covers_all_buckets(self) -> None:
+        assert {s.value for s in SourceId} == {
+            "A1", "A2", "A3", "A4",
+            "B1", "B2", "B3", "B4", "B5",
+        }

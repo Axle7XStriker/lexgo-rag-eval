@@ -20,7 +20,7 @@ A rigorously-evaluated multi-source RAG system over academic course materials, w
 
 ### In
 
-- Corpus: MIT 6.006 (Algorithms) + MIT 6.830 (Databases), 3 sources per course = 6 total
+- Corpus: MIT 6.006 (Algorithms) A1..A4 and MIT 6.830 (Databases) B1..B5
 - 4 retrieval variants (matrix below), single answer-generation prompt held constant
 - 100 hand-curated Q&As with source citations
 - Metrics: answer accuracy, citation precision, retrieval recall@5
@@ -54,14 +54,17 @@ If any of the following comes up, STOP and flag before proceeding:
 ## Corpus
 
 **Course A — MIT 6.006 (Intro Algorithms):**
-- **A1:** Lecture notes (coherent subset, e.g. lectures 1-12 or 13-24)
-- **A2:** Recitation notes
-- **A3:** Problem sets with solutions
+- **A1:** Lecture notes — full F11 set, lectures 1-24
+- **A2:** Recitation notes — full F11 set, recitations 1-24
+- **A3:** Problem sets with solutions (PS1-PS7)
+- **A4:** CLRS 3rd ed textbook. Copyrighted; not distributed from this repo. Place a legal PDF at `corpus/6.006/textbook/A4_clrs_3ed.pdf` to participate in retrieval.
 
 **Course B — MIT 6.830 (Database Systems):**
 - **B1:** Lecture notes (bundled — they synthesize the papers)
 - **B2:** Quizzes + solutions (OCW-hosted Fall 2010 quiz 1 & quiz 2, both with solutions)
 - **B3:** Papers bundle — 5 papers spanning query processing, transactions, concurrency, and column stores (Selinger, Franklin, Kung/Robinson, Gray, C-Store)
+- **B4:** Red Book 4th ed (Hellerstein/Stonebraker). Copyrighted; not distributed. Place a legal PDF at `corpus/6.830/textbook/B4_red_book_4ed.pdf` to participate in retrieval.
+- **B5:** Ramakrishnan/Gehrke DMS 3rd ed — fetched from a user-supplied URL.
 
 **Q&A authoring strategy for 6.830:**
 - **Lectures first (B1)** — they simplify the papers and anchor most factual/paraphrase Q&As.

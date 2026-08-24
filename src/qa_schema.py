@@ -28,21 +28,27 @@ SCHEMA_VERSION = 1
 
 
 class SourceId(StrEnum):
-    A1 = "A1"  # 6.006 lectures 1-12
-    A2 = "A2"  # 6.006 recitations 1-12
-    A3 = "A3"  # 6.006 problem sets + solutions (PS1-PS4)
+    A1 = "A1"  # 6.006 lectures (full F11 set)
+    A2 = "A2"  # 6.006 recitations (full F11 set)
+    A3 = "A3"  # 6.006 problem sets + solutions
+    A4 = "A4"  # 6.006 textbook — CLRS 3rd ed
     B1 = "B1"  # 6.830 lectures
-    B2 = "B2"  # 6.830 quizzes + solutions (quiz 1-2)
+    B2 = "B2"  # 6.830 quizzes + solutions
     B3 = "B3"  # 6.830 papers: query proc / txn / concurrency / column stores
+    B4 = "B4"  # 6.830 textbook — Red Book 4th ed
+    B5 = "B5"  # 6.830 textbook — Ramakrishnan/Gehrke DMS 3rd ed
 
 
 SOURCE_LABELS: dict[SourceId, str] = {
     SourceId.A1: "MIT 6.006 — Lecture notes",
     SourceId.A2: "MIT 6.006 — Recitation notes",
     SourceId.A3: "MIT 6.006 — Problem sets + solutions",
+    SourceId.A4: "MIT 6.006 — CLRS 3rd ed textbook",
     SourceId.B1: "MIT 6.830 — Lecture notes",
     SourceId.B2: "MIT 6.830 — Quizzes + solutions",
     SourceId.B3: "MIT 6.830 — Papers: query proc / txn / cc / column stores",
+    SourceId.B4: "MIT 6.830 — Red Book 4th ed",
+    SourceId.B5: "MIT 6.830 — Ramakrishnan/Gehrke DMS 3rd ed",
 }
 
 
@@ -77,7 +83,7 @@ ID_PREFIX_FOR_TYPE: dict[QAType, str] = {
 # scripts/corpus_manifest.py: <course>/<kind>/<source_id>_<slug>.pdf. The
 # source_id is derived from the filename's 2-char prefix (A1 / B3 / ...) — we
 # never store it on disk, so there's exactly one source of truth per citation.
-DOC_PATH_PATTERN = re.compile(r"^6\.(?:006|830)/[a-z_]+/([AB][123])_[a-z0-9_]+\.pdf$")
+DOC_PATH_PATTERN = re.compile(r"^6\.(?:006|830)/[a-z_]+/(A[1-4]|B[1-5])_[a-z0-9_]+\.pdf$")
 
 
 class Citation(BaseModel):

@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from evals.validate_golden import KNOWN_DOC_PATHS, validate_golden
+from scripts.corpus_manifest import MANIFEST
 from src.qa_schema import Citation, QARecord, QAType, save_jsonl_atomic
 
 # Pick two real corpus paths from the manifest (any two will do — they're
@@ -61,3 +62,20 @@ def test_validator_flags_duplicate_ids(tmp_path: Path) -> None:
     report = validate_golden(path)
     assert report.duplicate_ids == ["f001"]
     assert not report.is_clean
+
+
+def test_every_manifest_entry_is_citable(tmp_path: Path) -> None:
+    # Drift guard for DOC_PATH_PATTERN vs manifest naming: constructing a
+    # Citation for every manifest dest_path (via `_factual`) fires the
+    # schema regex; a new source whose dest_path shape the regex rejects
+    # raises ValidationError here loudly.
+    #
+    # The save+validate round-trip additionally exercises the golden-set
+    # cross-field rules on a batch that size. (KNOWN_DOC_PATHS is derived
+    # from MANIFEST in the same module the test imports from, so a
+    # membership check would be tautological — omitted intentionally.)
+    records = [_factual(f"f{i:03d}", e.dest_path) for i, e in enumerate(MANIFEST)]
+    path = tmp_path / "qa.jsonl"
+    save_jsonl_atomic(path, records, backup=False)
+    report = validate_golden(path)
+    assert report.is_clean, f"validator drift: {report}"
