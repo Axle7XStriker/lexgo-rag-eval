@@ -63,15 +63,15 @@ def test_validator_flags_duplicate_ids(tmp_path: Path) -> None:
     assert not report.is_clean
 
 
-def test_validator_accepts_reference_only_doc_path(tmp_path: Path) -> None:
-    # Reference-only manifest entries are valid citation targets — the
-    # corresponding PDF may never exist on disk (copyrighted textbook), but
-    # a citation to it should still validate at the golden-set level.
-    # Retrieval-time handling of missing files is a downstream concern.
-    ref_only_path = "6.006/textbook/A4_clrs_3ed.pdf"
-    assert ref_only_path in KNOWN_DOC_PATHS
+def test_validator_accepts_textbook_doc_path(tmp_path: Path) -> None:
+    # Textbook manifest entries (A4 CLRS, B4 Red Book) are valid citation
+    # targets even though the PDF may never exist on disk — the fetcher marks
+    # them `optional=True` so a %PDF-magic failure doesn't break CI, and
+    # citation validation at the golden-set level is independent of retrieval.
+    textbook_path = "6.006/textbook/A4_clrs_3ed.pdf"
+    assert textbook_path in KNOWN_DOC_PATHS
     path = tmp_path / "qa.jsonl"
-    save_jsonl_atomic(path, [_factual("f001", ref_only_path)], backup=False)
+    save_jsonl_atomic(path, [_factual("f001", textbook_path)], backup=False)
     report = validate_golden(path)
     assert report.is_clean
     assert not report.unknown_doc_paths

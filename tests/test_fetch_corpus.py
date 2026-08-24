@@ -1,5 +1,5 @@
-"""Tests for the corpus fetcher — narrowly scoped to the reference-only
-short-circuit and CLI argument surface. The HTTP/parsing paths are
+"""Tests for the corpus fetcher — narrowly scoped to the manual-placement
+short-circuit and the CLI argument surface. The HTTP/parsing paths are
 exercised by real runs against OCW; recreating them here would be a
 mock-per-call exercise with low signal.
 """
@@ -18,65 +18,75 @@ from src.qa_schema import SourceId
 
 
 @pytest.fixture
-def reference_only_entry() -> ManifestEntry:
+def textbook_entry() -> ManifestEntry:
+    """A copyrighted-textbook entry — publisher URL that will not return a PDF.
+
+    Semantically identical to the real A4/B4 entries: `optional=True` so the
+    fetcher's inevitable %PDF-magic failure reports `missing_optional`, not
+    `failed`. A human dropping a legally-obtained PDF at `dest_path` opts
+    it into retrieval via the standard `dest.exists()` short-circuit.
+    """
     return ManifestEntry(
         source_id=SourceId.A4,
         description="test-only CLRS reference",
         kind="direct_pdf",
         urls=("https://example.invalid/clrs.pdf",),
         dest_path="6.006/textbook/A4_test_ref.pdf",
-        reference_only=True,
+        optional=True,
     )
 
 
-def test_reference_only_returns_status_without_http(
-    reference_only_entry: ManifestEntry,
+def test_manual_placement_yields_skipped_present(
+    textbook_entry: ManifestEntry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # Redirect CORPUS_ROOT so we don't touch the real corpus/ tree.
+    # The manual-placement contract: if a human drops a legally-obtained PDF
+    # at dest_path, the fetcher must NOT hit the network — the standard
+    # `dest.exists() && size > 0` short-circuit wins. This is what lets a
+    # textbook entry participate in retrieval without a downloadable URL.
     monkeypatch.setattr(fetch_corpus, "CORPUS_ROOT", tmp_path)
-
-    # Any HTTP call is a bug: reference_only must short-circuit before urlopen.
-    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
-        raise AssertionError("urlopen must not be called for reference_only entries")
-
-    monkeypatch.setattr("urllib.request.urlopen", _boom)
-
-    result = fetch_corpus.fetch_entry(reference_only_entry)
-    assert result.status == "reference_only"
-    assert result.error is None
-    # Dest must NOT be created — the entry is a citation placeholder only.
-    assert not (tmp_path / reference_only_entry.dest_path).exists()
-
-
-def test_reference_only_yields_skipped_present_when_dest_exists(
-    reference_only_entry: ManifestEntry,
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    # If a human manually places a legally-obtained PDF at dest_path, the
-    # existing `dest.exists() && size > 0` short-circuit must win over the
-    # reference_only branch — this is what makes the "manual placement"
-    # path work with zero code changes downstream.
-    monkeypatch.setattr(fetch_corpus, "CORPUS_ROOT", tmp_path)
-    dest = tmp_path / reference_only_entry.dest_path
+    dest = tmp_path / textbook_entry.dest_path
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(b"%PDF-1.4\n... fake but non-empty ...")
 
-    def _boom(*args, **kwargs):  # noqa: ANN002, ANN003
-        raise AssertionError("urlopen must not be called when dest exists")
+    # Patch the module-under-test's own attribute (not urllib.request.urlopen)
+    # so a future `from urllib.request import urlopen` at the top of
+    # fetch_corpus.py doesn't silently defeat this guard.
+    def _boom(url: str) -> bytes:
+        raise AssertionError("_http_get must not be called when dest exists")
 
-    monkeypatch.setattr("urllib.request.urlopen", _boom)
+    monkeypatch.setattr(fetch_corpus, "_http_get", _boom)
 
-    result = fetch_corpus.fetch_entry(reference_only_entry)
+    result = fetch_corpus.fetch_entry(textbook_entry)
     assert result.status == "skipped_present"
 
 
+def test_optional_textbook_missing_reports_missing_optional(
+    textbook_entry: ManifestEntry,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # With no dest on disk, the fetcher attempts each URL; because publisher
+    # pages return HTML (not PDF bytes), the %PDF magic check fails. With
+    # `optional=True`, that failure must convert to `missing_optional`,
+    # not `failed` — otherwise CI breaks on every cold run.
+    monkeypatch.setattr(fetch_corpus, "CORPUS_ROOT", tmp_path)
+
+    def _fake_get(url: str) -> bytes:
+        return b"<!DOCTYPE html><p>Publisher landing page, not a PDF.</p>"
+
+    monkeypatch.setattr(fetch_corpus, "_http_get", _fake_get)
+
+    result = fetch_corpus.fetch_entry(textbook_entry)
+    assert result.status == "missing_optional"
+    assert result.error is not None  # error string preserved for the summary
+
+
 def test_only_flag_accepts_new_source_ids() -> None:
-    # Argparse-level check: --only must accept every current SourceId value.
-    # A drift here (new enum member without a matching --only choice) would
-    # make the entire bucket unfilterable from the CLI.
+    # Argparse-level guard: --only must accept every current SourceId value.
+    # A drift (new enum member without a matching --only choice) would make
+    # the entire bucket unfilterable from the CLI.
     for source_id in SourceId:
         result = subprocess.run(
             [

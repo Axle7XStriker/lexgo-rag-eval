@@ -14,14 +14,13 @@ Kinds:
 takes the first that returns a valid PDF (magic bytes `%PDF`).
 
 `optional=True` means the fetcher logs the miss and exits 0 anyway — used
-for sources whose host currently 5xxs (6.006 rec03/rec04 in particular,
-which return 503 from OCW).
-
-`reference_only=True` means the fetcher never issues an HTTP request for
-this entry — used for copyrighted textbooks (CLRS, Red Book) whose URL is
-recorded for citation/authoring purposes only. If a human legally obtains
-a PDF and places it at `dest_path`, the standard `dest.exists()`
-short-circuit picks it up on the next run and no other code path changes.
+for (a) sources whose host currently 5xxs (6.006 rec03/rec04 return 503
+from OCW; rec13-24 not yet fetch-verified), and (b) copyrighted textbook
+entries (CLRS, Red Book) whose URLs point to publisher pages rather than
+PDFs — the fetcher attempts them, fast-fails the %PDF check, and reports
+`missing_optional`. If a human legally obtains a copy and places the PDF
+at `dest_path`, the standard `dest.exists()` short-circuit picks it up
+transparently on the next run.
 """
 
 from dataclasses import dataclass
@@ -47,16 +46,12 @@ class ManifestEntry:
         HTML must be parsed to find the actual PDF href; "direct_pdf" means
         the URL points at the PDF bytes directly.
       urls: fallback list — the fetcher tries them in order and takes the
-        first that returns a valid PDF (magic bytes %PDF). For reference-only
-        entries this is the reference URL(s) — not fetched.
+        first that returns a valid PDF (magic bytes %PDF).
       dest_path: where to store it under corpus/, relative. Filenames start
         with the source_id (e.g. A1_lec03.pdf) so `ls` groups by bucket.
       optional: if True, a full-list failure is logged but does not fail
-        the run (used for papers with no reliably-open host).
-      reference_only: if True, the fetcher never issues an HTTP request; the
-        entry exists solely to register a citable doc_path + reference URL.
-        A manually-placed PDF at `dest_path` is still picked up by the
-        standard `dest.exists()` short-circuit — no other branching needed.
+        the run (used for hosts that currently 5xx and for copyrighted
+        textbook entries whose URLs are publisher pages, not PDFs).
     """
 
     source_id: SourceId
@@ -65,7 +60,6 @@ class ManifestEntry:
     urls: tuple[str, ...]
     dest_path: str  # relative to corpus/
     optional: bool = False
-    reference_only: bool = False
 
 
 def _ocw_006_lec(n: int) -> ManifestEntry:
@@ -139,17 +133,18 @@ _A2: list[ManifestEntry] = [_ocw_006_rec(n, optional=n in _OPTIONAL_A2) for n in
 _A3: list[ManifestEntry] = [_ocw_006_ps(n, sol) for n in range(1, 5) for sol in (False, True)]
 
 # ── A4: CLRS 3rd ed textbook. Copyrighted MIT Press title; not distributed
-# from this repo. URL points to the publisher's canonical page. If a human
-# legally obtains a copy and places it at dest_path, the fetcher's
+# from this repo. URL points to the publisher's canonical page — the fetcher
+# will fast-fail the %PDF magic check and report `missing_optional`. If a
+# human legally obtains a copy and places it at dest_path, the fetcher's
 # `dest.exists()` short-circuit picks it up transparently.
 _A4: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.A4,
         description="Cormen, Leiserson, Rivest, Stein — Introduction to Algorithms, 3rd ed (CLRS)",
-        kind="direct_pdf",  # placeholder — reference_only short-circuits before any GET
+        kind="direct_pdf",
         urls=("https://mitpress.mit.edu/9780262033848/introduction-to-algorithms/",),
         dest_path="6.006/textbook/A4_clrs_3ed.pdf",
-        reference_only=True,
+        optional=True,
     ),
 ]
 
@@ -218,15 +213,17 @@ _B3: list[ManifestEntry] = [
 ]
 
 # ── B4: Red Book 4th ed (Hellerstein & Stonebraker). Copyrighted MIT Press
-# title; not distributed. URL points to the book's public companion site.
+# title; not distributed. URL points to the book's public companion site
+# (redbook.io returns HTML, not a PDF — fetcher fast-fails the %PDF check
+# and reports `missing_optional`). Same manual-placement contract as A4.
 _B4: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.B4,
         description="Hellerstein & Stonebraker — Readings in Database Systems, 4th ed (Red Book)",
-        kind="direct_pdf",  # placeholder — reference_only short-circuits before any GET
+        kind="direct_pdf",
         urls=("http://www.redbook.io/",),
         dest_path="6.830/textbook/B4_red_book_4ed.pdf",
-        reference_only=True,
+        optional=True,
     ),
 ]
 
