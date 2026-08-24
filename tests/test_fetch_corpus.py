@@ -97,6 +97,9 @@ def test_only_flag_accepts_every_source_id() -> None:
             capture_output=True,
             text=True,
             cwd=Path(__file__).resolve().parents[1],
+            # Fail-fast if an interpreter hangs (import-time blocking IO,
+            # infinite loop in a future refactor) so CI doesn't stall.
+            timeout=30,
         )
         assert result.returncode == 0, (
             f"--only {source_id.value} exited {result.returncode}\n"

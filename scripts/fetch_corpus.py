@@ -50,6 +50,10 @@ USER_AGENT = "lexgo-rag-eval/0.1 (+https://github.com/Axle7XStriker/lexgo-rag-ev
 POLITENESS_SLEEP_S = 1.0
 REQUEST_TIMEOUT_S = 30
 PDF_MAGIC = b"%PDF"
+# Hard ceiling on any single response body — the largest corpus PDF today is
+# the DMS textbook (~30MB), so 200MB is a comfortable ceiling and a defence
+# against a rewritten mirror or a hostile fork serving a huge blob.
+MAX_RESPONSE_BYTES = 200 * 1024 * 1024
 # Only http/https are safe — urllib would otherwise happily open file:// or
 # ftp://, so a bad manifest edit could exfiltrate local files into corpus/.
 ALLOWED_SCHEMES = frozenset({"http", "https"})
@@ -145,11 +149,18 @@ def _http_get(url: str) -> bytes:
     req = urllib.request.Request(url, headers=_headers())
     try:
         with urllib.request.urlopen(req, timeout=REQUEST_TIMEOUT_S) as resp:
-            return resp.read()
+            # Read one byte past the ceiling so oversize can be detected without
+            # buffering the whole (potentially huge) body first.
+            data = resp.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError as e:
         if e.code in _RETRIABLE_STATUS:
             raise TransientHTTPError(f"HTTP {e.code} for {url}") from e
         raise FetchError(f"HTTP {e.code} for {url}") from e
+    if len(data) > MAX_RESPONSE_BYTES:
+        raise FetchError(
+            f"response from {url} exceeds {MAX_RESPONSE_BYTES} bytes; refusing to buffer"
+        )
+    return data
 
 
 def _extract_pdf_href(html: str, base_url: str, prefer_containing: str | None = None) -> str:

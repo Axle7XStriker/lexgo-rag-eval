@@ -65,17 +65,16 @@ def test_validator_flags_duplicate_ids(tmp_path: Path) -> None:
 
 
 def test_every_manifest_entry_is_citable(tmp_path: Path) -> None:
-    # Drift guard: every manifest entry must (a) pass Citation regex
-    # validation and (b) appear in KNOWN_DOC_PATHS. Adding a new source
-    # without updating DOC_PATH_PATTERN or the validator's known-paths
-    # derivation must fail this test loudly, not silently.
+    # Drift guard for DOC_PATH_PATTERN vs manifest naming: constructing a
+    # Citation for every manifest dest_path (via `_factual`) fires the
+    # schema regex; a new source whose dest_path shape the regex rejects
+    # raises ValidationError here loudly.
     #
-    # Citation construction inside `_factual` raises ValidationError if the
-    # regex rejects any entry's dest_path — so the assertion is the
-    # save+validate round-trip below, which additionally exercises
-    # KNOWN_DOC_PATHS membership through the validator.
+    # The save+validate round-trip additionally exercises the golden-set
+    # cross-field rules on a batch that size. (KNOWN_DOC_PATHS is derived
+    # from MANIFEST in the same module the test imports from, so a
+    # membership check would be tautological — omitted intentionally.)
     records = [_factual(f"f{i:03d}", e.dest_path) for i, e in enumerate(MANIFEST)]
-    assert all(e.dest_path in KNOWN_DOC_PATHS for e in MANIFEST)
     path = tmp_path / "qa.jsonl"
     save_jsonl_atomic(path, records, backup=False)
     report = validate_golden(path)
