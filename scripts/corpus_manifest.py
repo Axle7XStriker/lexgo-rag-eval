@@ -49,9 +49,8 @@ class ManifestEntry:
         first that returns a valid PDF (magic bytes %PDF).
       dest_path: where to store it under corpus/, relative. Filenames start
         with the source_id (e.g. A1_lec03.pdf) so `ls` groups by bucket.
-      optional: if True, a full-list failure is logged but does not fail
-        the run (used for hosts that currently 5xx and for copyrighted
-        textbook entries whose URLs are publisher pages, not PDFs).
+      optional: if True, a failure to fetch is logged but does not fail
+        the run — for entries whose absence from the corpus is acceptable.
     """
 
     source_id: SourceId
@@ -122,21 +121,15 @@ def _ocw_830_quiz(n: int, sol: bool) -> ManifestEntry:
 # handwritten scans are skipped for cleaner text extraction downstream)
 _A1: list[ManifestEntry] = [_ocw_006_lec(n) for n in range(1, 25)]
 
-# ── A2: 6.006 recitations 1-24. rec03/rec04 return 503 from OCW (Fastly
-# cache errors — may resolve later). rec13..rec24 are newly added and not
-# yet fetch-verified — marked optional pessimistically; downgrade to
-# required in a follow-up commit once first successful fetch confirms them.
-_OPTIONAL_A2 = {3, 4, *range(13, 25)}
+# ── A2: 6.006 recitations 1-24. OCW does not publish PDFs for rec03, rec04,
+# rec17, rec22, rec23 — marked optional so their absence doesn't fail the run.
+_OPTIONAL_A2 = {3, 4, 17, 22, 23}
 _A2: list[ManifestEntry] = [_ocw_006_rec(n, optional=n in _OPTIONAL_A2) for n in range(1, 25)]
 
-# ── A3: 6.006 PS1-PS4 with solutions (8 PDFs)
-_A3: list[ManifestEntry] = [_ocw_006_ps(n, sol) for n in range(1, 5) for sol in (False, True)]
+# ── A3: 6.006 PS1-PS7 with solutions (14 PDFs)
+_A3: list[ManifestEntry] = [_ocw_006_ps(n, sol) for n in range(1, 8) for sol in (False, True)]
 
-# ── A4: CLRS 3rd ed textbook. Copyrighted MIT Press title; not distributed
-# from this repo. URL points to the publisher's canonical page — the fetcher
-# will fast-fail the %PDF magic check and report `missing_optional`. If a
-# human legally obtains a copy and places it at dest_path, the fetcher's
-# `dest.exists()` short-circuit picks it up transparently.
+# ── A4: CLRS 3rd ed textbook. Copyrighted; not distributed from this repo.
 _A4: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.A4,
@@ -212,10 +205,7 @@ _B3: list[ManifestEntry] = [
     ),
 ]
 
-# ── B4: Red Book 4th ed (Hellerstein & Stonebraker). Copyrighted MIT Press
-# title; not distributed. URL points to the book's public companion site
-# (redbook.io returns HTML, not a PDF — fetcher fast-fails the %PDF check
-# and reports `missing_optional`). Same manual-placement contract as A4.
+# ── B4: Red Book 4th ed (Hellerstein & Stonebraker). Copyrighted; not distributed.
 _B4: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.B4,
@@ -228,12 +218,7 @@ _B4: list[ManifestEntry] = [
 ]
 
 # ── B5: Ramakrishnan & Gehrke, Database Management Systems, 3rd ed.
-# User-supplied URL: a copyrighted McGraw-Hill title mirrored on a personal
-# GitHub repo of uncertain legal provenance. Kept `optional=True` so a
-# takedown / 404 never breaks CI. `corpus/` is gitignored — the PDF is
-# never redistributed from this repo. See plan file for the full risk note.
-# NOTE: use raw.githubusercontent.com (not github.com/.../blob/...) so we
-# get PDF bytes rather than the GitHub file-viewer HTML page.
+# User-supplied URL; kept optional so a takedown / 404 never breaks CI.
 _B5: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.B5,

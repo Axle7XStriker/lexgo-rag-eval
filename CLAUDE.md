@@ -20,7 +20,7 @@ A rigorously-evaluated multi-source RAG system over academic course materials, w
 
 ### In
 
-- Corpus: MIT 6.006 (Algorithms) = A1..A4 (A4 = CLRS textbook, reference-only). MIT 6.830 (Databases) = B1..B5 (B4 = Red Book, reference-only; B5 = DMS textbook, user-supplied URL, optional).
+- Corpus: MIT 6.006 (Algorithms) A1..A4 and MIT 6.830 (Databases) B1..B5
 - 4 retrieval variants (matrix below), single answer-generation prompt held constant
 - 100 hand-curated Q&As with source citations
 - Metrics: answer accuracy, citation precision, retrieval recall@5
@@ -55,20 +55,16 @@ If any of the following comes up, STOP and flag before proceeding:
 
 **Course A — MIT 6.006 (Intro Algorithms):**
 - **A1:** Lecture notes — full F11 set, lectures 1-24
-- **A2:** Recitation notes — full F11 set, recitations 1-24 (rec03/rec04 + rec13-24 optional pending first fetch)
-- **A3:** Problem sets with solutions (PS1-PS4)
-- **A4:** CLRS 3rd ed textbook. Copyrighted MIT Press title, not distributed from this repo. Manifest entry is `optional=True` — the fetcher attempts the publisher URL, fails the `%PDF` magic check, and reports `missing_optional` without breaking CI. Manually place a legal PDF at `corpus/6.006/textbook/A4_clrs_3ed.pdf` to participate in retrieval.
+- **A2:** Recitation notes — full F11 set, recitations 1-24
+- **A3:** Problem sets with solutions (PS1-PS7)
+- **A4:** CLRS 3rd ed textbook. Copyrighted; not distributed from this repo. Place a legal PDF at `corpus/6.006/textbook/A4_clrs_3ed.pdf` to participate in retrieval.
 
 **Course B — MIT 6.830 (Database Systems):**
 - **B1:** Lecture notes (bundled — they synthesize the papers)
 - **B2:** Quizzes + solutions (OCW-hosted Fall 2010 quiz 1 & quiz 2, both with solutions)
 - **B3:** Papers bundle — 5 papers spanning query processing, transactions, concurrency, and column stores (Selinger, Franklin, Kung/Robinson, Gray, C-Store)
-- **B4:** Red Book 4th ed (Hellerstein/Stonebraker). Copyrighted MIT Press title, not distributed. Same `optional=True` treatment and manual-placement contract as A4.
-- **B5:** Ramakrishnan/Gehrke DMS 3rd ed — fetched from a user-supplied URL (see manifest for legal-provenance note). Marked `optional` so a takedown never breaks CI.
-
-**Note:** OCW 6.830 has no recitations — no B-bucket for them. (Do not invent one.)
-
-**Textbook semantics:** A4 and B4 are `optional=True` entries pointing to publisher pages that don't serve PDF bytes. The fetcher attempts them, fast-fails the `%PDF` magic check, and marks them `missing_optional`. Downstream chunking/retrieval skips missing files. If a human legally obtains a copy and places the PDF at `dest_path`, the standard `dest.exists()` short-circuit picks it up on the next run — no code changes needed for retrieval participation.
+- **B4:** Red Book 4th ed (Hellerstein/Stonebraker). Copyrighted; not distributed. Place a legal PDF at `corpus/6.830/textbook/B4_red_book_4ed.pdf` to participate in retrieval.
+- **B5:** Ramakrishnan/Gehrke DMS 3rd ed — fetched from a user-supplied URL.
 
 **Q&A authoring strategy for 6.830:**
 - **Lectures first (B1)** — they simplify the papers and anchor most factual/paraphrase Q&As.

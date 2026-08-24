@@ -10,6 +10,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from evals.validate_golden import KNOWN_DOC_PATHS, validate_golden
+from scripts.corpus_manifest import MANIFEST
 from src.qa_schema import Citation, QARecord, QAType, save_jsonl_atomic
 
 # Pick two real corpus paths from the manifest (any two will do — they're
@@ -63,15 +64,19 @@ def test_validator_flags_duplicate_ids(tmp_path: Path) -> None:
     assert not report.is_clean
 
 
-def test_validator_accepts_textbook_doc_path(tmp_path: Path) -> None:
-    # Textbook manifest entries (A4 CLRS, B4 Red Book) are valid citation
-    # targets even though the PDF may never exist on disk — the fetcher marks
-    # them `optional=True` so a %PDF-magic failure doesn't break CI, and
-    # citation validation at the golden-set level is independent of retrieval.
-    textbook_path = "6.006/textbook/A4_clrs_3ed.pdf"
-    assert textbook_path in KNOWN_DOC_PATHS
+def test_every_manifest_entry_is_citable(tmp_path: Path) -> None:
+    # Drift guard: every manifest entry must (a) pass Citation regex
+    # validation and (b) appear in KNOWN_DOC_PATHS. Adding a new source
+    # without updating DOC_PATH_PATTERN or the validator's known-paths
+    # derivation must fail this test loudly, not silently.
+    #
+    # Citation construction inside `_factual` raises ValidationError if the
+    # regex rejects any entry's dest_path — so the assertion is the
+    # save+validate round-trip below, which additionally exercises
+    # KNOWN_DOC_PATHS membership through the validator.
+    records = [_factual(f"f{i:03d}", e.dest_path) for i, e in enumerate(MANIFEST)]
+    assert all(e.dest_path in KNOWN_DOC_PATHS for e in MANIFEST)
     path = tmp_path / "qa.jsonl"
-    save_jsonl_atomic(path, [_factual("f001", textbook_path)], backup=False)
+    save_jsonl_atomic(path, records, backup=False)
     report = validate_golden(path)
-    assert report.is_clean
-    assert not report.unknown_doc_paths
+    assert report.is_clean, f"validator drift: {report}"

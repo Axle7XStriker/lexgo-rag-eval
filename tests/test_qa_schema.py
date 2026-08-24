@@ -126,20 +126,6 @@ class TestCitation:
             )
 
     @pytest.mark.parametrize(
-        "doc_path,expected_source_id",
-        [
-            ("6.006/textbook/A4_clrs_3ed.pdf", SourceId.A4),
-            ("6.830/textbook/B4_red_book_4ed.pdf", SourceId.B4),
-            ("6.830/textbook/B5_dms_3ed.pdf", SourceId.B5),
-        ],
-    )
-    def test_doc_path_accepts_new_source_ids(
-        self, doc_path: str, expected_source_id: SourceId
-    ) -> None:
-        c = Citation(doc_path=doc_path, page_or_section="chapter 1")
-        assert c.source_id == expected_source_id
-
-    @pytest.mark.parametrize(
         "doc_path",
         [
             "6.006/lectures/A0_lec01.pdf",  # A[1-4] range: 0 rejected

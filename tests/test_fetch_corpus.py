@@ -18,37 +18,35 @@ from src.qa_schema import SourceId
 
 
 @pytest.fixture
-def textbook_entry() -> ManifestEntry:
-    """A copyrighted-textbook entry — publisher URL that will not return a PDF.
+def optional_entry() -> ManifestEntry:
+    """A generic `optional=True` manifest entry pointing at an unresolvable host.
 
-    Semantically identical to the real A4/B4 entries: `optional=True` so the
-    fetcher's inevitable %PDF-magic failure reports `missing_optional`, not
-    `failed`. A human dropping a legally-obtained PDF at `dest_path` opts
-    it into retrieval via the standard `dest.exists()` short-circuit.
+    Kept abstract on purpose — the tests here assert generic fetcher
+    behavior (short-circuits and status reporting), not the specifics of
+    any real corpus source.
     """
     return ManifestEntry(
-        source_id=SourceId.A4,
-        description="test-only CLRS reference",
+        source_id=SourceId.A1,
+        description="test fixture — optional entry",
         kind="direct_pdf",
-        urls=("https://example.invalid/clrs.pdf",),
-        dest_path="6.006/textbook/A4_test_ref.pdf",
+        urls=("https://example.invalid/fixture.pdf",),
+        dest_path="test/fixture.pdf",
         optional=True,
     )
 
 
 def test_manual_placement_yields_skipped_present(
-    textbook_entry: ManifestEntry,
+    optional_entry: ManifestEntry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The manual-placement contract: if a human drops a legally-obtained PDF
-    # at dest_path, the fetcher must NOT hit the network — the standard
-    # `dest.exists() && size > 0` short-circuit wins. This is what lets a
-    # textbook entry participate in retrieval without a downloadable URL.
+    # If a non-empty file already exists at `dest_path`, the fetcher must
+    # short-circuit before any network call — regardless of the entry's URL
+    # reachability. Any HTTP call in this branch is a bug.
     monkeypatch.setattr(fetch_corpus, "CORPUS_ROOT", tmp_path)
-    dest = tmp_path / textbook_entry.dest_path
+    dest = tmp_path / optional_entry.dest_path
     dest.parent.mkdir(parents=True, exist_ok=True)
-    dest.write_bytes(b"%PDF-1.4\n... fake but non-empty ...")
+    dest.write_bytes(b"%PDF-1.4\n... non-empty stub ...")
 
     # Patch the module-under-test's own attribute (not urllib.request.urlopen)
     # so a future `from urllib.request import urlopen` at the top of
@@ -58,35 +56,40 @@ def test_manual_placement_yields_skipped_present(
 
     monkeypatch.setattr(fetch_corpus, "_http_get", _boom)
 
-    result = fetch_corpus.fetch_entry(textbook_entry)
+    result = fetch_corpus.fetch_entry(optional_entry)
     assert result.status == "skipped_present"
 
 
-def test_optional_textbook_missing_reports_missing_optional(
-    textbook_entry: ManifestEntry,
+def test_optional_fetch_failure_reports_missing_optional(
+    optional_entry: ManifestEntry,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # With no dest on disk, the fetcher attempts each URL; because publisher
-    # pages return HTML (not PDF bytes), the %PDF magic check fails. With
-    # `optional=True`, that failure must convert to `missing_optional`,
-    # not `failed` — otherwise CI breaks on every cold run.
+    # With no dest on disk, the fetcher attempts each URL. When every URL
+    # yields bytes that fail the %PDF magic check, and the entry is
+    # `optional=True`, the outcome must be `missing_optional` — not
+    # `failed` — so the run exits 0.
     monkeypatch.setattr(fetch_corpus, "CORPUS_ROOT", tmp_path)
 
     def _fake_get(url: str) -> bytes:
-        return b"<!DOCTYPE html><p>Publisher landing page, not a PDF.</p>"
+        return b"<!DOCTYPE html><p>Not a PDF.</p>"
 
     monkeypatch.setattr(fetch_corpus, "_http_get", _fake_get)
 
-    result = fetch_corpus.fetch_entry(textbook_entry)
+    result = fetch_corpus.fetch_entry(optional_entry)
     assert result.status == "missing_optional"
     assert result.error is not None  # error string preserved for the summary
 
 
-def test_only_flag_accepts_new_source_ids() -> None:
-    # Argparse-level guard: --only must accept every current SourceId value.
-    # A drift (new enum member without a matching --only choice) would make
+def test_only_flag_accepts_every_source_id() -> None:
+    # The --only argparse choice list must stay in sync with SourceId. A
+    # drift (new enum member without a matching --only choice) would make
     # the entire bucket unfilterable from the CLI.
+    #
+    # NOTE: subprocess-per-value is a coarse but robust check — it exercises
+    # the same argparse instance the real CLI uses. A cheaper in-process
+    # equivalent would require factoring the parser out of main(); doing so
+    # is on the follow-up list.
     for source_id in SourceId:
         result = subprocess.run(
             [
