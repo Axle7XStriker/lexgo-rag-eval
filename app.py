@@ -28,7 +28,7 @@ render_sidebar(settings)
 st.title("lexgo — RAG eval")
 st.caption(
     "Rigorously-evaluated multi-source RAG over MIT 6.006 (Algorithms) + "
-    "MIT 6.830 (Databases). 4 pipelines, 100 hand-authored golden Q&As, "
+    "MIT 6.830 (Databases). 4 pipeline variants, 100 hand-authored golden Q&As, "
     "honest numbers."
 )
 

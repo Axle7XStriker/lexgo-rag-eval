@@ -112,7 +112,7 @@
 **Job:** show calibration. What I *chose not to do* is as informative as what I did.
 
 - Bigger golden set (300+) for per-question-type confidence intervals.
-- Add a fine-tuned reranker to compare against Cohere Rerank 3.
+- Add a fine-tuned reranker variant to compare against Cohere Rerank 3.
 - Multi-turn / follow-up questions — currently single-shot only.
 - Chunk-size sweep (I fixed 500/50 as a constraint; didn't sweep it as a variable).
 - One-sentence honest cost of building this: 26 hrs, ~$X in API spend.

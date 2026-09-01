@@ -81,8 +81,6 @@ Design 6.006 Q&As around concepts and complexity claims, not "what does line 47 
 
 All 4 pipelines use the **same 100 Q&As** and the **same generation prompt**. Only the retrieval pipeline changes.
 
-**Naming convention.** *Pipelines* use the `P` prefix (`P1`..`P4`); *prompt versions* use the `v` prefix (`v1`, `v2`, …). Eval-run headers record both axes independently, so a run of P1 with `answer_v2.md` is unambiguous on disk and in grep output.
-
 | Pipeline | Chunking | Retrieval | Rerank | Purpose |
 |---|---|---|---|---|
 | **P1 baseline** | Fixed 500 tokens, 50 overlap | Dense (Voyage) top-10 | — | Establish floor |

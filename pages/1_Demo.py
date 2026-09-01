@@ -20,9 +20,9 @@ render_page_header(
 )
 
 with st.sidebar:
-    st.subheader("Pipeline")
+    st.subheader("Pipeline variant")
     st.selectbox(
-        "Pipeline",
+        "Variant",
         ["P1 baseline", "P2 semantic", "P3 hybrid", "P4 hybrid+rerank"],
         index=0,
         disabled=True,
