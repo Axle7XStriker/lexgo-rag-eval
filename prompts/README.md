@@ -29,8 +29,8 @@ version: 1
 model: claude-sonnet-4-6
 purpose: >
   Given a question and retrieved chunks, produce a grounded answer with
-  inline citations. Held constant across all 4 retrieval variants — the
-  variant matrix isolates retrieval, not generation.
+  inline citations. Held constant across all 4 retrieval pipelines — the
+  pipeline matrix isolates retrieval, not generation.
 ---
 ```
 

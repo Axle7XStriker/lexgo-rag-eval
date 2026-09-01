@@ -8,14 +8,14 @@
 **Target length:** 1500–2500 words.
 **Audience:** layered — skimmers (hiring managers, general tech readers) exit after §1; engineers read through §7.
 **Voice:** first person, plainspoken. Show the thinking, not just the result. No hedging, no throat-clearing.
-**Anchor thesis (one line to earn early):** *The V1→V4 accuracy delta is the story — and I built the eval so I could trust the number.*
+**Anchor thesis (one line to earn early):** *The P1→P4 accuracy delta is the story — and I built the eval so I could trust the number.*
 
 **Do NOT include (scope guards for the writing itself):**
 - Per-course accuracy claims (n=50 per course is too small for that)
 - Tutorial-style setup walkthroughs — link the repo, don't retype it
 - LLM-generation of Q&As anywhere in the narrative (it's prohibited; don't muddy the story)
 - Speculative "future work" beyond one paragraph
-- Any variant beyond the 4 named
+- Any pipeline beyond the 4 named
 
 ---
 
@@ -52,16 +52,16 @@
 
 ---
 
-## §4 — The 4 variants and what each isolates (300–400 words)
+## §4 — The 4 pipelines and what each isolates (300–400 words)
 
 **Job:** make the experimental design legible. This is the "did you actually run a real experiment" section.
 
 - Small matrix table (chunking / retrieval / rerank / purpose) — same as CLAUDE.md.
-- One paragraph per variant explaining *what hypothesis it tests*, not just *what it does*:
-  - **V1 baseline** — floor. Fixed chunks + dense retrieval. If this is already good enough, everything else is theater.
-  - **V2 semantic chunks** — does chunk boundary quality matter more than retrieval math?
-  - **V3 hybrid** — does adding BM25/FTS to dense buy you meaningful recall on questions where wording ≠ source?
-  - **V4 hybrid + rerank** — does a rerank stage on top of hybrid recover precision without giving back the recall gain?
+- One paragraph per pipeline explaining *what hypothesis it tests*, not just *what it does*:
+  - **P1 baseline** — floor. Fixed chunks + dense retrieval. If this is already good enough, everything else is theater.
+  - **P2 semantic chunks** — does chunk boundary quality matter more than retrieval math?
+  - **P3 hybrid** — does adding BM25/FTS to dense buy you meaningful recall on questions where wording ≠ source?
+  - **P4 hybrid + rerank** — does a rerank stage on top of hybrid recover precision without giving back the recall gain?
 - Emphasize: **same 100 Q&As, same generation prompt, only retrieval changes.** That's the whole point.
 
 ---
@@ -96,12 +96,12 @@
 
 **Job:** deliver the actual insight. This is why anyone kept reading.
 
-- Restate the results table with commentary per variant:
-  - V1→V2 delta: what did semantic chunking buy? [surprise or non-surprise]
-  - V1→V3 delta: was hybrid worth the plumbing? [named answer]
-  - V3→V4 delta: how much did reranking recover?
-  - Headline: V1→V4 total delta, cost delta, latency delta.
-- Break-out by question type: where does the pipeline win, where does it lose? (Especially: does V4 correctly refuse the 10 out-of-corpus questions, or does it hallucinate?)
+- Restate the results table with commentary per pipeline:
+  - P1→P2 delta: what did semantic chunking buy? [surprise or non-surprise]
+  - P1→P3 delta: was hybrid worth the plumbing? [named answer]
+  - P3→P4 delta: how much did reranking recover?
+  - Headline: P1→P4 total delta, cost delta, latency delta.
+- Break-out by question type: where does the pipeline win, where does it lose? (Especially: does P4 correctly refuse the 10 out-of-corpus questions, or does it hallucinate?)
 - The 3 sharpest specific findings (fill after eval; e.g. "reranking bought +8pp on synthesis but 0 on factual", "hybrid helped paraphrase questions most").
 - What the numbers **don't** say: no per-course claim (n too small), no generalization beyond this corpus type.
 

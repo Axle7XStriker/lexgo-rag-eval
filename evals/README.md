@@ -10,7 +10,7 @@ evals/
     qa.jsonl              # 100 hand-authored Q&As (W1–W2 deliverable)
   runs/
     <run_id>/             # one dir per run, gitignored except .gitkeep
-      manifest.json       # git SHA, prompt versions, config, variant
+      manifest.json       # git SHA, prompt versions, config, pipeline
       results.jsonl       # per-Q&A: model answer, citations, judge verdict
       llm_calls.jsonl     # snapshot of logs/llm_calls.jsonl for this run
       summary.md          # aggregate metrics, generated
@@ -35,7 +35,7 @@ Every eval run captures:
 
 - `git_sha` — the commit the pipeline ran at
 - `prompt_versions` — `{answer: "v1", judge: "v1", ...}`
-- `variant` — one of `v1_baseline`, `v2_semantic`, `v3_hybrid`, `v4_rerank`
+- `pipeline` — one of `p1_baseline`, `p2_semantic`, `p3_hybrid`, `p4_rerank`
 - `config` — chunk size, top-k, rerank-k, model IDs
 - `cost_usd` — sum from llm_calls.jsonl
 - `metrics` — accuracy, citation precision, retrieval recall@5, p95 latency

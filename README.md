@@ -10,12 +10,12 @@
 
 *Numbers land as evals run.*
 
-| Variant | Chunking | Retrieval | Rerank | Accuracy | Citation precision | Cost/query | P95 latency |
+| Pipeline | Chunking | Retrieval | Rerank | Accuracy | Citation precision | Cost/query | P95 latency |
 |---|---|---|---|---|---|---|---|
-| V1 baseline | Fixed 500/50 | Dense (Voyage) top-10 | — | — | — | — | — |
-| V2 semantic | Semantic | Dense top-10 | — | — | — | — | — |
-| V3 hybrid | Fixed 500/50 | BM25 + dense (RRF), top-10 | — | — | — | — | — |
-| V4 hybrid+rerank | Fixed 500/50 | Hybrid top-20 | Cohere Rerank 3 → top-5 | — | — | — | — |
+| P1 baseline | Fixed 500/50 | Dense (Voyage) top-10 | — | — | — | — | — |
+| P2 semantic | Semantic | Dense top-10 | — | — | — | — | — |
+| P3 hybrid | Fixed 500/50 | BM25 + dense (RRF), top-10 | — | — | — | — | — |
+| P4 hybrid+rerank | Fixed 500/50 | Hybrid top-20 | Cohere Rerank 3 → top-5 | — | — | — | — |
 
 ---
 
