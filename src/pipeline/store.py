@@ -93,6 +93,13 @@ class VectorStore:
 
     def __enter__(self) -> Self:
         self._conn = psycopg.connect(self._dsn, autocommit=False)
+        # register_vector needs the `vector` type to exist, but on a fresh
+        # DB nothing has installed it yet — ensure_schema() would, but the
+        # caller can't reach it until __enter__ returns. Break the cycle by
+        # creating the extension here. Idempotent (IF NOT EXISTS) + cheap.
+        with self._conn.cursor() as cur:
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+        self._conn.commit()
         register_vector(self._conn)
         return self
 
@@ -223,6 +230,10 @@ class VectorStore:
                 f"query embedding dim {len(query_embedding)} ≠ expected {EMBEDDING_DIM}"
             )
         with self.conn.cursor() as cur:
+            # Explicit ::vector cast: on INSERT the destination column type
+            # tells psycopg to adapt the Python list as a vector, but as a
+            # bare `%s` parameter the type is inferred as double precision[]
+            # and pgvector's <=> operator has no such overload.
             cur.execute(
                 """
                 SELECT
@@ -235,11 +246,11 @@ class VectorStore:
                     c.text,
                     c.page_start,
                     c.page_end,
-                    1 - (c.embedding <=> %s) AS score
+                    1 - (c.embedding <=> %s::vector) AS score
                 FROM chunks c
                 JOIN documents d ON d.id = c.document_id
                 WHERE c.pipeline = %s
-                ORDER BY c.embedding <=> %s
+                ORDER BY c.embedding <=> %s::vector
                 LIMIT %s
                 """,
                 (query_embedding, pipeline, query_embedding, k),
