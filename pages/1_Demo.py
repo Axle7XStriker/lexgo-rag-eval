@@ -20,10 +20,10 @@ render_page_header(
 )
 
 with st.sidebar:
-    st.subheader("Pipeline variant")
+    st.subheader("Pipeline")
     st.selectbox(
-        "Variant",
-        ["V1 baseline", "V2 semantic", "V3 hybrid", "V4 hybrid+rerank"],
+        "Pipeline",
+        ["P1 baseline", "P2 semantic", "P3 hybrid", "P4 hybrid+rerank"],
         index=0,
         disabled=True,
         help="Selector enabled once the retrieval pipeline lands (W3).",
@@ -42,7 +42,7 @@ st.divider()
 col_answer, col_chunks = st.columns([2, 1])
 with col_answer:
     st.subheader("Answer")
-    st.info("Answer + inline citations render here once V1 lands.")
+    st.info("Answer + inline citations render here once P1 lands.")
 with col_chunks:
     st.subheader("Retrieved chunks")
     st.info("Top-k retrieved chunks (with scores) render here.")

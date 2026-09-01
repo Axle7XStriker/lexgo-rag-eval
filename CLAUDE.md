@@ -12,7 +12,7 @@ A rigorously-evaluated multi-source RAG system over academic course materials, w
 
 **Timebox:** ~26 hrs of build time over 4 weeks. Non-negotiable.
 
-**Primary success metric:** answer accuracy on a 100-Q&A golden set — the **delta between baseline (V1) and best pipeline (V4) is the story.**
+**Primary success metric:** answer accuracy on a 100-Q&A golden set — the **delta between baseline (P1) and best pipeline (P4) is the story.**
 
 ---
 
@@ -21,7 +21,7 @@ A rigorously-evaluated multi-source RAG system over academic course materials, w
 ### In
 
 - Corpus: MIT 6.006 (Algorithms) A1..A4 and MIT 6.830 (Databases) B1..B5
-- 4 retrieval variants (matrix below), single answer-generation prompt held constant
+- 4 retrieval pipelines (matrix below), single answer-generation prompt held constant
 - 100 hand-curated Q&As with source citations
 - Metrics: answer accuracy, citation precision, retrieval recall@5
 - Streamlit demo — query → answer + citations + retrieved chunks
@@ -34,7 +34,7 @@ A rigorously-evaluated multi-source RAG system over academic course materials, w
 - Multi-turn chat / chat history
 - Streaming (nice-to-have; cut if it eats budget)
 - Fine-tuning
-- More than one answer-generation prompt or 4 retrieval variants
+- More than one answer-generation prompt or 4 retrieval pipelines
 - Concept extraction / concept map
 - More than 100 Q&As, or per-course accuracy claims (would need 50+ per course)
 
@@ -46,7 +46,7 @@ If any of the following comes up, STOP and flag before proceeding:
 - Adding auth, user accounts, or personalization
 - Extending to multi-turn conversation
 - Building a more elaborate frontend
-- Adding more variants beyond the 4 named
+- Adding more pipelines beyond the 4 named
 - Suggesting LLM-generated Q&As "to save time"
 
 ---
@@ -77,16 +77,18 @@ Design 6.006 Q&As around concepts and complexity claims, not "what does line 47 
 
 ---
 
-## Retrieval variant matrix
+## Retrieval pipeline matrix
 
-All 4 variants use the **same 100 Q&As** and the **same generation prompt**. Only the retrieval pipeline changes.
+All 4 pipelines use the **same 100 Q&As** and the **same generation prompt**. Only the retrieval pipeline changes.
 
-| Variant | Chunking | Retrieval | Rerank | Purpose |
+**Naming convention.** *Pipelines* use the `P` prefix (`P1`..`P4`); *prompt versions* use the `v` prefix (`v1`, `v2`, …). Eval-run headers record both axes independently, so a run of P1 with `answer_v2.md` is unambiguous on disk and in grep output.
+
+| Pipeline | Chunking | Retrieval | Rerank | Purpose |
 |---|---|---|---|---|
-| **V1 baseline** | Fixed 500 tokens, 50 overlap | Dense (Voyage) top-10 | — | Establish floor |
-| **V2 semantic chunks** | Semantic split | Dense top-10 | — | Isolate chunking effect |
-| **V3 hybrid** | Fixed 500/50 | BM25 (Postgres FTS) + dense (RRF fusion), top-10 | — | Isolate retrieval fusion effect |
-| **V4 hybrid + rerank** | Fixed 500/50 | Hybrid top-20 | Cohere Rerank 3 → top-5 | Best case |
+| **P1 baseline** | Fixed 500 tokens, 50 overlap | Dense (Voyage) top-10 | — | Establish floor |
+| **P2 semantic chunks** | Semantic split | Dense top-10 | — | Isolate chunking effect |
+| **P3 hybrid** | Fixed 500/50 | BM25 (Postgres FTS) + dense (RRF fusion), top-10 | — | Isolate retrieval fusion effect |
+| **P4 hybrid + rerank** | Fixed 500/50 | Hybrid top-20 | Cohere Rerank 3 → top-5 | Best case |
 
 ---
 
@@ -104,9 +106,9 @@ Each Q&A: **question**, **gold answer** (2-4 sentences), **gold citation** (sour
 
 ---
 
-## Target numbers [anchors — revise after V1 baseline]
+## Target numbers [anchors — revise after P1 baseline]
 
-| Metric | Baseline (V1) | Best (V4) | Delta target |
+| Metric | Baseline (P1) | Best (P4) | Delta target |
 |---|---|---|---|
 | Answer accuracy | 55-65% | 80-90% | **+20pp minimum** |
 | Citation precision | ~60% | ~85% | +25pp |
@@ -114,8 +116,8 @@ Each Q&A: **question**, **gold answer** (2-4 sentences), **gold citation** (sour
 | P95 latency | <3s | <3s | constraint |
 
 **Sanity gates:**
-- If V1 baseline > 75% → golden set is too easy → rebuild with harder cross-source questions
-- If V4 < 70% → pipeline is broken → debug before writing
+- If P1 baseline > 75% → golden set is too easy → rebuild with harder cross-source questions
+- If P4 < 70% → pipeline is broken → debug before writing
 
 ---
 
@@ -144,16 +146,16 @@ LLM-as-judge using Claude Sonnet. Given (question, gold answer, gold citations, 
 | Week | Hrs | Work |
 |---|---|---|
 | **1** | 6.5 | Scoping locked. README skeleton + blog outline (2 hrs) ← **BEFORE any code**. Repo + Streamlit skeleton + Voyage/Cohere API keys (1 hr). Start golden set — target 20-30 Q&As (3-3.5 hrs). |
-| **2** | 6.5 | Finish golden set — 70-80 more Q&As (5-6 hrs). **Hard checkpoint:** if incomplete by end of W2, cut V2 or V3 from the variants matrix. |
-| **3** | 6.5 | V1 baseline pipeline + eval loop (3 hrs). V2/V3/V4 variants (3.5 hrs — each ~1 hr once infra reused). Sanity gate check after V1. |
+| **2** | 6.5 | Finish golden set — 70-80 more Q&As (5-6 hrs). **Hard checkpoint:** if incomplete by end of W2, cut P2 or P3 from the pipelines matrix. |
+| **3** | 6.5 | P1 baseline pipeline + eval loop (3 hrs). P2/P3/P4 pipelines (3.5 hrs — each ~1 hr once infra reused). Sanity gate check after P1. |
 | **4** | 6.5 | Streamlit demo polish (1 hr). Deploy demo (1 hr). Blog post draft (3 hrs). README final + repo cleanup (1.5 hrs). |
 
 ---
 
 ## Risks & mitigations
 
-1. **Golden set curation blows the budget** *(most likely failure mode)*. W1 checkpoint = 20-30 done; W2 hard checkpoint = 100 done. Cut a variant before cutting golden-set quality.
-2. **Baseline too good or too bad kills the story.** Sanity-check numbers after V1 baseline before building V2-V4.
+1. **Golden set curation blows the budget** *(most likely failure mode)*. W1 checkpoint = 20-30 done; W2 hard checkpoint = 100 done. Cut a pipeline before cutting golden-set quality.
+2. **Baseline too good or too bad kills the story.** Sanity-check numbers after P1 baseline before building P2-P4.
 3. **Writeup debt.** README skeleton + blog outline land W1 BEFORE any code. Budget 8 of 26 hrs on writing, front-loaded.
 4. **Cohere Rerank cost.** ~2000 rerank calls × $0.001 ≈ $2. Not a real risk, noted for completeness.
 5. **6.830 papers dense — Q&A authoring slower than lectures.** Get most Q&As from lectures; use papers only for cross-source synthesis.
@@ -186,4 +188,4 @@ LLM-as-judge using Claude Sonnet. Given (question, gold answer, gold citations, 
 - If asked to fluff up the frontend (Next.js, styling, auth), refer back to the "Streamlit only" constraint.
 - If asked to speed up golden-set curation via LLM generation, refuse — the golden set's integrity is load-bearing.
 - Prefer running actual evals over theorizing about them.
-- When scoping variants, remember the 26-hr timebox. If a proposed addition costs >2 hrs, name what gets cut to accommodate.
+- When scoping pipelines, remember the 26-hr timebox. If a proposed addition costs >2 hrs, name what gets cut to accommodate.
