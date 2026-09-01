@@ -1,0 +1,30 @@
+# Local Postgres+pgvector for lexgo-rag-eval.
+#
+# One service, one named volume. Everything about the DB the pipeline needs
+# lives here — no manual `psql`, no host Postgres. Bring up with `make db-up`
+# and tear down with `make db-down`.
+#
+# Not intended for production; credentials are lexgo:lexgo and the container
+# publishes 5432 on localhost.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: lexgo-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lexgo
+      POSTGRES_USER: lexgo
+      POSTGRES_PASSWORD: lexgo
+    ports:
+      - "5432:5432"
+    volumes:
+      - lexgo_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lexgo -d lexgo"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  lexgo_pgdata:

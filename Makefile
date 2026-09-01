@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup app corpus validate eval test lint format clean
+.PHONY: help setup app corpus validate eval test lint format clean db-up db-down
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -12,6 +12,13 @@ app: ## Run the Streamlit app (Demo + Author pages)
 
 corpus: ## Download MIT OCW PDFs into corpus/ (idempotent)
 	uv run python -m scripts.fetch_corpus
+
+db-up: ## Start local Postgres+pgvector (docker compose)
+	docker compose up -d
+	@echo "Postgres up at postgresql://lexgo:lexgo@localhost:5432/lexgo"
+
+db-down: ## Stop the local Postgres container
+	docker compose down
 
 validate: ## Lint the golden Q&A set (evals/golden/qa.jsonl)
 	uv run python -m evals.validate_golden
