@@ -8,10 +8,14 @@ Design notes:
 - Schema is applied idempotently by `ensure_schema()` reading schema.sql;
   callers can invoke on every ingest run without special-casing "first
   time" vs "subsequent" runs.
-- All chunks tagged with `pipeline` (a P1..P4-derived identifier like
-  "p1_fixed_500_50"). A single global HNSW index composes with the
-  pipeline filter at query time — cheaper than per-pipeline indexes for
-  our scale, and P2/P3/P4 A/B evals are a WHERE change, not DDL.
+- All chunks tagged with a `pipeline` column (P1..P4-derived, e.g.
+  "p1_fixed_500_50"). Pipelines coexist in one table — an A/B eval
+  across P2/P3/P4 is a WHERE-clause change, not DDL.
+- One global HNSW index over `chunks.embedding` for cosine similarity.
+  Queries compose `WHERE pipeline = $1` with the index scan; at our
+  scale (a few thousand chunks per pipeline) that's cheaper than
+  maintaining a separate HNSW index per pipeline and keeps the schema
+  simpler.
 """
 
 from __future__ import annotations
@@ -80,8 +84,8 @@ class RetrievedChunk:
 class VectorStore:
     """Thin sync wrapper around psycopg + pgvector.
 
-    Use as a context manager to guarantee the connection closes:
-
+    Must be used as a context manager. The connection is opened in
+    __enter__; any method call on an unopened store raises RuntimeError.
         with VectorStore(dsn) as store:
             store.ensure_schema()
             ...
@@ -105,9 +109,11 @@ class VectorStore:
 
     def __exit__(
         self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        tb: TracebackType | None,
+        # Required by the context-manager protocol, unused here — underscored
+        # to signal that. We just close the connection on any exit path.
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _tb: TracebackType | None,
     ) -> None:
         if self._conn is not None:
             self._conn.close()
@@ -122,7 +128,15 @@ class VectorStore:
     # ── Schema ────────────────────────────────────────────────────────
 
     def ensure_schema(self) -> None:
-        """Apply schema.sql. Idempotent — every DDL statement is guarded."""
+        """Apply schema.sql. Idempotent — every DDL statement is guarded.
+
+        schema.sql is the source of truth for the schema; this method is
+        a thin execute-the-file wrapper. Additive changes (new tables,
+        new indexes) are picked up on the next call because every DDL is
+        guarded with IF NOT EXISTS. Destructive changes (drop column,
+        change column type) need explicit migration handling, which is
+        out of scope for P1.
+        """
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_PATH.read_text())
         self.conn.commit()
@@ -137,6 +151,10 @@ class VectorStore:
         compare their computed hash against `content_hash` on the existing
         row before calling.
         """
+        # ON CONFLICT DO UPDATE / EXCLUDED: on doc_path collision, update
+        # the row from the values that would have been inserted. EXCLUDED
+        # is a Postgres pseudo-row bound to that pending insert, only
+        # available inside the DO UPDATE clause.
         with self.conn.cursor() as cur:
             cur.execute(
                 """
@@ -155,7 +173,7 @@ class VectorStore:
             row = cur.fetchone()
             assert row is not None  # RETURNING guarantees a row on INSERT/UPDATE
             self.conn.commit()
-            return int(row[0])
+            return row[0]
 
     # ── Chunks ────────────────────────────────────────────────────────
 
@@ -258,16 +276,16 @@ class VectorStore:
             rows = cur.fetchall()
         return [
             RetrievedChunk(
-                chunk_id=int(r[0]),
-                document_id=int(r[1]),
-                doc_path=str(r[2]),
-                source_id=str(r[3]),
-                pipeline=str(r[4]),
-                chunk_index=int(r[5]),
-                text=str(r[6]),
-                page_start=int(r[7]),
-                page_end=int(r[8]),
-                score=float(r[9]),
+                chunk_id=r[0],
+                document_id=r[1],
+                doc_path=r[2],
+                source_id=r[3],
+                pipeline=r[4],
+                chunk_index=r[5],
+                text=r[6],
+                page_start=r[7],
+                page_end=r[8],
+                score=r[9],
             )
             for r in rows
         ]
@@ -275,15 +293,11 @@ class VectorStore:
     # ── Smoke / observability helpers ─────────────────────────────────
 
     def count_chunks(self, pipeline: str | None = None) -> int:
-        """Total chunks in the store, optionally filtered by pipeline.
-
-        Used by ingest scripts + the PR-B smoke check to prove the schema
-        applied and the DB is queryable.
-        """
+        """Total chunks in the store, optionally filtered by pipeline."""
         with self.conn.cursor() as cur:
             if pipeline is None:
                 cur.execute("SELECT COUNT(*) FROM chunks")
             else:
                 cur.execute("SELECT COUNT(*) FROM chunks WHERE pipeline = %s", (pipeline,))
             row = cur.fetchone()
-            return int(row[0]) if row else 0
+            return row[0] if row else 0

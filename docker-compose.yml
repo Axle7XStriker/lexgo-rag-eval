@@ -1,6 +1,6 @@
 # Local Postgres+pgvector for lexgo-rag-eval.
 #
-# One service, one named volume. Everything about the DB the pipeline needs
+# One service, one named volume. Everything about the DB that the pipeline needs
 # lives here — no manual `psql`, no host Postgres. Bring up with `make db-up`
 # and tear down with `make db-down`.
 #
