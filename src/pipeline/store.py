@@ -89,12 +89,10 @@ class VectorStore:
         with VectorStore(dsn) as store:
             store.ensure_schema()
             ...
-
-    `dsn` is a Postgres data source name (connection string), e.g.
-    "postgresql://lexgo:lexgo@localhost:5432/lexgo".
     """
 
     def __init__(self, dsn: str) -> None:
+        # Postgres data source name (connection string).
         self._dsn = dsn
         self._conn: psycopg.Connection | None = None
 
