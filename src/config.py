@@ -25,10 +25,9 @@ class Settings(BaseSettings):
     voyage_api_key: SecretStr = Field(..., description="Voyage AI API key (embeddings).")
     cohere_api_key: SecretStr = Field(..., description="Cohere API key (rerank).")
 
-    # TODO(#3): wire this into a Postgres+pgvector connection helper.
     database_url: str = Field(
-        default="postgresql://localhost:5432/lexgo",
-        description="Postgres+pgvector connection string.",
+        default="postgresql://lexgo:lexgo@localhost:5432/lexgo",
+        description="Postgres+pgvector connection string; matches docker-compose defaults.",
     )
 
     # TODO(#2): verify these IDs against the provider SDKs at first API call.
