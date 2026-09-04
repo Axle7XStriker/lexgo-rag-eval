@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help setup app corpus validate eval test lint format clean db-up db-down
+.PHONY: help setup app corpus ingest validate eval test lint format clean db-up db-down
 
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -12,6 +12,9 @@ app: ## Run the Streamlit app (Demo + Author pages)
 
 corpus: ## Download MIT OCW PDFs into corpus/ (idempotent)
 	uv run python -m scripts.fetch_corpus
+
+ingest: ## Ingest corpus PDFs into pgvector (P1 fixed 500/50 chunks)
+	uv run python -m scripts.ingest
 
 db-up: ## Start local Postgres+pgvector (docker compose)
 	docker compose up -d
