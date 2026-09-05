@@ -19,6 +19,13 @@ dependencies = [
     "tenacity>=9.0",
     "psycopg[binary]>=3.2",
     "pgvector>=0.3",
+    # PDF text extraction. Dual-licensed AGPL-3 / commercial — chosen for its
+    # extraction quality on academic PDFs. See ingest plan for the license note.
+    "pymupdf>=1.24",
+    # Tokenizer used only as a size proxy for the fixed-window chunker. Voyage
+    # doesn't publish a public tokenizer; cl100k_base is fast, offline, and
+    # close enough for the "500 tokens, 50 overlap" spec.
+    "tiktoken>=0.8",
 ]
 
 [dependency-groups]
@@ -36,11 +43,12 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B", "SIM", "RUF"]
-# RUF001 flags ambiguous unicode characters in string literals — we use
-# em-dashes ("—"), arrows ("→"), and section marks ("§") in help text and
-# error messages throughout the repo. These are intentional and readable;
-# suppressing repo-wide is cleaner than a `# noqa: RUF001` per occurrence.
-ignore = ["RUF001"]
+# RUF001 (in string literals) and RUF003 (in comments) flag ambiguous
+# unicode characters — we use em-dashes ("—"), arrows ("→"), section marks
+# ("§"), and multiplication signs ("×") throughout the repo. These are
+# intentional and readable; suppressing repo-wide is cleaner than a
+# `# noqa` per occurrence.
+ignore = ["RUF001", "RUF003"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
