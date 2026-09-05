@@ -114,7 +114,7 @@ def chunk_fixed(
     # Whitespace-only inputs would tokenize to whitespace tokens and produce
     # a spurious first chunk of literal whitespace. Guard here so callers get
     # an unambiguous empty list rather than an ingested whitespace chunk.
-    if all(not p.text.strip() for p in doc.pages):
+    if not any(p.text.strip() for p in doc.pages):
         return []
 
     encoder = tiktoken.get_encoding(encoding_name)
