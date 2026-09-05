@@ -91,7 +91,7 @@ def extract_pdf(path: Path) -> ExtractedDoc:
 
         # Reject only when EVERY page is whitespace-only — a doc with a blank
         # cover page but real content elsewhere is still a valid extraction.
-        if all(not p.text.strip() for p in pages):
+        if not any(p.text.strip() for p in pages):
             raise ValueError(f"{path} yielded no extractable text on any page")
 
         # Metadata title falls back to None so downstream doesn't have to
