@@ -1,8 +1,9 @@
 """P1 ingest orchestrator — corpus PDFs → pgvector.
 
 For each present PDF in the manifest: extract text → chunk (fixed 500/50) →
-embed via Voyage → upsert into `documents` + `chunks`. Idempotent: unchanged
-documents are skipped by content-hash short-circuit, so re-running is cheap.
+embed via Voyage → upsert into the `documents` and `chunks` tables.
+Idempotent: unchanged documents are skipped by content-hash short-circuit,
+so re-running is cheap.
 
 CLI::
 
@@ -19,9 +20,9 @@ Design notes worth remembering:
   - Missing REQUIRED corpus files fail-fast at doc time (log + surface in
     summary + non-zero exit). Missing OPTIONAL files (per MANIFEST.optional)
     are warned + skipped.
-  - Per-doc summary rows land in `logs/ingest_run_<utc_iso>.jsonl` for the
-    blog post's cost/latency story. Per-Voyage-call records land in
-    `logs/llm_calls.jsonl` via `log_llm_call`.
+  - Per-doc summary rows land in `logs/ingest_run_<utc_iso>.jsonl` — one
+    JSONL record per document with num_chunks, tokens, cost, elapsed. Per
+    Voyage call, one line lands in `logs/llm_calls.jsonl` via `log_llm_call`.
 """
 
 from __future__ import annotations
@@ -34,6 +35,7 @@ import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Literal
 
 from scripts.corpus_manifest import MANIFEST, ManifestEntry
 from src.config import get_settings
@@ -42,6 +44,10 @@ from src.pipeline.chunk import PIPELINE_TAG, chunk_fixed
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.extract import extract_pdf
 from src.pipeline.store import ChunkRow, DocumentRow, VectorStore
+
+# Finite outcome set for one document's ingest attempt. Kept as a Literal so
+# the type checker catches typos across `_process_entry` and `_print_summary`.
+DocStatus = Literal["ingested", "skipped_unchanged", "missing", "extract_failed", "error"]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CORPUS_ROOT = REPO_ROOT / "corpus"
@@ -57,7 +63,7 @@ class DocResult:
 
     source_id: str
     doc_path: str
-    status: str  # "ingested" | "skipped_unchanged" | "missing" | "extract_failed" | "error"
+    status: DocStatus
     num_pages: int = 0
     num_chunks: int = 0
     tokens_embedded: int = 0
@@ -66,8 +72,9 @@ class DocResult:
     error: str | None = None
 
 
-def _entries_for_only(only: str | None) -> list[ManifestEntry]:
-    """Manifest slice honoring --only (matches on doc_path suffix or source_id)."""
+def _select_manifest_entries(only: str | None) -> list[ManifestEntry]:
+    """Return the manifest entries to process — the full manifest when `only` is None,
+    otherwise the subset matching either a full `dest_path` or a `source_id`."""
     if not only:
         return list(MANIFEST)
     matches = [e for e in MANIFEST if e.dest_path == only or e.source_id == only]
@@ -82,6 +89,8 @@ def _entries_for_only(only: str | None) -> list[ManifestEntry]:
 
 def _write_run_log(path: Path, results: list[DocResult]) -> None:
     """One JSON object per doc, appended to the per-run log."""
+    # Ensure the log directory exists — first-time runs on a fresh checkout
+    # hit this before anything else has written under logs/.
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for r in results:
@@ -286,7 +295,7 @@ def _process_entry(
 
 
 def _print_summary(results: list[DocResult]) -> None:
-    """Tally + list of failures + total cost. Aggregate story for humans."""
+    """Print per-status counts, failing entries, and total chunks / tokens / cost."""
     buckets: dict[str, list[DocResult]] = {}
     for r in results:
         buckets.setdefault(r.status, []).append(r)
@@ -312,10 +321,11 @@ def _print_summary(results: list[DocResult]) -> None:
     )
     for status in ("missing", "extract_failed", "error"):
         rows = buckets.get(status, [])
-        # Missing optional entries are demoted to a lower-noise line; missing
-        # REQUIRED entries and every extract_failed / error is loud.
-        required_only = status == "missing"
-        if required_only:
+        # `missing` is the only status that splits required vs. optional —
+        # optional-missing is demoted to a low-noise line, required-missing
+        # (and every extract_failed / error) stays loud.
+        is_missing_status = status == "missing"
+        if is_missing_status:
             required_rows = [r for r in rows if _is_required(r.doc_path)]
             optional_rows = [r for r in rows if not _is_required(r.doc_path)]
             if required_rows:
@@ -373,7 +383,7 @@ def main() -> int:
     logger = get_logger("ingest")
     settings = get_settings()
 
-    entries = _entries_for_only(args.only)
+    entries = _select_manifest_entries(args.only)
     logger.info(
         "ingest_start",
         n_entries=len(entries),

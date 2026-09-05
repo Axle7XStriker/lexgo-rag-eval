@@ -4,7 +4,7 @@ Two layers of coverage:
   - `_process_entry` against a real Postgres (skipped when unreachable) with
     a fake embedder — exercises idempotency, --force, upsert semantics, and
     missing/required exit behavior.
-  - Manifest helper (`_entries_for_only`) — pure, no DB.
+  - Manifest helper (`_select_manifest_entries`) — pure, no DB.
 
 Integration path uses a real DB per CLAUDE.md ("no mocked DB in integration
 tests"). Voyage is always mocked — the eval-suite ban on mocked LLM calls
@@ -120,26 +120,26 @@ def _make_entry(dest_path: str, *, optional: bool = False) -> ManifestEntry:
 
 
 class TestEntrySelection:
-    """_entries_for_only: full manifest / source_id filter / doc_path filter / miss."""
+    """_select_manifest_entries: full manifest / source_id filter / doc_path filter / miss."""
 
     def test_none_returns_all(self) -> None:
-        entries = ingest_mod._entries_for_only(None)
+        entries = ingest_mod._select_manifest_entries(None)
         assert len(entries) == len(ingest_mod.MANIFEST)
 
     def test_source_id_filter(self) -> None:
-        entries = ingest_mod._entries_for_only("A1")
+        entries = ingest_mod._select_manifest_entries("A1")
         assert entries and all(e.source_id == SourceId.A1 for e in entries)
 
     def test_doc_path_filter(self) -> None:
         # Pick a real manifest entry so we know it matches.
         target = ingest_mod.MANIFEST[0].dest_path
-        entries = ingest_mod._entries_for_only(target)
+        entries = ingest_mod._select_manifest_entries(target)
         assert len(entries) == 1
         assert entries[0].dest_path == target
 
     def test_unknown_only_raises_systemexit(self) -> None:
         with pytest.raises(SystemExit):
-            ingest_mod._entries_for_only("Z9")
+            ingest_mod._select_manifest_entries("Z9")
 
 
 class TestIsRequired:

@@ -5,25 +5,28 @@ concern (chunking, hashing, page-range citations) reads from `ExtractedDoc`,
 so keeping this module small + strict pays for itself.
 
 Design notes worth remembering:
-  - PyMuPDF (`fitz`) is used for extraction. It is dual-licensed AGPL-3 /
-    commercial — flagged in the ingest plan; not litigated here.
-  - `content_hash` is sha256 over the `\\n\\n`-joined page text. That's the
-    idempotency key ingest uses to decide "same doc, skip embed". Any
-    change to the join separator is a schema break (rehashes everything).
+  - PyMuPDF is used for extraction. It is dual-licensed AGPL-3 / commercial;
+    flagged in the pyproject dep comment so the license question is a
+    conscious choice.
+  - `content_hash` is sha256 over the page-joined text (`_text.join_pages`).
+    That's the idempotency key ingest uses to decide "same doc, skip embed".
+    Changing the join separator or the hash function is a schema break.
   - Whitespace-only pages are kept in `pages` (empty `text`) so 1-indexed
     page numbers stay honest — a chunk that spans pages 4-5 while page 4
-    is blank still gets `page_start=4` truthfully.
+    is blank still gets `page_start=4` truthfully. Page-range fidelity is
+    the load-bearing infrastructure behind citations.
   - Encrypted / empty / non-PDF inputs raise `ValueError`. Ingest catches
     and logs — one bad doc must never wedge the whole run.
 """
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import pymupdf
+
+from src.pipeline._text import join_pages, sha256_utf8
 
 PDF_MAGIC = b"%PDF"
 
@@ -51,15 +54,6 @@ class ExtractedDoc:
     content_hash: str
 
 
-def _joined_text(pages: list[PageText]) -> str:
-    """Canonical page-joined text — the input to `content_hash`.
-
-    Kept as a private helper so tests and callers agree on the exact
-    join separator. Changing this string is a schema break.
-    """
-    return "\n\n".join(p.text for p in pages)
-
-
 def extract_pdf(path: Path) -> ExtractedDoc:
     """Extract text from `path` and return an `ExtractedDoc`.
 
@@ -72,8 +66,8 @@ def extract_pdf(path: Path) -> ExtractedDoc:
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {path}")
 
-    # Magic-byte sniff before handing to fitz — fitz raises on non-PDFs but
-    # its error message is less useful for a corpus health check.
+    # Magic-byte sniff before handing to pymupdf — pymupdf raises on non-PDFs
+    # but its error message is less useful for a corpus health check.
     with path.open("rb") as f:
         head = f.read(len(PDF_MAGIC))
     if head != PDF_MAGIC:
@@ -95,7 +89,9 @@ def extract_pdf(path: Path) -> ExtractedDoc:
             text = page.get_text("text")
             pages.append(PageText(page_number=i + 1, text=text))
 
-        if not any(p.text.strip() for p in pages):
+        # Reject only when EVERY page is whitespace-only — a doc with a blank
+        # cover page but real content elsewhere is still a valid extraction.
+        if all(not p.text.strip() for p in pages):
             raise ValueError(f"{path} yielded no extractable text on any page")
 
         # Metadata title falls back to None so downstream doesn't have to
@@ -104,7 +100,7 @@ def extract_pdf(path: Path) -> ExtractedDoc:
         title = raw_title.strip() if raw_title else None
         title = title or None  # empty-after-strip → None
 
-        content_hash = hashlib.sha256(_joined_text(pages).encode("utf-8")).hexdigest()
+        content_hash = sha256_utf8(join_pages([p.text for p in pages]))
         return ExtractedDoc(
             pages=pages,
             num_pages=doc.page_count,

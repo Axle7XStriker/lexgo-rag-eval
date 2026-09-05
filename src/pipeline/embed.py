@@ -1,17 +1,18 @@
 """Voyage embedding client with retry, batching, and per-call cost logging.
 
 One class, `VoyageEmbedder`. Two methods:
-  - `embed_documents(texts)` — used by ingest, batched, `input_type="document"`.
-  - `embed_query(text)` — used at query time in Stage B, `input_type="query"`.
+  - `embed_documents(texts)` — batched, `input_type="document"`.
+  - `embed_query(text)` — single input, `input_type="query"`.
 
 Design notes worth remembering:
   - Voyage's SDK is sync and its batch limit is 128 inputs per request. We
     default to 64 to leave headroom for the token-per-request cap and to
     keep any single failure/refire cost small.
   - Every successful call writes one `log_llm_call` record. `input_tokens`
-    is Voyage's reported `total_tokens`. Cost is computed from the local
-    `PRICING` dict — verified against provider docs on first API call
-    (per the CLAUDE.md pattern; TODO(#2) in `src/config.py`).
+    is Voyage's reported `total_tokens`. Voyage's SDK does NOT return a
+    per-call cost — cost is computed locally from the `PRICING` dict, so
+    that dict is the only place that needs updating if Voyage's prices
+    change.
   - Retries are tenacity, targeted at transient failures only (rate-limit,
     5xx, connection). Deterministic errors (bad API key, invalid model)
     fail fast.
@@ -35,11 +36,11 @@ from voyageai.error import RateLimitError, ServerError
 
 from src.observability import get_logger, log_llm_call
 
-_log = get_logger("embed")
+_logger = get_logger("embed")
 
-# USD per 1M input tokens, keyed on Voyage model id.
-# voyage-3-large pricing per Voyage's docs: $0.18 / 1M input tokens.
-# Verified against Voyage's response.total_tokens on first live call.
+# USD per 1M input tokens, keyed on Voyage model id. Voyage's SDK does not
+# return a per-call cost, so we compute it locally from this table. Tracked
+# for periodic verification against Voyage's docs — see the follow-up issue.
 PRICING: dict[str, float] = {
     "voyage-3-large": 0.18,
     # Add other models here as they get exercised.
@@ -63,7 +64,7 @@ def _cost_for(model: str, input_tokens: int) -> float:
     """Cost in USD for `input_tokens` at `model`'s pricing. Missing model → 0.0."""
     per_million = PRICING.get(model)
     if per_million is None:
-        _log.warning("voyage_pricing_missing", model=model, input_tokens=input_tokens)
+        _logger.warning("voyage_pricing_missing", model=model, input_tokens=input_tokens)
         return 0.0
     return (input_tokens / 1_000_000) * per_million
 
@@ -151,16 +152,24 @@ class VoyageEmbedder:
         total_tokens = int(getattr(result, "total_tokens", 0) or 0)
         embeddings: list[list[float]] = list(result.embeddings)
 
+        # Explicit branch instead of f"embed_{input_type}s" to avoid an
+        # `embed_querys` typo; distinct constants also make log filters trivial.
+        operation = "embed_documents" if input_type == "document" else "embed_query"
         log_llm_call(
             self._log_path,
             provider="voyage",
             model=self._model,
-            operation=f"embed_{input_type}s",
+            operation=operation,
             input_tokens=total_tokens,
+            # Embedding calls have no output tokens — the response is a vector,
+            # not generated text. Kept in the shared log schema for uniformity
+            # with chat/judge calls that DO emit output tokens.
             output_tokens=0,
             cost_usd=_cost_for(self._model, total_tokens),
             latency_ms=elapsed_ms,
             run_id=run_id,
+            # Embeddings don't use a prompt template, so no prompt_version to
+            # record. Kept as an explicit None to match the log_llm_call kwargs.
             prompt_version=None,
             extra={"batch_size": len(batch), "input_type": input_type},
         )

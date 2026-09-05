@@ -25,7 +25,7 @@ def _doc(pages: list[str]) -> ExtractedDoc:
     )
 
 
-def _long_page(word: str, n_words: int) -> str:
+def _page_of_repeated_word(word: str, n_words: int) -> str:
     return " ".join([word] * n_words)
 
 
@@ -44,7 +44,7 @@ class TestChunkFixedShape:
 
     def test_chunk_sizes_bounded(self) -> None:
         # ~3000 tokens of repeated content → several full windows + a tail.
-        doc = _doc([_long_page("alpha", 3000)])
+        doc = _doc([_page_of_repeated_word("alpha", 3000)])
         chunks = chunk_fixed(doc)
         assert len(chunks) > 1
         assert all(c.num_tokens <= 500 for c in chunks)
@@ -55,7 +55,7 @@ class TestChunkFixedShape:
         # Consecutive chunks share `overlap_tokens` at the join in token space.
         # We assert this by re-tokenizing and comparing the tail of chunk N
         # against the head of chunk N+1.
-        doc = _doc([_long_page("gamma", 2500)])
+        doc = _doc([_page_of_repeated_word("gamma", 2500)])
         chunks = chunk_fixed(doc, target_tokens=500, overlap_tokens=50)
         encoder = tiktoken.get_encoding(DEFAULT_ENCODING)
         for a, b in itertools.pairwise(chunks):
@@ -68,13 +68,13 @@ class TestChunkFixedShape:
     def test_tail_chunk_kept_even_if_short(self) -> None:
         # Total tokens not a multiple of `step` — the final chunk is shorter
         # than target_tokens and MUST NOT be dropped.
-        doc = _doc([_long_page("delta", 601)])  # 601 words → ~601 tokens
+        doc = _doc([_page_of_repeated_word("delta", 601)])  # 601 words → ~601 tokens
         chunks = chunk_fixed(doc, target_tokens=500, overlap_tokens=50)
         assert chunks[-1].num_tokens < 500
         assert chunks[-1].num_tokens > 0
 
     def test_chunk_indices_are_dense_and_monotonic(self) -> None:
-        doc = _doc([_long_page("epsilon", 2000)])
+        doc = _doc([_page_of_repeated_word("epsilon", 2000)])
         chunks = chunk_fixed(doc)
         assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
 
@@ -93,20 +93,20 @@ class TestChunkFixedPageRanges:
     """`page_start` / `page_end` are monotonic and honest across page breaks."""
 
     def test_single_page_chunks_share_page(self) -> None:
-        doc = _doc([_long_page("eta", 300)])
+        doc = _doc([_page_of_repeated_word("eta", 300)])
         chunks = chunk_fixed(doc)
         assert all(c.page_start == 1 and c.page_end == 1 for c in chunks)
 
     def test_multi_page_chunk_reports_range(self) -> None:
         # Two ~400-token pages → any single 500-token chunk straddles them.
-        doc = _doc([_long_page("theta", 400), _long_page("iota", 400)])
+        doc = _doc([_page_of_repeated_word("theta", 400), _page_of_repeated_word("iota", 400)])
         chunks = chunk_fixed(doc, target_tokens=500, overlap_tokens=50)
         straddlers = [c for c in chunks if c.page_start != c.page_end]
         assert straddlers, "expected at least one chunk spanning both pages"
         assert all(c.page_start == 1 and c.page_end == 2 for c in straddlers)
 
     def test_page_start_monotonic(self) -> None:
-        doc = _doc([_long_page(f"w{i}", 300) for i in range(6)])
+        doc = _doc([_page_of_repeated_word(f"w{i}", 300) for i in range(6)])
         chunks = chunk_fixed(doc)
         assert chunks[0].page_start == 1
         # page_start advances monotonically as we walk chunks.

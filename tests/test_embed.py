@@ -142,7 +142,7 @@ class TestLogging:
         e = _make_embedder(client=client, log_path=log_path)
         e.embed_query("hello?")
         recs = _read_log(log_path)
-        assert recs[0]["operation"] == "embed_querys"  # sanity: naming stays "embed_{type}s"
+        assert recs[0]["operation"] == "embed_query"
         assert recs[0]["input_type"] == "query"
 
     def test_one_record_per_batch(self, log_path: Path) -> None:

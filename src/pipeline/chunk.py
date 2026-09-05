@@ -7,11 +7,10 @@ via `tiktoken cl100k_base`. Chunks carry their originating `page_start` /
 Design notes worth remembering:
   - Voyage does not publish a public tokenizer. cl100k_base (OpenAI's) is
     the de facto lingua franca — fast, offline, and stable. The 500-token
-    target is *approximate* vs. Voyage's internal count; documented as a
-    baseline caveat in the blog's methodology section.
-  - Pages join with a single `\\n\\n` separator into one token stream. The
-    separator's tokens are attributed to whichever page's boundary they
-    straddle — cheap and honest enough for citations.
+    target is *approximate* vs. Voyage's internal count.
+  - Pages join with `_text.PAGE_JOIN` into one token stream. The separator's
+    tokens are attributed to whichever page's boundary they straddle —
+    cheap and honest enough for citations.
   - `PIPELINE_TAG` is the exact string written to `chunks.pipeline` so all
     P1 rows are queryable with a single WHERE clause. Do not typo it.
   - The final chunk is kept even if shorter than `target_tokens` — dropping
@@ -20,20 +19,17 @@ Design notes worth remembering:
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass
 
 import tiktoken
 
+from src.pipeline._text import PAGE_JOIN, sha256_utf8
 from src.pipeline.extract import ExtractedDoc
 
 PIPELINE_TAG = "p1_fixed_500_50"
 DEFAULT_TARGET_TOKENS = 500
 DEFAULT_OVERLAP_TOKENS = 50
 DEFAULT_ENCODING = "cl100k_base"
-# Single-blank-line join between pages. Keeping this a module constant makes
-# the "how do pages compose" invariant grep-able across chunker + tests.
-PAGE_JOIN = "\n\n"
 
 
 @dataclass(frozen=True)
@@ -48,17 +44,19 @@ class Chunk:
     content_hash: str
 
 
-def _page_boundaries(
+def _encode_pages(
     doc: ExtractedDoc,
     encoder: tiktoken.Encoding,
 ) -> tuple[list[int], list[int]]:
-    """Compute per-page start-token indices in the joined stream + full token list.
+    """Tokenize each page into one flat token stream, recording per-page start indices.
 
-    The two returned parallel lists let callers translate any absolute token
-    index back to the 1-indexed source page: `page_of(i) = 1 + bisect_right(starts, i) - 1`.
+    Returns `(page_starts, tokens)`:
+      - `page_starts[i]` = the index in `tokens` where page `i+1` begins.
+      - `tokens` = concatenated tokens for all pages, with `PAGE_JOIN` tokens
+        inserted between pages so a chunk that straddles pages reports both.
 
-    Kept as a helper (not inlined in `chunk_fixed`) so the boundary invariant
-    is unit-testable in isolation.
+    `_page_of(token_index, page_starts)` maps an absolute token index in
+    `tokens` back to a 1-indexed page number.
     """
     starts: list[int] = []
     tokens: list[int] = []
@@ -116,11 +114,11 @@ def chunk_fixed(
     # Whitespace-only inputs would tokenize to whitespace tokens and produce
     # a spurious first chunk of literal whitespace. Guard here so callers get
     # an unambiguous empty list rather than an ingested whitespace chunk.
-    if not any(p.text.strip() for p in doc.pages):
+    if all(not p.text.strip() for p in doc.pages):
         return []
 
     encoder = tiktoken.get_encoding(encoding_name)
-    page_starts, tokens = _page_boundaries(doc, encoder)
+    page_starts, tokens = _encode_pages(doc, encoder)
     total = len(tokens)
     if total == 0:
         return []
@@ -135,7 +133,6 @@ def chunk_fixed(
         text = encoder.decode(window)
         page_start = _page_of(start, page_starts)
         page_end = _page_of(end - 1, page_starts)
-        content_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
         chunks.append(
             Chunk(
                 text=text,
@@ -143,7 +140,7 @@ def chunk_fixed(
                 chunk_index=chunk_index,
                 page_start=page_start,
                 page_end=page_end,
-                content_hash=content_hash,
+                content_hash=sha256_utf8(text),
             )
         )
         chunk_index += 1
