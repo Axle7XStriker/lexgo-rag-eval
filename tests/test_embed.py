@@ -7,6 +7,7 @@ tenacity retry on transient errors, hard-fail on deterministic errors.
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -32,6 +33,12 @@ class _FakeResponse:
     total_tokens: int
 
 
+# One entry in `_FakeClient.responses`: either a canned response or a
+# callable that receives the batch texts and returns/raises. Callables are
+# how retry tests simulate transient failures then a success.
+_ResponseItem = _FakeResponse | Callable[[list[str]], _FakeResponse]
+
+
 @dataclass
 class _FakeClient:
     """Tracks calls and returns pre-programmed responses in order.
@@ -40,7 +47,7 @@ class _FakeClient:
     invoked (used for retry tests where the first N raise).
     """
 
-    responses: list = field(default_factory=list)
+    responses: list[_ResponseItem] = field(default_factory=list)
     calls: list[dict] = field(default_factory=list)
 
     def embed(self, texts: list[str], model: str, input_type: str) -> _FakeResponse:
@@ -142,8 +149,16 @@ class TestLogging:
         e = _make_embedder(client=client, log_path=log_path)
         e.embed_query("hello?")
         recs = _read_log(log_path)
-        assert recs[0]["operation"] == "embed_query"
-        assert recs[0]["input_type"] == "query"
+        assert len(recs) == 1
+        r = recs[0]
+        assert r["provider"] == "voyage"
+        assert r["model"] == "voyage-3-large"
+        assert r["operation"] == "embed_query"
+        assert r["input_tokens"] == 7
+        assert r["output_tokens"] == 0
+        assert r["cost_usd"] == pytest.approx(_cost_for("voyage-3-large", 7), abs=1e-6)
+        assert r["batch_size"] == 1
+        assert r["input_type"] == "query"
 
     def test_one_record_per_batch(self, log_path: Path) -> None:
         client = _FakeClient()
@@ -163,7 +178,6 @@ class TestRetry:
             "wait",
             lambda *a, **kw: 0,
         )
-
         state = {"n": 0}
 
         def _flaky(texts: list[str]) -> _FakeResponse:

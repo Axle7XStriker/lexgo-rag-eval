@@ -52,16 +52,14 @@ class TestChunkFixedShape:
         assert all(c.num_tokens == 500 for c in chunks[:-1])
 
     def test_overlap_is_honored(self) -> None:
-        # Consecutive chunks share `overlap_tokens` at the join in token space.
-        # We assert this by re-tokenizing and comparing the tail of chunk N
-        # against the head of chunk N+1.
+        # Overlap is defined in TOKENS (not chars), and tiktoken doesn't split
+        # 1:1 with characters, so the invariant has to be checked in token
+        # space. Re-encoding here is deterministic — tiktoken round-trips.
         doc = _doc([_page_of_repeated_word("gamma", 2500)])
         chunks = chunk_fixed(doc, target_tokens=500, overlap_tokens=50)
         encoder = tiktoken.get_encoding(DEFAULT_ENCODING)
         for a, b in itertools.pairwise(chunks):
-            a_tail = encoder.encode(a.text)[-50:]
-            b_head = encoder.encode(b.text)[:50]
-            assert a_tail == b_head, (
+            assert encoder.encode(a.text)[-50:] == encoder.encode(b.text)[:50], (
                 f"overlap mismatch between chunk {a.chunk_index} and {b.chunk_index}"
             )
 
@@ -74,6 +72,9 @@ class TestChunkFixedShape:
         assert chunks[-1].num_tokens > 0
 
     def test_chunk_indices_are_dense_and_monotonic(self) -> None:
+        # chunk_index is a 0-based ORDINAL, not just a unique id — downstream
+        # code uses `ORDER BY chunk_index` to walk a document in reading order.
+        # Dense + monotonic is the actual contract, not just uniqueness.
         doc = _doc([_page_of_repeated_word("epsilon", 2000)])
         chunks = chunk_fixed(doc)
         assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
@@ -102,8 +103,9 @@ class TestChunkFixedPageRanges:
         doc = _doc([_page_of_repeated_word("theta", 400), _page_of_repeated_word("iota", 400)])
         chunks = chunk_fixed(doc, target_tokens=500, overlap_tokens=50)
         straddlers = [c for c in chunks if c.page_start != c.page_end]
-        assert straddlers, "expected at least one chunk spanning both pages"
-        assert all(c.page_start == 1 and c.page_end == 2 for c in straddlers)
+        assert straddlers, "expected at least one chunk spanning multiple pages"
+        for c in straddlers:
+            assert c.page_start < c.page_end
 
     def test_page_start_monotonic(self) -> None:
         doc = _doc([_page_of_repeated_word(f"w{i}", 300) for i in range(6)])
@@ -112,6 +114,17 @@ class TestChunkFixedPageRanges:
         # page_start advances monotonically as we walk chunks.
         starts = [c.page_start for c in chunks]
         assert starts == sorted(starts)
+
+    def test_middle_blank_page_preserves_page_numbering(self) -> None:
+        # Analogous to test_extract's `test_whitespace_only_page_preserves_page_number`:
+        # a blank middle page must not shift downstream page numbers. Chunks
+        # from page 3's content must report page 3, not page 2.
+        doc = _doc([_page_of_repeated_word("alpha", 300), "", _page_of_repeated_word("gamma", 300)])
+        chunks = chunk_fixed(doc)
+        assert chunks, "expected at least one chunk"
+        # First chunk covers page 1 content; last chunk covers page 3 content.
+        assert chunks[0].page_start == 1
+        assert chunks[-1].page_end == 3
 
 
 class TestChunkFixedValidation:
