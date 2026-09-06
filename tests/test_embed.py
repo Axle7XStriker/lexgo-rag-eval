@@ -13,7 +13,7 @@ from pathlib import Path
 
 import pytest
 from pydantic import SecretStr
-from voyageai.error import RateLimitError
+from voyageai.error import APIConnectionError, RateLimitError, Timeout
 
 from src.pipeline import embed as embed_module
 from src.pipeline.embed import (
@@ -214,9 +214,46 @@ class TestRetry:
         # tenacity is configured stop_after_attempt(5); no successful log line.
         assert _read_log(log_path) == []
 
+    @pytest.mark.parametrize(
+        "exc_factory",
+        [
+            # Voyage's OWN network-level exceptions — NOT Python built-in
+            # TimeoutError / ConnectionError. If _RETRYABLE regresses to the
+            # built-ins these tests fail immediately instead of silently
+            # skipping retries in production.
+            lambda: Timeout("simulated timeout"),
+            lambda: APIConnectionError("simulated connection error"),
+        ],
+        ids=["voyage_timeout", "voyage_api_connection_error"],
+    )
+    def test_retries_on_voyage_network_exceptions(
+        self,
+        log_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        exc_factory,
+    ) -> None:
+        monkeypatch.setattr(
+            embed_module.VoyageEmbedder._embed_batch.retry,
+            "wait",
+            lambda *a, **kw: 0,
+        )
+        state = {"n": 0}
+
+        def _flaky(texts: list[str]) -> _FakeResponse:
+            state["n"] += 1
+            if state["n"] < 2:
+                raise exc_factory()
+            return _FakeResponse(embeddings=[[0.5]] * len(texts), total_tokens=len(texts))
+
+        client = _FakeClient(responses=[_flaky, _flaky])
+        e = _make_embedder(client=client, log_path=log_path)
+        out = e.embed_documents(["a"])
+        assert len(out) == 1
+        assert state["n"] == 2  # 1 failure + 1 success
+
 
 class TestValidation:
-    """Constructor guards on batch_size."""
+    """Constructor guards on batch_size + unknown model."""
 
     def test_batch_size_zero_rejected(self, log_path: Path) -> None:
         with pytest.raises(ValueError, match="batch_size"):
@@ -225,6 +262,12 @@ class TestValidation:
     def test_batch_size_over_ceiling_rejected(self, log_path: Path) -> None:
         with pytest.raises(ValueError, match="batch_size"):
             _make_embedder(client=_FakeClient(), log_path=log_path, batch_size=MAX_BATCH_SIZE + 1)
+
+    def test_unknown_model_rejected_at_init(self, log_path: Path) -> None:
+        # Silent $0 cost from an unpriced model would poison the blog's cost
+        # story with no visible signal — fail loud at construction instead.
+        with pytest.raises(ValueError, match="unknown Voyage model"):
+            _make_embedder(client=_FakeClient(), log_path=log_path, model="voyage-not-real")
 
 
 class TestPricing:

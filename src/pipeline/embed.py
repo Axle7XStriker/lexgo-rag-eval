@@ -32,7 +32,14 @@ from tenacity import (
     wait_exponential,
 )
 from voyageai import Client as VoyageClient
-from voyageai.error import RateLimitError, ServerError
+from voyageai.error import (
+    APIConnectionError,
+    RateLimitError,
+    ServerError,
+    ServiceUnavailableError,
+    Timeout,
+    TryAgain,
+)
 
 from src.observability import get_logger, log_llm_call
 
@@ -54,14 +61,28 @@ MAX_BATCH_SIZE = 128
 
 InputType = Literal["document", "query"]
 
-# tenacity: retry on the two Voyage exception classes plus connection-level
-# TimeoutError. Deterministic exceptions (bad key, unknown model) are not
-# retryable and surface immediately.
-_RETRYABLE = (RateLimitError, ServerError, TimeoutError, ConnectionError)
+# tenacity: retry on Voyage's transient exception classes. The voyageai SDK
+# raises its OWN Timeout / APIConnectionError (subclasses of VoyageError), NOT
+# Python's built-in TimeoutError / ConnectionError — so a real network hiccup
+# wouldn't match those. Deterministic errors (bad key, unknown model, malformed
+# request) are NOT in this list and fail immediately.
+_RETRYABLE = (
+    RateLimitError,
+    ServerError,
+    ServiceUnavailableError,
+    APIConnectionError,
+    Timeout,
+    TryAgain,
+)
 
 
 def _cost_for(model: str, input_tokens: int) -> float:
-    """Cost in USD for `input_tokens` at `model`'s pricing. Missing model → 0.0."""
+    """Cost in USD for `input_tokens` at `model`'s pricing. Missing model → 0.0.
+
+    VoyageEmbedder rejects unknown models at construction time; this fallback
+    only trips if PRICING is edited to drop an already-in-flight model, which
+    should never happen. Warning is a belt-and-braces breadcrumb.
+    """
     per_million = PRICING.get(model)
     if per_million is None:
         _logger.warning("voyage_pricing_missing", model=model, input_tokens=input_tokens)
@@ -87,6 +108,14 @@ class VoyageEmbedder:
     ) -> None:
         if batch_size <= 0 or batch_size > MAX_BATCH_SIZE:
             raise ValueError(f"batch_size must be in [1, {MAX_BATCH_SIZE}], got {batch_size}")
+        # Fail fast on unknown models: a silent $0 per-call cost would poison
+        # the blog's cost story with no visible signal. If a new Voyage tier
+        # is being trialed, add it to PRICING first.
+        if model not in PRICING:
+            raise ValueError(
+                f"unknown Voyage model {model!r}; add its price to PRICING "
+                f"in src/pipeline/embed.py before use. Known: {sorted(PRICING)}"
+            )
         self._model = model
         self._log_path = log_path
         self._batch_size = batch_size

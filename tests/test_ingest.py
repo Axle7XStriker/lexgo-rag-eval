@@ -163,6 +163,42 @@ class TestIsRequired:
         assert ingest_mod._is_required("nowhere/nothing.pdf") is True
 
 
+class TestExitCodeLogic:
+    """_any_required_failed: what actually decides the process exit code."""
+
+    def _result(self, dest_path: str, status: ingest_mod.DocStatus) -> ingest_mod.DocResult:
+        return ingest_mod.DocResult(source_id="A1", doc_path=dest_path, status=status)
+
+    def test_all_ingested_exits_clean(self) -> None:
+        required = next(e for e in MANIFEST if not e.optional)
+        assert not ingest_mod._any_required_failed([self._result(required.dest_path, "ingested")])
+
+    def test_required_missing_fails(self) -> None:
+        required = next(e for e in MANIFEST if not e.optional)
+        assert ingest_mod._any_required_failed([self._result(required.dest_path, "missing")])
+
+    def test_required_extract_failed_fails(self) -> None:
+        required = next(e for e in MANIFEST if not e.optional)
+        assert ingest_mod._any_required_failed([self._result(required.dest_path, "extract_failed")])
+
+    def test_optional_extract_failed_does_not_fail(self) -> None:
+        # The specific regression: previously any extract_failed row exited 1
+        # regardless of optional status, contradicting the required-vs-optional
+        # policy applied to `missing`.
+        optional = next((e for e in MANIFEST if e.optional), None)
+        if optional is None:
+            pytest.skip("no optional entries in manifest")
+        assert not ingest_mod._any_required_failed(
+            [self._result(optional.dest_path, "extract_failed")]
+        )
+
+    def test_optional_missing_does_not_fail(self) -> None:
+        optional = next((e for e in MANIFEST if e.optional), None)
+        if optional is None:
+            pytest.skip("no optional entries in manifest")
+        assert not ingest_mod._any_required_failed([self._result(optional.dest_path, "missing")])
+
+
 # ── Integration tests (require DB) ────────────────────────────────────
 
 
@@ -298,6 +334,169 @@ class TestProcessEntryIntegration:
         assert result.tokens_embedded > 0  # reports the pre-flight estimate
         assert result.cost_usd == 0.0
         assert embedder.calls == 0
+        assert clean_store.count_chunks(PIPELINE_TAG) == 0
+
+    def test_dry_run_works_without_store(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # The M1 contract: --dry-run must be usable on a laptop with no
+        # docker up. store=None mirrors what main() passes in that case.
+        monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
+        dest = tmp_path / "corpus" / "test/A1_fake.pdf"
+        write_pdf(dest, ["Delta " * 100])
+        entry = _make_entry("test/A1_fake.pdf")
+
+        embedder = _FakeEmbedder()
+        result = ingest_mod._process_entry(
+            entry,
+            store=None,
+            embedder=embedder,  # type: ignore[arg-type]
+            force=False,
+            dry_run=True,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert result.status == "ingested"
+        assert result.tokens_embedded > 0
+        assert result.cost_usd == 0.0
+        assert embedder.calls == 0
+
+    def test_halfingested_doc_reembeds_not_skips(
+        self,
+        clean_store: VectorStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Guards C3: a doc row whose content_hash matches but has ZERO chunks
+        # for PIPELINE_TAG must NOT be skipped. This is the partial-failure
+        # recovery path AND the future P2/P3/P4-after-P1 path.
+        monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
+        dest = tmp_path / "corpus" / "test/A1_fake.pdf"
+        write_pdf(dest, ["Gamma " * 100])
+        entry = _make_entry("test/A1_fake.pdf")
+
+        # Seed the docs table with a matching content_hash but zero chunks —
+        # simulates a prior partial failure. Use extract_pdf to get the
+        # canonical hash so we're not duplicating the hashing logic here.
+        from src.pipeline.extract import extract_pdf
+
+        doc = extract_pdf(dest)
+        clean_store.upsert_document(
+            ingest_mod.DocumentRow(
+                source_id="A1",
+                doc_path="test/A1_fake.pdf",
+                title=doc.title,
+                num_pages=doc.num_pages,
+                content_hash=doc.content_hash,
+            )
+        )
+        clean_store.conn.commit()
+        assert clean_store.count_chunks(PIPELINE_TAG) == 0
+
+        embedder = _FakeEmbedder()
+        result = ingest_mod._process_entry(
+            entry,
+            store=clean_store,
+            embedder=embedder,  # type: ignore[arg-type]
+            force=False,
+            dry_run=False,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert result.status == "ingested"  # NOT skipped_unchanged
+        assert embedder.calls == 1
+        assert clean_store.count_chunks(PIPELINE_TAG) == result.num_chunks
+
+    def test_shrinking_chunkset_no_orphans(
+        self,
+        clean_store: VectorStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Guards C2: v1 of a doc ingests as N chunks, v2 as fewer. The DB
+        # must NOT retain the tail chunks from v1 — retrieval would surface
+        # them as stale hits.
+        monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
+        dest = tmp_path / "corpus" / "test/A1_fake.pdf"
+        # v1: big doc → many chunks.
+        write_pdf(dest, ["Big content page. " * 400] * 3)
+        entry = _make_entry("test/A1_fake.pdf")
+        embedder = _FakeEmbedder()
+        v1 = ingest_mod._process_entry(
+            entry,
+            store=clean_store,
+            embedder=embedder,  # type: ignore[arg-type]
+            force=False,
+            dry_run=False,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert v1.status == "ingested"
+        assert v1.num_chunks > 1
+        v1_count = clean_store.count_chunks(PIPELINE_TAG)
+        assert v1_count == v1.num_chunks
+
+        # v2: same path, much smaller content → fewer chunks.
+        write_pdf(dest, ["Tiny."])
+        v2 = ingest_mod._process_entry(
+            entry,
+            store=clean_store,
+            embedder=embedder,  # type: ignore[arg-type]
+            force=False,
+            dry_run=False,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert v2.status == "ingested"
+        assert v2.num_chunks < v1_count, "test setup should produce fewer v2 chunks"
+        # The load-bearing assertion: total chunks == v2's chunks, not v1_count.
+        assert clean_store.count_chunks(PIPELINE_TAG) == v2.num_chunks
+
+    def test_partial_failure_leaves_docrow_absent(
+        self,
+        clean_store: VectorStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Guards C1: if the chunk write path fails, the document row's new
+        # content_hash must NOT be committed. Otherwise the next run's
+        # idempotency check would silently skip a doc with no chunks.
+        monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
+        dest = tmp_path / "corpus" / "test/A1_fake.pdf"
+        write_pdf(dest, ["Zeta " * 100])
+        entry = _make_entry("test/A1_fake.pdf")
+
+        # Embedder that produces WRONG-DIMENSION vectors — upsert_chunks
+        # raises ValueError at the dim guard, mid-transaction.
+        class _BadDimEmbedder:
+            calls = 0
+
+            def embed_documents(
+                self, texts: list[str], *, run_id: str | None = None
+            ) -> list[list[float]]:
+                self.calls += 1
+                return [[0.1] * 4 for _ in texts]  # dim=4, not EMBEDDING_DIM
+
+        embedder = _BadDimEmbedder()
+        result = ingest_mod._process_entry(
+            entry,
+            store=clean_store,
+            embedder=embedder,  # type: ignore[arg-type]
+            force=False,
+            dry_run=False,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert result.status == "error"
+
+        # Neither the doc row NOR any chunks should be committed.
+        with clean_store.conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) FROM documents WHERE doc_path = %s", (entry.dest_path,))
+            row = cur.fetchone()
+            assert row is not None
+            assert row[0] == 0, "partial-failure must not commit the doc row"
         assert clean_store.count_chunks(PIPELINE_TAG) == 0
 
     def test_optional_missing_does_not_fail(

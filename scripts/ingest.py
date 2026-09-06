@@ -11,31 +11,42 @@ CLI::
                            [--batch-size N] [--log-level LEVEL]
 
 Design notes worth remembering:
-  - Idempotency key is `documents.content_hash` (sha256 of joined page text).
-    Match → skip embed + upsert entirely; miss (or --force) → re-embed all
-    the doc's chunks. Keeps the "unchanged corpus → zero API calls" invariant.
+  - Idempotency key is `(documents.content_hash, chunks-exist-for-pipeline)`.
+    Match on BOTH → skip embed + upsert; miss on either (or --force) →
+    re-embed all the doc's chunks. Requiring the chunks-exist half means a
+    prior partial-failure ingest recovers on the next run instead of being
+    permanently short-circuited by a stale hash — and P2..P4 don't silently
+    no-op on docs P1 already touched.
+  - Per-doc write is one transaction: upsert `documents` + DELETE stale
+    chunks for `(doc_id, pipeline)` + insert new chunks + commit. Chunk-
+    write failures roll back the document row's new hash too, so the
+    invariant above holds.
   - One VectorStore, one VoyageEmbedder, one loop. No parallelism — the
     Voyage SDK is sync, the DB writes are cheap, and the total budget is
     a few hundred chunks. Parallelism would be complexity without payoff.
   - Missing REQUIRED corpus files fail-fast at doc time (log + surface in
     summary + non-zero exit). Missing OPTIONAL files (per MANIFEST.optional)
-    are warned + skipped.
-  - Per-doc summary rows land in `logs/ingest_run_<utc_iso>.jsonl` — one
-    JSONL record per document with num_chunks, tokens, cost, elapsed. Per
-    Voyage call, one line lands in `logs/llm_calls.jsonl` via `log_llm_call`.
+    are warned + skipped; optional extract_failed / error are also demoted.
+  - Per-doc summary rows land in `logs/ingest_<utc_iso>.jsonl` — one JSONL
+    record per document with num_chunks, tokens, cost, elapsed. Per Voyage
+    call, one line lands in `logs/llm_calls.jsonl` tagged with the same
+    run_id so cost can be attributed to a specific ingest run.
+  - --dry-run opens NO database connection — extract + chunk + estimate
+    only. Useful for pre-flight cost checks on a laptop with no docker up.
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Literal
+
+import psycopg
 
 from scripts.corpus_manifest import MANIFEST, ManifestEntry
 from src.config import get_settings
@@ -112,15 +123,32 @@ def _write_run_log(path: Path, results: list[DocResult]) -> None:
             )
 
 
-def _fetch_existing_hash(store: VectorStore, doc_path: str) -> str | None:
-    """Read the persisted content_hash for `doc_path`, or None if unseen."""
+def _fetch_existing(store: VectorStore, doc_path: str, pipeline: str) -> tuple[str, bool] | None:
+    """Read `(content_hash, has_chunks_for_pipeline)` for `doc_path`, or None if unseen.
+
+    Combined into one call because both pieces are load-bearing for the
+    idempotency short-circuit: same hash AND chunks present = safe skip.
+    Same hash but zero chunks means a prior ingest half-failed (or a
+    different pipeline populated the doc row), and we must re-embed.
+    """
     with store.conn.cursor() as cur:
         cur.execute(
-            "SELECT content_hash FROM documents WHERE doc_path = %s",
-            (doc_path,),
+            """
+            SELECT
+                d.content_hash,
+                EXISTS(
+                    SELECT 1 FROM chunks c
+                    WHERE c.document_id = d.id AND c.pipeline = %s
+                )
+            FROM documents d
+            WHERE d.doc_path = %s
+            """,
+            (pipeline, doc_path),
         )
         row = cur.fetchone()
-    return row[0] if row else None
+    if row is None:
+        return None
+    return row[0], bool(row[1])
 
 
 def _tokens_since(log_path: Path, offset_bytes: int) -> tuple[int, float]:
@@ -149,14 +177,19 @@ def _tokens_since(log_path: Path, offset_bytes: int) -> tuple[int, float]:
 def _process_entry(
     entry: ManifestEntry,
     *,
-    store: VectorStore,
+    store: VectorStore | None,
     embedder: VoyageEmbedder,
     force: bool,
     dry_run: bool,
     log_path: Path,
     logger,
+    run_id: str | None = None,
 ) -> DocResult:
-    """Extract + chunk + embed + upsert one manifest entry. Never raises."""
+    """Extract + chunk + embed + upsert one manifest entry. Never raises.
+
+    `store` may be None in --dry-run (no DB is opened at all). Real runs
+    must pass a live VectorStore.
+    """
     dest = CORPUS_ROOT / entry.dest_path
     result = DocResult(source_id=entry.source_id, doc_path=entry.dest_path, status="error")
     started = time.perf_counter()
@@ -174,10 +207,12 @@ def _process_entry(
             logger.error("required_missing", doc_path=entry.dest_path, source_id=entry.source_id)
         return result
 
-    # Extract.
+    # Extract. `OSError` catches PermissionError, corrupt-file I/O errors,
+    # and anything pymupdf raises through the filesystem layer — without
+    # this, one unreadable PDF kills the whole run.
     try:
         doc = extract_pdf(dest)
-    except (ValueError, FileNotFoundError) as e:
+    except (OSError, ValueError) as e:
         result.status = "extract_failed"
         result.error = str(e)
         result.elapsed_ms = (time.perf_counter() - started) * 1000
@@ -197,13 +232,36 @@ def _process_entry(
         )
         return result
 
-    # Idempotency short-circuit — same content hash and not forced → skip.
-    existing_hash = _fetch_existing_hash(store, entry.dest_path)
-    if existing_hash == doc.content_hash and not force:
-        result.status = "skipped_unchanged"
-        result.elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.info("skipped_unchanged", doc_path=entry.dest_path, content_hash=doc.content_hash)
-        return result
+    # Idempotency short-circuit — same content hash AND chunks exist for
+    # THIS pipeline, and not forced → skip. The pipeline check is what
+    # keeps a partially-failed prior ingest (doc row committed, chunks
+    # empty) from being permanently skipped, and what keeps P2..P4 from
+    # silently no-op'ing on docs P1 already touched.
+    if store is not None:
+        try:
+            existing = _fetch_existing(store, entry.dest_path, PIPELINE_TAG)
+        except psycopg.Error as e:
+            # A failed SELECT poisons the connection until rolled back —
+            # otherwise every subsequent doc's SELECT fails with
+            # `current transaction is aborted`. Rollback + surface as a
+            # doc-level error and continue.
+            store.conn.rollback()
+            result.status = "error"
+            result.error = f"idempotency lookup failed: {type(e).__name__}: {e}"
+            result.elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.error("idempotency_lookup_failed", doc_path=entry.dest_path, error=str(e))
+            return result
+
+        if existing is not None and existing[0] == doc.content_hash and existing[1] and not force:
+            result.status = "skipped_unchanged"
+            result.elapsed_ms = (time.perf_counter() - started) * 1000
+            logger.info(
+                "skipped_unchanged",
+                doc_path=entry.dest_path,
+                content_hash=doc.content_hash,
+                pipeline=PIPELINE_TAG,
+            )
+            return result
 
     # Chunk.
     chunks = chunk_fixed(doc)
@@ -231,25 +289,42 @@ def _process_entry(
         )
         return result
 
+    assert store is not None, "non-dry-run requires a live VectorStore"
+
     # Embed. Snapshot log size so we can attribute per-doc token counts.
+    # If a batch fails partway through, tokens for earlier successful
+    # batches are still in the log — attribute what actually landed so
+    # the summary reflects real spend even on partial-failure docs.
     log_offset = log_path.stat().st_size if log_path.exists() else 0
     try:
-        embeddings = embedder.embed_documents([c.text for c in chunks])
+        embeddings = embedder.embed_documents([c.text for c in chunks], run_id=run_id)
     except Exception as e:
         # Third-party SDK exceptions surface into the run summary; we cannot
         # anticipate every subclass but must not let one bad doc wedge the run.
+        # Attribute any partial-batch cost to this doc even though it failed.
+        partial_tokens, partial_cost = _tokens_since(log_path, log_offset)
+        result.tokens_embedded = partial_tokens
+        result.cost_usd = partial_cost
         result.status = "error"
         result.error = f"embed failed: {type(e).__name__}: {e}"
         result.elapsed_ms = (time.perf_counter() - started) * 1000
-        logger.error("embed_failed", doc_path=entry.dest_path, error=str(e))
+        logger.error(
+            "embed_failed",
+            doc_path=entry.dest_path,
+            error=str(e),
+            partial_tokens=partial_tokens,
+            partial_cost_usd=round(partial_cost, 4),
+        )
         return result
 
     tokens_billed, cost = _tokens_since(log_path, log_offset)
     result.tokens_embedded = tokens_billed
     result.cost_usd = cost
 
-    # Upsert. `upsert_document` returns the id; `upsert_chunks` replaces on
-    # (document_id, pipeline, chunk_index) conflict so re-runs are safe.
+    # Atomic write: upsert doc + wipe stale chunks for this pipeline +
+    # insert new chunks, all in one transaction. If chunks fail, the doc
+    # row rolls back too — so the next run's hash check won't skip a
+    # half-ingested doc, and shrinking chunk sets don't leave orphans.
     doc_row = DocumentRow(
         source_id=entry.source_id,
         doc_path=entry.dest_path,
@@ -257,22 +332,21 @@ def _process_entry(
         num_pages=doc.num_pages,
         content_hash=doc.content_hash,
     )
+    chunk_rows = [
+        ChunkRow(
+            pipeline=PIPELINE_TAG,
+            chunk_index=c.chunk_index,
+            text=c.text,
+            num_tokens=c.num_tokens,
+            page_start=c.page_start,
+            page_end=c.page_end,
+            content_hash=c.content_hash,
+            embedding=e,
+        )
+        for c, e in zip(chunks, embeddings, strict=True)
+    ]
     try:
-        document_id = store.upsert_document(doc_row)
-        chunk_rows = [
-            ChunkRow(
-                pipeline=PIPELINE_TAG,
-                chunk_index=c.chunk_index,
-                text=c.text,
-                num_tokens=c.num_tokens,
-                page_start=c.page_start,
-                page_end=c.page_end,
-                content_hash=c.content_hash,
-                embedding=e,
-            )
-            for c, e in zip(chunks, embeddings, strict=True)
-        ]
-        store.upsert_chunks(document_id, chunk_rows)
+        store.replace_document_chunks(doc_row, chunk_rows, pipeline=PIPELINE_TAG)
     except Exception as e:
         # DB errors surface into the summary rather than aborting the whole
         # run — the outer main() exits non-zero if any required entry failed.
@@ -352,6 +426,8 @@ def _is_required(doc_path: str) -> bool:
 
 
 def main() -> int:
+    settings = get_settings()
+
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--only",
@@ -365,7 +441,8 @@ def main() -> int:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Extract + chunk only. No Voyage calls, no DB writes. Reports estimated tokens.",
+        help="Extract + chunk only. No Voyage calls, no DB open, no DB writes. "
+        "Reports estimated tokens.",
     )
     parser.add_argument(
         "--batch-size",
@@ -374,14 +451,16 @@ def main() -> int:
         help="Override Voyage embed batch size (default: 64).",
     )
     parser.add_argument(
+        # Default reads settings.log_level (which honors .env) rather than
+        # os.environ directly — otherwise a .env-only LOG_LEVEL override is
+        # silently ignored for ingest but honored everywhere else.
         "--log-level",
-        default=os.environ.get("LOG_LEVEL", "INFO"),
+        default=settings.log_level,
     )
     args = parser.parse_args()
 
     configure_logging(args.log_level)
     logger = get_logger("ingest")
-    settings = get_settings()
 
     entries = _select_manifest_entries(args.only)
     logger.info(
@@ -396,22 +475,28 @@ def main() -> int:
     if args.batch_size is not None:
         embedder_kwargs["batch_size"] = args.batch_size
 
+    # run_id ties per-doc rows in `ingest_run_<ts>.jsonl` to per-call rows in
+    # `llm_calls.jsonl` so a cost regression can be attributed to a specific
+    # run without timestamp-window heuristics.
     run_started = datetime.now(UTC)
-    run_log = settings.log_dir / f"ingest_run_{run_started.strftime('%Y%m%dT%H%M%SZ')}.jsonl"
+    run_id = f"ingest_{run_started.strftime('%Y%m%dT%H%M%SZ')}"
+    run_log = settings.log_dir / f"{run_id}.jsonl"
 
-    with VectorStore(settings.database_url) as store:
-        store.ensure_schema()
+    embedder = VoyageEmbedder(
+        api_key=settings.voyage_api_key,
+        model=settings.embedding_model,
+        log_path=settings.llm_call_log,
+        **embedder_kwargs,
+    )
 
-        # Instantiate the embedder even in --dry-run: cheap (no API call until
-        # embed_documents is called) and keeps the code path single.
-        embedder = VoyageEmbedder(
-            api_key=settings.voyage_api_key,
-            model=settings.embedding_model,
-            log_path=settings.llm_call_log,
-            **embedder_kwargs,
-        )
+    results: list[DocResult] = []
+    # --dry-run runs entirely without a DB — the point of dry-run is to
+    # pre-flight the corpus + estimate cost on a laptop with no docker up.
+    store_ctx = _NullContext() if args.dry_run else VectorStore(settings.database_url)
+    with store_ctx as store:
+        if store is not None:
+            store.ensure_schema()
 
-        results: list[DocResult] = []
         for i, entry in enumerate(entries, start=1):
             result = _process_entry(
                 entry,
@@ -421,6 +506,7 @@ def main() -> int:
                 dry_run=args.dry_run,
                 log_path=settings.llm_call_log,
                 logger=logger,
+                run_id=run_id,
             )
             results.append(result)
             marker = {
@@ -439,15 +525,31 @@ def main() -> int:
 
     _write_run_log(run_log, results)
     _print_summary(results)
+    return 1 if _any_required_failed(results) else 0
 
-    # Non-zero exit iff any REQUIRED entry failed. Optional-missing does NOT
-    # fail the run — mirrors fetch_corpus semantics.
-    any_required_failed = any(
-        r.status in {"error", "extract_failed"}
-        or (r.status == "missing" and _is_required(r.doc_path))
+
+def _any_required_failed(results: list[DocResult]) -> bool:
+    """True iff any REQUIRED entry ended in a failure status.
+
+    Failure statuses are missing, extract_failed, and error. Optional
+    entries in ANY of those states are demoted to non-failure — an
+    operator-placed optional PDF that is corrupt should not be louder
+    than one that is simply absent.
+    """
+    return any(
+        r.status in {"error", "extract_failed", "missing"} and _is_required(r.doc_path)
         for r in results
     )
-    return 1 if any_required_failed else 0
+
+
+class _NullContext:
+    """Context manager that yields None. Used to skip DB open in --dry-run."""
+
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_exc: object) -> None:
+        return None
 
 
 if __name__ == "__main__":
