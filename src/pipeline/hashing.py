@@ -6,10 +6,6 @@ Two invariants held in one place so `extract.py` and `chunk.py` can't drift:
     a string joined with this exact separator. Changing it invalidates
     every hash in the DB (schema break).
   - `sha256_utf8` — the hash function. Same rule.
-
-Keeping both here means "how do we canonicalize + hash text" is defined
-once. A drift on either would silently break the "unchanged corpus → zero
-API calls" short-circuit in `scripts/ingest.py`.
 """
 
 from __future__ import annotations
