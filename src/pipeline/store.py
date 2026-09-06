@@ -147,10 +147,9 @@ class VectorStore:
     def upsert_document(self, doc: DocumentRow) -> int:
         """Insert or refresh a document by `doc_path`; return its id.
 
-        On conflict the row's metadata + content_hash are updated. Callers
-        that want to skip work when the content is unchanged should
-        compare their computed hash against `content_hash` on the existing
-        row before calling.
+        Does NOT commit — caller controls the transaction boundary so
+        this can be composed with `upsert_chunks` atomically (see
+        `replace_document_chunks`).
         """
         # ON CONFLICT DO UPDATE / EXCLUDED: on doc_path collision, update
         # the row from the values that would have been inserted. EXCLUDED
@@ -173,18 +172,16 @@ class VectorStore:
             )
             row = cur.fetchone()
             assert row is not None  # RETURNING guarantees a row on INSERT/UPDATE
-            self.conn.commit()
             return row[0]
 
     # ── Chunks ────────────────────────────────────────────────────────
 
     def upsert_chunks(self, document_id: int, chunks: list[ChunkRow]) -> None:
-        """Insert or replace chunks for `(document_id, pipeline)`.
+        """Bulk-insert chunks; on `(document_id, pipeline, chunk_index)` conflict, replace.
 
-        Bulk insert via `executemany`. On
-        `(document_id, pipeline, chunk_index)` conflict the row is
-        replaced — re-running ingest for the same doc + pipeline is
-        cheap for unchanged chunks and a swap for changed ones.
+        Does NOT commit — caller controls the transaction. Does NOT delete
+        stale higher-index chunks left over from a previous ingest with more
+        chunks; use `replace_document_chunks` when re-embedding a document.
 
         Raises `ValueError` up front if any embedding is the wrong dim,
         so a single bad chunk fails fast instead of mid-transaction.
@@ -227,7 +224,49 @@ class VectorStore:
                     for c in chunks
                 ],
             )
-        self.conn.commit()
+
+    def delete_chunks(self, document_id: int, pipeline: str) -> int:
+        """Delete all chunks for `(document_id, pipeline)`; return the row count.
+
+        Does NOT commit. Used by `replace_document_chunks` to purge stale
+        chunks (including higher-index orphans a plain UPSERT would miss)
+        before re-inserting a fresh chunk set.
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM chunks WHERE document_id = %s AND pipeline = %s",
+                (document_id, pipeline),
+            )
+            return cur.rowcount
+
+    def replace_document_chunks(
+        self,
+        doc: DocumentRow,
+        chunks: list[ChunkRow],
+        *,
+        pipeline: str,
+    ) -> int:
+        """Atomic: upsert `doc`, wipe existing chunks for `(doc, pipeline)`, insert `chunks`.
+
+        Returns the document_id. The document row's content_hash is only
+        visible to other readers after all chunks land — a mid-flight failure
+        rolls back both writes, so the idempotency short-circuit
+        (`skip if content_hash matches`) can trust that a committed doc row
+        implies its chunks are present.
+
+        Also purges any orphan chunks with `chunk_index` past the current
+        batch's length — the ON CONFLICT UPDATE in `upsert_chunks` alone
+        would leave those stranded when a re-ingest produces fewer chunks.
+        """
+        try:
+            document_id = self.upsert_document(doc)
+            self.delete_chunks(document_id, pipeline)
+            self.upsert_chunks(document_id, chunks)
+            self.conn.commit()
+            return document_id
+        except Exception:
+            self.conn.rollback()
+            raise
 
     # ── Retrieval ─────────────────────────────────────────────────────
 

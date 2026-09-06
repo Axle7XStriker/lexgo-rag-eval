@@ -290,6 +290,13 @@ class TestHelpers:
 
     def test_source_id_covers_all_buckets(self) -> None:
         assert {s.value for s in SourceId} == {
-            "A1", "A2", "A3", "A4",
-            "B1", "B2", "B3", "B4", "B5",
+            "A1",
+            "A2",
+            "A3",
+            "A4",
+            "B1",
+            "B2",
+            "B3",
+            "B4",
+            "B5",
         }

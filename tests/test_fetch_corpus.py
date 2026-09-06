@@ -102,6 +102,5 @@ def test_only_flag_accepts_every_source_id() -> None:
             timeout=30,
         )
         assert result.returncode == 0, (
-            f"--only {source_id.value} exited {result.returncode}\n"
-            f"stderr: {result.stderr}"
+            f"--only {source_id.value} exited {result.returncode}\nstderr: {result.stderr}"
         )
