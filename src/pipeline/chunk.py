@@ -8,9 +8,9 @@ Design notes worth remembering:
   - Voyage does not publish a public tokenizer. cl100k_base (OpenAI's) is
     the de facto lingua franca — fast, offline, and stable. The 500-token
     target is *approximate* vs. Voyage's internal count.
-  - Pages join with `_text.PAGE_JOIN` into one token stream. The separator's
-    tokens are attributed to whichever page's boundary they straddle —
-    cheap and honest enough for citations.
+  - Pages join with `hashing.PAGE_JOIN` into one token stream. The
+    separator's tokens are attributed to whichever page's boundary they
+    straddle — cheap and honest enough for citations.
   - `PIPELINE_TAG` is the exact string written to `chunks.pipeline` so all
     P1 rows are queryable with a single WHERE clause. Do not typo it.
   - The final chunk is kept even if shorter than `target_tokens` — dropping
@@ -23,8 +23,8 @@ from dataclasses import dataclass
 
 import tiktoken
 
-from src.pipeline._text import PAGE_JOIN, sha256_utf8
 from src.pipeline.extract import ExtractedDoc
+from src.pipeline.hashing import PAGE_JOIN, sha256_utf8
 
 PIPELINE_TAG = "p1_fixed_500_50"
 DEFAULT_TARGET_TOKENS = 500

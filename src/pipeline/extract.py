@@ -8,9 +8,10 @@ Design notes worth remembering:
   - PyMuPDF is used for extraction. It is dual-licensed AGPL-3 / commercial;
     flagged in the pyproject dep comment so the license question is a
     conscious choice.
-  - `content_hash` is sha256 over the page-joined text (`_text.join_pages`).
-    That's the idempotency key ingest uses to decide "same doc, skip embed".
-    Changing the join separator or the hash function is a schema break.
+  - `content_hash` is sha256 over the page-joined text (see
+    `src.pipeline.hashing`). That's the idempotency key ingest uses to
+    decide "same doc, skip embed". Changing the join separator or the
+    hash function is a schema break.
   - Whitespace-only pages are kept in `pages` (empty `text`) so 1-indexed
     page numbers stay honest — a chunk that spans pages 4-5 while page 4
     is blank still gets `page_start=4` truthfully. Page-range fidelity is
@@ -26,7 +27,7 @@ from pathlib import Path
 
 import pymupdf
 
-from src.pipeline._text import join_pages, sha256_utf8
+from src.pipeline.hashing import join_pages, sha256_utf8
 
 PDF_MAGIC = b"%PDF"
 
