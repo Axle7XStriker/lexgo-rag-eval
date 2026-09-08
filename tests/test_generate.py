@@ -161,6 +161,7 @@ class TestHappyPath:
     """A successful generate() returns the text and logs one record."""
 
     def test_returns_text_and_tokens(self, log_path: Path) -> None:
+        """Returns joined answer text + usage counts + cost derived from PRICING."""
         msg = _FakeMessage(
             content=[_FakeTextBlock(text="the answer is 42 [1]")],
             usage=_FakeUsage(input_tokens=120, output_tokens=8),
@@ -173,11 +174,12 @@ class TestHappyPath:
         assert result.text == "the answer is 42 [1]"
         assert result.input_tokens == 120
         assert result.output_tokens == 8
-        # Cost: 120/1M * 3 + 8/1M * 15
-        expected_cost = (120 / 1_000_000) * 3.0 + (8 / 1_000_000) * 15.0
-        assert result.cost_usd == pytest.approx(expected_cost)
+        # Cost derived from PRICING via _cost_for so a price change here needs
+        # no test update — the source of truth is src/pricing.py.
+        assert result.cost_usd == pytest.approx(_cost_for("claude-sonnet-4-6", 120, 8))
 
     def test_forwards_request_shape(self, log_path: Path) -> None:
+        """generate() forwards model, system, max_tokens, temperature, and messages to the SDK."""
         client = _FakeClient()
         g = _make_generator(client=client, log_path=log_path)
         g.generate(
@@ -196,8 +198,7 @@ class TestHappyPath:
         assert call["messages"] == [{"role": "user", "content": "USER BODY"}]
 
     def test_multiple_text_blocks_are_joined(self, log_path: Path) -> None:
-        # Sonnet usually returns one block, but if a future tier splits into
-        # multiple text blocks we still capture the full answer.
+        """Multiple text blocks are concatenated (defensive against future model tiers)."""
         msg = _FakeMessage(
             content=[_FakeTextBlock(text="part one "), _FakeTextBlock(text="part two")],
             usage=_FakeUsage(input_tokens=1, output_tokens=1),
@@ -212,6 +213,7 @@ class TestLogging:
     """Every successful call writes exactly one llm_calls.jsonl record."""
 
     def test_log_record_shape(self, log_path: Path) -> None:
+        """One successful call writes exactly one log record with all the expected fields."""
         msg = _FakeMessage(
             content=[_FakeTextBlock(text="hi")],
             usage=_FakeUsage(input_tokens=200, output_tokens=50),
@@ -242,8 +244,7 @@ class TestLogging:
         assert r["cost_usd"] == pytest.approx(_cost_for("claude-sonnet-4-6", 200, 50), abs=1e-6)
 
     def test_no_log_on_failure(self, log_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        # A raised exception during .create() must not write a log line —
-        # tokens_billed accounting would be corrupted.
+        """Exceptions during .create() must NOT write a log line — else cost accounting corrupts."""
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
             "wait",
@@ -281,6 +282,7 @@ class TestRetry:
         exc_factory,
         label: str,
     ) -> None:
+        """Each transient failure class triggers a retry; the second attempt succeeds."""
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
             "wait",
@@ -306,6 +308,7 @@ class TestRetry:
     def test_gives_up_after_max_attempts(
         self, log_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """A persistent transient failure re-raises after tenacity's attempt budget is exhausted."""
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
             "wait",
@@ -336,6 +339,7 @@ class TestRetry:
         exc_factory,
         label: str,
     ) -> None:
+        """Deterministic errors (auth / 400 / 404) surface after exactly one attempt."""
         # Wait zeroed so if a retry mistakenly happens we still finish fast.
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
@@ -360,6 +364,7 @@ class TestValidation:
     """Constructor guards on unknown model."""
 
     def test_unknown_model_rejected_at_init(self, log_path: Path) -> None:
+        """Unknown model raises at init — silent $0 cost would poison the eval numbers."""
         with pytest.raises(ValueError, match="unknown Anthropic model"):
             _make_generator(
                 client=_FakeClient(),
@@ -372,42 +377,51 @@ class TestPricing:
     """Cost table stays honest; missing model degrades gracefully."""
 
     def test_sonnet_present(self) -> None:
+        """The currently-used chat model is in PRICING with non-zero input+output rates."""
         assert "claude-sonnet-4-6" in PRICING
         assert PRICING["claude-sonnet-4-6"]["input"] > 0
         assert PRICING["claude-sonnet-4-6"]["output"] > 0
 
     def test_output_more_expensive_than_input(self) -> None:
-        # Sanity: Claude output tokens are always priced higher than input.
-        # If PRICING is edited the wrong way this catches it immediately.
+        """Sanity: output rate > input rate for every Claude tier (catches an accidental swap)."""
         assert PRICING["claude-sonnet-4-6"]["output"] > PRICING["claude-sonnet-4-6"]["input"]
 
     def test_unknown_model_zero_cost(self) -> None:
+        """Unknown model returns 0.0 cost (and logs a warning), rather than raising."""
         assert _cost_for("model-that-does-not-exist", 1_000_000, 1_000_000) == 0.0
 
     def test_cost_calc(self) -> None:
-        # 1M input tokens = $3, 1M output tokens = $15 → $18 total
-        assert _cost_for("claude-sonnet-4-6", 1_000_000, 1_000_000) == pytest.approx(18.0)
+        """1M input + 1M output = (input_rate + output_rate) USD; expected derived from PRICING."""
+        rates = PRICING["claude-sonnet-4-6"]
+        expected = rates["input"] + rates["output"]
+        assert _cost_for("claude-sonnet-4-6", 1_000_000, 1_000_000) == pytest.approx(expected)
 
 
 class TestRetryablePredicate:
     """The _is_retryable predicate is load-bearing — test it directly too."""
 
     def test_rate_limit_retryable(self) -> None:
+        """Anthropic's RateLimitError is transient — worth retrying."""
         assert _is_retryable(_rate_limit()) is True
 
     def test_connection_retryable(self) -> None:
+        """A dropped connection is transient — worth retrying."""
         assert _is_retryable(_connection_error()) is True
 
     def test_timeout_retryable(self) -> None:
+        """APITimeoutError is transient — worth retrying (subclass of APIConnectionError)."""
         assert _is_retryable(_timeout_error()) is True
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504, 599])
     def test_5xx_retryable(self, status: int) -> None:
+        """5xx server errors are transient — retry across the whole 5xx range."""
         assert _is_retryable(_server_error(status)) is True
 
     @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
     def test_4xx_not_retryable(self, status: int) -> None:
+        """4xx errors indicate a deterministic client mistake — retrying can't fix them."""
         assert _is_retryable(_server_error(status)) is False
 
     def test_random_exception_not_retryable(self) -> None:
+        """Non-Anthropic exceptions (a bug in our own code) must not silently retry."""
         assert _is_retryable(RuntimeError("nope")) is False

@@ -42,18 +42,14 @@ from tenacity import (
 )
 
 from src.observability import get_logger, log_llm_call
+from src.pricing import ANTHROPIC_PRICING as PRICING
+from src.pricing import anthropic_cost
 
 _logger = get_logger("generate")
 
-# USD per 1M tokens, separate input/output rates. Anthropic's SDK does not
-# return a per-call cost, so we compute it locally. Update this dict when
-# pricing changes — the fail-fast constructor check keeps unknown/mispriced
-# models out of the eval numbers.
-PRICING: dict[str, dict[str, float]] = {
-    "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
-    # Add other models here as they get exercised. Keep the nested-dict shape
-    # so downstream cost code doesn't branch on model tier.
-}
+# `PRICING` is re-exported from src.pricing so this module still has a single
+# import surface for callers that want to inspect the price table. All cost
+# math delegates to src.pricing so the numbers live in exactly one place.
 
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TEMPERATURE = 0.0
@@ -92,12 +88,13 @@ def _is_retryable(exc: BaseException) -> bool:
 def _cost_for(model: str, input_tokens: int, output_tokens: int) -> float:
     """Cost in USD for a call at `model`'s pricing. Missing model → 0.0.
 
-    ClaudeGenerator rejects unknown models at construction, so this fallback
-    only trips if PRICING is edited to drop an in-flight model. Warning is a
-    belt-and-braces breadcrumb (same pattern as embed._cost_for).
+    Delegates to `src.pricing.anthropic_cost` so the price table has one
+    owner. ClaudeGenerator rejects unknown models at construction, so this
+    fallback only trips if pricing is edited to drop an in-flight model.
+    Warning is a belt-and-braces breadcrumb (same pattern as embed._cost_for).
     """
-    rates = PRICING.get(model)
-    if rates is None:
+    cost = anthropic_cost(model, input_tokens, output_tokens)
+    if cost is None:
         _logger.warning(
             "anthropic_pricing_missing",
             model=model,
@@ -105,9 +102,7 @@ def _cost_for(model: str, input_tokens: int, output_tokens: int) -> float:
             output_tokens=output_tokens,
         )
         return 0.0
-    return (input_tokens / 1_000_000) * rates["input"] + (output_tokens / 1_000_000) * rates[
-        "output"
-    ]
+    return cost
 
 
 class ClaudeGenerator:

@@ -7,11 +7,6 @@ callers can share connections.
 Design notes worth remembering:
   - No client construction here. All I/O flows through the injected
     dependencies, so this module is pure orchestration + parsing.
-  - Prompt lives at prompts/answer/v1.md per `prompts/README.md`. Two sections
-    separated by `# System` / `# User template` markdown headings. The version
-    string is the caller's (matches the filename) and is what gets logged and
-    later captured in the eval run manifest — the front-matter is human-facing
-    metadata, not the source of truth.
   - Empty retrieval short-circuits to the out-of-corpus sentinel — no
     generator call, cost 0. Guards against wrong `pipeline_tag`, empty DB,
     or a degenerate filter and keeps the eval loop honest.
@@ -41,13 +36,14 @@ DEFAULT_TOP_K = 10
 
 # `role` + `version` locate the prompt file at prompts/<role>/<version>.md.
 # When we author a v2 answer prompt, bump PROMPT_VERSION here. Any change to
-# the prompt file's semantics MUST come with a version bump (see prompts/README.md).
+# the prompt file's semantics MUST come with a version bump.
 PROMPT_ROLE = "answer"
 PROMPT_VERSION = "v1"
 
-# Exact sentinel string the answer prompt tells Claude to return when the
-# context doesn't cover the question. Kept in code (not just the prompt) so
-# the empty-retrieval short-circuit produces identical output.
+# Exact sentinel string Claude must return when the context doesn't cover
+# the question. Threaded INTO the prompt template as `{out_of_corpus_sentinel}`
+# so this constant is the single source of truth — the prompt file cannot
+# drift to a different literal string.
 OUT_OF_CORPUS_SENTINEL = "This isn't covered in the provided course materials."
 
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
@@ -99,28 +95,25 @@ class QueryResult:
 def _load_prompt(role: str, version: str) -> tuple[str, str]:
     """Load a prompt file, return (system_body, user_template).
 
-    Cached per (role, version) — prompt files are immutable once shipped
-    (see prompts/README.md), so a one-time read is safe.
+    Cached per (role, version) — prompt files are immutable once shipped, so
+    a one-time read is safe. The system body has `{out_of_corpus_sentinel}`
+    pre-substituted with the code constant at load time; the user template
+    still contains `{question}` / `{context}` placeholders for the caller
+    to fill per-request.
+
+    Parsing is section-based: everything before `# System` is ignored
+    (front-matter, top-level headings, blank lines), so a prompt file with
+    or without YAML front-matter is loaded the same way.
 
     Raises:
       FileNotFoundError — no file at prompts/<role>/<version>.md.
-      ValueError — file missing YAML front-matter terminator, missing
-        `# System` / `# User template` sections, or template lacks the
-        required `{question}` / `{context}` placeholders.
+      ValueError — missing `# System` / `# User template` sections, missing
+        required placeholders in either section.
     """
     path = PROMPTS_DIR / role / f"{version}.md"
     if not path.exists():
         raise FileNotFoundError(f"prompt not found: {path}")
     text = path.read_text(encoding="utf-8")
-
-    # Strip YAML front-matter if present. We don't need any of its fields at
-    # runtime — the caller-supplied `version` is the source of truth. The
-    # front-matter is metadata for humans opening the file.
-    if text.startswith("---\n"):
-        end = text.find("\n---\n", 4)
-        if end == -1:
-            raise ValueError(f"{path}: unterminated YAML front-matter")
-        text = text[end + len("\n---\n") :]
 
     sys_idx = text.find(_SYSTEM_MARKER)
     user_idx = text.find(_USER_TEMPLATE_MARKER)
@@ -128,17 +121,27 @@ def _load_prompt(role: str, version: str) -> tuple[str, str]:
         raise ValueError(
             f"{path}: expected '{_SYSTEM_MARKER}' then '{_USER_TEMPLATE_MARKER}' sections"
         )
-    system_body = text[sys_idx + len(_SYSTEM_MARKER) : user_idx].strip()
+    raw_system = text[sys_idx + len(_SYSTEM_MARKER) : user_idx].strip()
     user_template = text[user_idx + len(_USER_TEMPLATE_MARKER) :].strip()
 
-    # Fail fast on template drift: the user template MUST contain both
-    # placeholders. A silent missing placeholder would substitute nothing and
-    # ship the raw literal to Claude — hard to notice, easy to prevent here.
+    # Fail fast on template drift.
+    #   - The system body MUST reference {out_of_corpus_sentinel}, or the
+    #     code constant and the prompt's actual instruction would silently
+    #     drift apart.
+    #   - The user template MUST contain {question} and {context}, or the
+    #     substitution below would ship the raw literal to Claude.
+    if "{out_of_corpus_sentinel}" not in raw_system:
+        raise ValueError(
+            f"{path}: system body must reference '{{out_of_corpus_sentinel}}' "
+            f"so OUT_OF_CORPUS_SENTINEL stays the single source of truth."
+        )
     missing = [p for p in ("{question}", "{context}") if p not in user_template]
     if missing:
         raise ValueError(
             f"{path}: user template missing required placeholder(s): {', '.join(missing)}"
         )
+
+    system_body = raw_system.format(out_of_corpus_sentinel=OUT_OF_CORPUS_SENTINEL)
     return system_body, user_template
 
 
@@ -225,9 +228,9 @@ def answer_question(
       6. Call Claude for the answer.
       7. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
 
-    Wall-clock `latency_ms` covers steps 2-6 (whichever ran); individual
-    provider tokens/cost land in `logs/llm_calls.jsonl` per the embedder and
-    generator's own bookkeeping.
+    Wall-clock `latency_ms` covers the whole run (steps 1-6, whichever ran);
+    individual provider tokens/cost land in `logs/llm_calls.jsonl` per the
+    embedder and generator's own bookkeeping.
     """
     started = time.perf_counter()
     system_body, user_template = _load_prompt(PROMPT_ROLE, PROMPT_VERSION)

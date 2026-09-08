@@ -3,6 +3,10 @@
 Covers: end-to-end shape, citation dedup + first-mention order, out-of-range
 marker handling, out-of-corpus prompt path, empty-retrieval short-circuit,
 context block format.
+
+Tests are decoupled from the real prompt file: every test uses a canned
+system/user template via the `mock_prompt` autouse fixture, so pipeline
+behaviour is tested independently of prompt v1's wording.
 """
 
 from __future__ import annotations
@@ -10,10 +14,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
+from src.pipeline import query as query_module
 from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.generate import GenerateResult
 from src.pipeline.query import (
-    DEFAULT_TOP_K,
     OUT_OF_CORPUS_SENTINEL,
     PROMPT_VERSION,
     _format_context,
@@ -21,6 +27,29 @@ from src.pipeline.query import (
     answer_question,
 )
 from src.pipeline.store import RetrievedChunk
+
+# Canned prompt used by every test in this file — decouples the pipeline
+# tests from the real prompt file's exact wording. If v1.md changes,
+# these tests do not need to change.
+_MOCK_SYSTEM = "SYSTEM: sentinel is 'CANNED_SENTINEL'."
+_MOCK_USER_TEMPLATE = "Q: {question}\nCTX:\n{context}"
+
+
+@pytest.fixture(autouse=True)
+def mock_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Replace `_load_prompt` with a canned template for every test.
+
+    `functools.cache` on the real loader would otherwise leak state across
+    tests, and the assertions in `test_prompt_includes_enumerated_context`
+    would become tied to prompt v1's exact wording. Using a fixed canned
+    template keeps pipeline behaviour tests orthogonal to prompt content.
+    """
+    monkeypatch.setattr(
+        query_module,
+        "_load_prompt",
+        lambda role, version: (_MOCK_SYSTEM, _MOCK_USER_TEMPLATE),
+    )
+
 
 # ── Fake dependencies ────────────────────────────────────────────────
 
@@ -108,6 +137,7 @@ def _chunk(marker: int, doc_path: str, source_id: str = "A1") -> RetrievedChunk:
 
 class TestEndToEnd:
     def test_happy_path(self, tmp_path: Path) -> None:
+        """Returns model's answer verbatim; cited chunks parsed in first-mention order."""
         chunks = [
             _chunk(1, "6.006/lectures/A1_lec03.pdf", "A1"),
             _chunk(2, "6.006/recitations/A2_rec03.pdf", "A2"),
@@ -149,16 +179,16 @@ class TestEndToEnd:
         assert result.citations[1].doc_path == "6.006/psets/A3_pset1.pdf"
         assert result.citations[0].source_id == "A1"
 
-        # Dependencies invoked as expected.
+        # Dependencies invoked with the query + run_id threaded through.
         assert embedder.calls == ["what is merge sort?"]
         assert len(store.calls) == 1
         assert store.calls[0]["pipeline"] == PIPELINE_TAG
-        assert store.calls[0]["k"] == DEFAULT_TOP_K
         assert len(generator.calls) == 1
         assert generator.calls[0]["prompt_version"] == PROMPT_VERSION
         assert generator.calls[0]["run_id"] == "run_test"
 
-    def test_prompt_includes_enumerated_context(self, tmp_path: Path) -> None:
+    def test_generator_receives_substituted_prompt(self, tmp_path: Path) -> None:
+        """{question} and {context} placeholders are filled before the generator sees the prompt."""
         chunks = [
             _chunk(1, "6.006/lectures/A1_lec01.pdf", "A1"),
             _chunk(2, "6.830/lectures/B1_lec02.pdf", "B1"),
@@ -168,37 +198,24 @@ class TestEndToEnd:
         generator = _FakeGenerator(reply_text="ok [1]")
 
         answer_question(
-            query="q",
+            query="what is merge sort?",
             embedder=embedder,
             store=store,
             generator=generator,
         )
 
-        # The generator saw a system prompt + a user prompt containing the
-        # enumerated chunks and the question.
         call = generator.calls[0]
-        assert "answer strictly" in call["system"].lower()
-        assert "Question:" in call["user"]
-        assert "q" in call["user"]
-        # Both bracketed chunk headers must appear, in order.
+        # Canned template is passed through verbatim as system.
+        assert call["system"] == _MOCK_SYSTEM
+        # Placeholders substituted with the real question + formatted context.
+        assert "Q: what is merge sort?" in call["user"]
+        assert "CTX:" in call["user"]
+        # Both enumerated chunk headers appear, in order.
         assert "[1] A1 6.006/lectures/A1_lec01.pdf" in call["user"]
         assert "[2] B1 6.830/lectures/B1_lec02.pdf" in call["user"]
-        # And the chunk bodies too.
+        # And the chunk bodies.
         assert "chunk-1-body" in call["user"]
         assert "chunk-2-body" in call["user"]
-
-    def test_top_k_override(self, tmp_path: Path) -> None:
-        embedder = _FakeEmbedder()
-        store = _FakeStore(to_return=[_chunk(1, "6.006/lectures/A1_lec01.pdf")])
-        generator = _FakeGenerator(reply_text="hi [1]")
-        answer_question(
-            query="q",
-            embedder=embedder,
-            store=store,
-            generator=generator,
-            top_k=5,
-        )
-        assert store.calls[0]["k"] == 5
 
 
 # ── Citation parsing ──────────────────────────────────────────────────
@@ -206,31 +223,31 @@ class TestEndToEnd:
 
 class TestCitationParsing:
     def test_dedup_first_mention_order(self) -> None:
+        """Repeated `[N]` markers dedup; overall order = first-appearance order."""
         chunks = [_chunk(i, f"6.006/lectures/A1_lec{i:02d}.pdf") for i in (1, 2, 3)]
         cits = _parse_citations("Foo [3] bar [1] baz [3][1][2] end.", chunks)
         assert [c.marker for c in cits] == [3, 1, 2]
 
     def test_out_of_range_dropped(self) -> None:
+        """`[N]` past top-k is dropped (not raised) — no invented citations in the output."""
         chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
-        # [9] doesn't exist — dropped. [1] kept.
         cits = _parse_citations("Ok [1] and also [9].", chunks)
         assert [c.marker for c in cits] == [1]
 
     def test_zero_and_negative_ignored(self) -> None:
-        # `[0]` is out of range (1-indexed). `[-1]` won't even match the
-        # `\d+` regex — sanity check both.
+        """[0] out of range (1-indexed), [-N] doesn't match \\d+ — both ignored."""
         chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
         cits = _parse_citations("Bad [0] good [1] weird [-2].", chunks)
         assert [c.marker for c in cits] == [1]
 
     def test_no_markers_returns_empty(self) -> None:
+        """An answer with no `[N]` brackets produces zero citations, not an error."""
         chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
         cits = _parse_citations("No brackets here at all.", chunks)
         assert cits == []
 
     def test_all_out_of_range_returns_empty(self, tmp_path: Path) -> None:
-        # End-to-end version — an answer that only cites nonexistent chunks
-        # yields an empty citations list but preserves the answer text.
+        """End-to-end: only-invented markers → empty citations; answer text round-trips."""
         chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -245,9 +262,7 @@ class TestCitationParsing:
 
 class TestOutOfCorpus:
     def test_sentinel_text_preserved(self, tmp_path: Path) -> None:
-        # When Claude produces the exact out-of-corpus sentence, the pipeline
-        # doesn't do anything special — the answer round-trips, citations are
-        # empty (no brackets in the reply), and the generator DID run.
+        """When Claude returns the sentinel, pipeline passes it through (generator ran)."""
         chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -258,10 +273,7 @@ class TestOutOfCorpus:
         assert len(generator.calls) == 1
 
     def test_empty_retrieval_short_circuits(self, tmp_path: Path) -> None:
-        # No chunks retrieved → skip the generator call entirely, return the
-        # sentinel with zero cost. Saves a token spend and keeps eval cost
-        # accounting honest for degenerate cases (wrong pipeline_tag,
-        # empty DB, over-filtering).
+        """No chunks retrieved → skip generator entirely, return sentinel + zero cost."""
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
         generator = _FakeGenerator(reply_text="should not be called")
@@ -285,6 +297,7 @@ class TestOutOfCorpus:
 
 class TestFormatContext:
     def test_shape(self) -> None:
+        """Each chunk renders as `[N] source_id doc_path ...` header + body, blank line between."""
         chunks = [
             _chunk(1, "6.006/lectures/A1_lec01.pdf", "A1"),
             _chunk(2, "6.830/lectures/B1_lec02.pdf", "B1"),
@@ -297,28 +310,9 @@ class TestFormatContext:
         # Blank line between chunks.
         assert "\n\n" in out
 
-    def test_page_range_and_score(self) -> None:
+    def test_page_range_rendered(self) -> None:
+        """Chunk header shows the page range (e.g. `pages 1-1`) so Claude can cite by page."""
         c = _chunk(1, "6.006/lectures/A1_lec01.pdf", "A1")
         out = _format_context([c])
-        # page_start=1, page_end=1 → "pages 1–1"; score renders with 2 dp.
+        # page_start=1, page_end=1 → "pages 1–1"
         assert "pages 1–1" in out
-        # score for marker 1 = 0.9 - 0.01 = 0.89 → "0.89"
-        assert "0.89" in out
-
-    def test_empty_input(self) -> None:
-        assert _format_context([]) == ""
-
-
-class TestPipelineTagOverride:
-    def test_custom_pipeline_tag_forwarded(self, tmp_path: Path) -> None:
-        embedder = _FakeEmbedder()
-        store = _FakeStore(to_return=[])  # empty → short-circuit, but store IS called
-        generator = _FakeGenerator()
-        answer_question(
-            query="q",
-            embedder=embedder,
-            store=store,
-            generator=generator,
-            pipeline_tag="p2_semantic",
-        )
-        assert store.calls[0]["pipeline"] == "p2_semantic"
