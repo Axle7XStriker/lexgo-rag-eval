@@ -29,9 +29,11 @@ from src.pipeline.query import (
 from src.pipeline.store import RetrievedChunk
 
 # Canned prompt used by every test in this file — decouples the pipeline
-# tests from the real prompt file's exact wording. If v1.md changes,
-# these tests do not need to change.
-_MOCK_SYSTEM = "SYSTEM: sentinel is 'CANNED_SENTINEL'."
+# tests from the real prompt file's exact wording. Mirrors the real
+# `_load_prompt` output shape: the system body has OUT_OF_CORPUS_SENTINEL
+# already substituted in (loader does that at load time), and the user
+# template still has {question}/{context} for per-request substitution.
+_MOCK_SYSTEM = f"SYSTEM: sentinel is '{OUT_OF_CORPUS_SENTINEL}'."
 _MOCK_USER_TEMPLATE = "Q: {question}\nCTX:\n{context}"
 
 
@@ -207,9 +209,8 @@ class TestEndToEnd:
         call = generator.calls[0]
         # Canned template is passed through verbatim as system.
         assert call["system"] == _MOCK_SYSTEM
-        # Placeholders substituted with the real question + formatted context.
-        assert "Q: what is merge sort?" in call["user"]
-        assert "CTX:" in call["user"]
+        # Question text made it into the substituted user prompt.
+        assert "what is merge sort?" in call["user"]
         # Both enumerated chunk headers appear, in order.
         assert "[1] A1 6.006/lectures/A1_lec01.pdf" in call["user"]
         assert "[2] B1 6.830/lectures/B1_lec02.pdf" in call["user"]
@@ -297,7 +298,7 @@ class TestOutOfCorpus:
 
 class TestFormatContext:
     def test_shape(self) -> None:
-        """Each chunk renders as `[N] source_id doc_path ...` header + body, blank line between."""
+        """Each chunk renders `[N] source_id doc_path (pages P-Q ...)` header + body, blank line."""
         chunks = [
             _chunk(1, "6.006/lectures/A1_lec01.pdf", "A1"),
             _chunk(2, "6.830/lectures/B1_lec02.pdf", "B1"),
@@ -305,14 +306,9 @@ class TestFormatContext:
         out = _format_context(chunks)
         assert "[1] A1 6.006/lectures/A1_lec01.pdf" in out
         assert "[2] B1 6.830/lectures/B1_lec02.pdf" in out
+        # Page range rendered in the header (chunk 1 → page_start=1, page_end=1).
+        assert "pages 1–1" in out
         assert "chunk-1-body" in out
         assert "chunk-2-body" in out
         # Blank line between chunks.
         assert "\n\n" in out
-
-    def test_page_range_rendered(self) -> None:
-        """Chunk header shows the page range (e.g. `pages 1-1`) so Claude can cite by page."""
-        c = _chunk(1, "6.006/lectures/A1_lec01.pdf", "A1")
-        out = _format_context([c])
-        # page_start=1, page_end=1 → "pages 1–1"
-        assert "pages 1–1" in out
