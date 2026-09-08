@@ -4,9 +4,9 @@ Covers: end-to-end shape, citation dedup + first-mention order, out-of-range
 marker handling, out-of-corpus prompt path, empty-retrieval short-circuit,
 context block format.
 
-Tests are decoupled from the real prompt file: every test uses a canned
-system/user template via the `mock_prompt` autouse fixture, so pipeline
-behaviour is tested independently of prompt v1's wording.
+Tests create a small prompt file rather than use the production prompt, so
+they exercise `_load_prompt` without coupling pipeline behaviour to any
+production prompt's wording.
 """
 
 from __future__ import annotations
@@ -28,29 +28,34 @@ from src.pipeline.query import (
 )
 from src.pipeline.store import RetrievedChunk
 
-# Canned prompt used by every test in this file — decouples the pipeline
-# tests from the real prompt file's exact wording. Mirrors the real
-# `_load_prompt` output shape: the system body has OUT_OF_CORPUS_SENTINEL
-# already substituted in (loader does that at load time), and the user
-# template still has {question}/{context} for per-request substitution.
-_MOCK_SYSTEM = f"SYSTEM: sentinel is '{OUT_OF_CORPUS_SENTINEL}'."
-_MOCK_USER_TEMPLATE = "Q: {question}\nCTX:\n{context}"
-
 
 @pytest.fixture(autouse=True)
-def mock_prompt(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Replace `_load_prompt` with a canned template for every test.
+def prompt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Create a minimal prompt file and point the real loader at its directory."""
+    prompt_path = tmp_path / "prompts" / "answer" / f"{PROMPT_VERSION}.md"
+    prompt_path.parent.mkdir(parents=True)
+    prompt_path.write_text(
+        """---
+name: test-answer
+version: 1
+---
 
-    `functools.cache` on the real loader would otherwise leak state across
-    tests, and the assertions in `test_prompt_includes_enumerated_context`
-    would become tied to prompt v1's exact wording. Using a fixed canned
-    template keeps pipeline behaviour tests orthogonal to prompt content.
-    """
-    monkeypatch.setattr(
-        query_module,
-        "_load_prompt",
-        lambda role, version: (_MOCK_SYSTEM, _MOCK_USER_TEMPLATE),
+# System
+
+SYSTEM: sentinel is '{out_of_corpus_sentinel}'.
+
+# User template
+
+Q: {question}
+CTX:
+{context}
+""",
+        encoding="utf-8",
     )
+    query_module._load_prompt.cache_clear()
+    monkeypatch.setattr(query_module, "PROMPTS_DIR", tmp_path / "prompts")
+    yield
+    query_module._load_prompt.cache_clear()
 
 
 # ── Fake dependencies ────────────────────────────────────────────────
@@ -123,7 +128,7 @@ def _chunk(marker: int, doc_path: str, source_id: str = "A1") -> RetrievedChunk:
 
     `doc_path` here is a synthetic fixture, NOT validated against the real
     corpus manifest — pipeline tests are decoupled from corpus content by
-    design (same principle as the mock_prompt fixture above). Manifest
+    design (same principle as the prompt fixture above). Manifest
     integrity is tested by test_ingest.py + test_fetch_corpus.py.
     """
     return RetrievedChunk(
@@ -216,7 +221,7 @@ class TestEndToEnd:
         # Canned template is passed through verbatim as system, and the
         # out-of-corpus sentinel must be reachable to Claude via the system
         # prompt — otherwise a P1 "not in corpus" answer would be impossible.
-        assert call["system"] == _MOCK_SYSTEM
+        assert call["system"] == f"SYSTEM: sentinel is '{OUT_OF_CORPUS_SENTINEL}'."
         assert OUT_OF_CORPUS_SENTINEL in call["system"]
         # Question text made it into the substituted user prompt.
         assert "what is merge sort?" in call["user"]
