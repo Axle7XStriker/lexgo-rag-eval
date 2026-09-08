@@ -47,10 +47,6 @@ from src.pricing import anthropic_cost
 
 _logger = get_logger("generate")
 
-# `PRICING` is re-exported from src.pricing so this module still has a single
-# import surface for callers that want to inspect the price table. All cost
-# math delegates to src.pricing so the numbers live in exactly one place.
-
 DEFAULT_MAX_TOKENS = 1024
 DEFAULT_TEMPERATURE = 0.0
 PROVIDER = "anthropic"
@@ -86,13 +82,7 @@ def _is_retryable(exc: BaseException) -> bool:
 
 
 def _cost_for(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Cost in USD for a call at `model`'s pricing. Missing model → 0.0.
-
-    Delegates to `src.pricing.anthropic_cost` so the price table has one
-    owner. ClaudeGenerator rejects unknown models at construction, so this
-    fallback only trips if pricing is edited to drop an in-flight model.
-    Warning is a belt-and-braces breadcrumb (same pattern as embed._cost_for).
-    """
+    """Cost in USD for a call at `model`'s pricing. Missing model → 0.0."""
     cost = anthropic_cost(model, input_tokens, output_tokens)
     if cost is None:
         _logger.warning(

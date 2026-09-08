@@ -47,10 +47,6 @@ from src.pricing import voyage_cost
 
 _logger = get_logger("embed")
 
-# `PRICING` is re-exported from src.pricing so this module still has a single
-# import surface for callers that want to inspect the price table. All cost
-# math delegates to src.pricing so the numbers live in exactly one place.
-
 # Voyage's max inputs per request is 128; leaving headroom keeps any single
 # refire cheap and stays comfortably under the 120k-token-per-request cap for
 # 500-token chunks (64 * 500 = 32k tokens per request).
@@ -75,13 +71,7 @@ _RETRYABLE = (
 
 
 def _cost_for(model: str, input_tokens: int) -> float:
-    """Cost in USD for `input_tokens` at `model`'s pricing. Missing model → 0.0.
-
-    Delegates to `src.pricing.voyage_cost` so the price table has one owner.
-    VoyageEmbedder rejects unknown models at construction time; this fallback
-    only trips if pricing is edited to drop an already-in-flight model, which
-    should never happen. Warning is a belt-and-braces breadcrumb.
-    """
+    """Cost in USD for `input_tokens` at `model`'s pricing. Missing model → 0.0."""
     cost = voyage_cost(model, input_tokens)
     if cost is None:
         _logger.warning("voyage_pricing_missing", model=model, input_tokens=input_tokens)

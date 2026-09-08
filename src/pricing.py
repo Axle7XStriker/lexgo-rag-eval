@@ -26,11 +26,7 @@ ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
 
 
 def voyage_cost(model: str, input_tokens: int) -> float | None:
-    """Return USD cost for a Voyage embed call, or None if the model is unknown.
-
-    None (not 0.0) is the "unknown model" sentinel so callers can decide the
-    policy: fail fast at init, log-then-attribute-zero at call time, etc.
-    """
+    """Return USD cost for a Voyage embed call, or None if the model is unknown."""
     per_million = VOYAGE_PRICING.get(model)
     if per_million is None:
         return None
@@ -38,11 +34,7 @@ def voyage_cost(model: str, input_tokens: int) -> float | None:
 
 
 def anthropic_cost(model: str, input_tokens: int, output_tokens: int) -> float | None:
-    """Return USD cost for an Anthropic messages call, or None if the model is unknown.
-
-    None (not 0.0) is the "unknown model" sentinel — same convention as
-    `voyage_cost` so provider modules handle unknowns uniformly.
-    """
+    """Return USD cost for an Anthropic messages call, or None if the model is unknown."""
     rates = ANTHROPIC_PRICING.get(model)
     if rates is None:
         return None
