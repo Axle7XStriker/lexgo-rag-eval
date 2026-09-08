@@ -42,16 +42,10 @@ from voyageai.error import (
 )
 
 from src.observability import get_logger, log_llm_call
+from src.pricing import VOYAGE_PRICING as PRICING
+from src.pricing import voyage_cost
 
 _logger = get_logger("embed")
-
-# USD per 1M input tokens, keyed on Voyage model id. Voyage's SDK does not
-# return a per-call cost, so we compute it locally from this table. Tracked
-# for periodic verification against Voyage's docs — see the follow-up issue.
-PRICING: dict[str, float] = {
-    "voyage-3-large": 0.18,
-    # Add other models here as they get exercised.
-}
 
 # Voyage's max inputs per request is 128; leaving headroom keeps any single
 # refire cheap and stays comfortably under the 120k-token-per-request cap for
@@ -77,17 +71,12 @@ _RETRYABLE = (
 
 
 def _cost_for(model: str, input_tokens: int) -> float:
-    """Cost in USD for `input_tokens` at `model`'s pricing. Missing model → 0.0.
-
-    VoyageEmbedder rejects unknown models at construction time; this fallback
-    only trips if PRICING is edited to drop an already-in-flight model, which
-    should never happen. Warning is a belt-and-braces breadcrumb.
-    """
-    per_million = PRICING.get(model)
-    if per_million is None:
+    """Cost in USD for `input_tokens` at `model`'s pricing. Missing model → 0.0."""
+    cost = voyage_cost(model, input_tokens)
+    if cost is None:
         _logger.warning("voyage_pricing_missing", model=model, input_tokens=input_tokens)
         return 0.0
-    return (input_tokens / 1_000_000) * per_million
+    return cost
 
 
 class VoyageEmbedder:
