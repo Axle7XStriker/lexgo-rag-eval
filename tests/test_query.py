@@ -119,7 +119,13 @@ class _FakeGenerator:
 
 
 def _chunk(marker: int, doc_path: str, source_id: str = "A1") -> RetrievedChunk:
-    """Build a RetrievedChunk with unique-per-marker text so we can spot it in prompts."""
+    """Build a RetrievedChunk with unique-per-marker text so we can spot it in prompts.
+
+    `doc_path` here is a synthetic fixture, NOT validated against the real
+    corpus manifest — pipeline tests are decoupled from corpus content by
+    design (same principle as the mock_prompt fixture above). Manifest
+    integrity is tested by test_ingest.py + test_fetch_corpus.py.
+    """
     return RetrievedChunk(
         chunk_id=1000 + marker,
         document_id=1,
@@ -141,9 +147,9 @@ class TestEndToEnd:
     def test_happy_path(self, tmp_path: Path) -> None:
         """Returns model's answer verbatim; cited chunks parsed in first-mention order."""
         chunks = [
-            _chunk(1, "6.006/lectures/A1_lec03.pdf", "A1"),
-            _chunk(2, "6.006/recitations/A2_rec03.pdf", "A2"),
-            _chunk(3, "6.006/psets/A3_pset1.pdf", "A3"),
+            _chunk(1, "fixture/A1_doc03.pdf", "A1"),
+            _chunk(2, "fixture/A2_doc03.pdf", "A2"),
+            _chunk(3, "fixture/A3_doc01.pdf", "A3"),
         ]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -177,8 +183,8 @@ class TestEndToEnd:
 
         # Citations parsed, deduped, first-mention order.
         assert [c.marker for c in result.citations] == [1, 3]
-        assert result.citations[0].doc_path == "6.006/lectures/A1_lec03.pdf"
-        assert result.citations[1].doc_path == "6.006/psets/A3_pset1.pdf"
+        assert result.citations[0].doc_path == "fixture/A1_doc03.pdf"
+        assert result.citations[1].doc_path == "fixture/A3_doc01.pdf"
         assert result.citations[0].source_id == "A1"
 
         # Dependencies invoked with the query + run_id threaded through.
@@ -192,8 +198,8 @@ class TestEndToEnd:
     def test_generator_receives_substituted_prompt(self, tmp_path: Path) -> None:
         """{question} and {context} placeholders are filled before the generator sees the prompt."""
         chunks = [
-            _chunk(1, "6.006/lectures/A1_lec01.pdf", "A1"),
-            _chunk(2, "6.830/lectures/B1_lec02.pdf", "B1"),
+            _chunk(1, "fixture/A1_doc01.pdf", "A1"),
+            _chunk(2, "fixture/B1_doc02.pdf", "B1"),
         ]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -207,13 +213,16 @@ class TestEndToEnd:
         )
 
         call = generator.calls[0]
-        # Canned template is passed through verbatim as system.
+        # Canned template is passed through verbatim as system, and the
+        # out-of-corpus sentinel must be reachable to Claude via the system
+        # prompt — otherwise a P1 "not in corpus" answer would be impossible.
         assert call["system"] == _MOCK_SYSTEM
+        assert OUT_OF_CORPUS_SENTINEL in call["system"]
         # Question text made it into the substituted user prompt.
         assert "what is merge sort?" in call["user"]
         # Both enumerated chunk headers appear, in order.
-        assert "[1] A1 6.006/lectures/A1_lec01.pdf" in call["user"]
-        assert "[2] B1 6.830/lectures/B1_lec02.pdf" in call["user"]
+        assert "[1] A1 fixture/A1_doc01.pdf" in call["user"]
+        assert "[2] B1 fixture/B1_doc02.pdf" in call["user"]
         # And the chunk bodies.
         assert "chunk-1-body" in call["user"]
         assert "chunk-2-body" in call["user"]
@@ -225,31 +234,31 @@ class TestEndToEnd:
 class TestCitationParsing:
     def test_dedup_first_mention_order(self) -> None:
         """Repeated `[N]` markers dedup; overall order = first-appearance order."""
-        chunks = [_chunk(i, f"6.006/lectures/A1_lec{i:02d}.pdf") for i in (1, 2, 3)]
+        chunks = [_chunk(i, f"fixture/A1_doc{i:02d}.pdf") for i in (1, 2, 3)]
         cits = _parse_citations("Foo [3] bar [1] baz [3][1][2] end.", chunks)
         assert [c.marker for c in cits] == [3, 1, 2]
 
     def test_out_of_range_dropped(self) -> None:
         """`[N]` past top-k is dropped (not raised) — no invented citations in the output."""
-        chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         cits = _parse_citations("Ok [1] and also [9].", chunks)
         assert [c.marker for c in cits] == [1]
 
     def test_zero_and_negative_ignored(self) -> None:
         """[0] out of range (1-indexed), [-N] doesn't match \\d+ — both ignored."""
-        chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         cits = _parse_citations("Bad [0] good [1] weird [-2].", chunks)
         assert [c.marker for c in cits] == [1]
 
     def test_no_markers_returns_empty(self) -> None:
         """An answer with no `[N]` brackets produces zero citations, not an error."""
-        chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         cits = _parse_citations("No brackets here at all.", chunks)
         assert cits == []
 
     def test_all_out_of_range_returns_empty(self, tmp_path: Path) -> None:
         """End-to-end: only-invented markers → empty citations; answer text round-trips."""
-        chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
         generator = _FakeGenerator(reply_text="Something [9] and [42].")
@@ -264,7 +273,7 @@ class TestCitationParsing:
 class TestOutOfCorpus:
     def test_sentinel_text_preserved(self, tmp_path: Path) -> None:
         """When Claude returns the sentinel, pipeline passes it through (generator ran)."""
-        chunks = [_chunk(1, "6.006/lectures/A1_lec01.pdf")]
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
         generator = _FakeGenerator(reply_text=OUT_OF_CORPUS_SENTINEL)
@@ -300,12 +309,12 @@ class TestFormatContext:
     def test_shape(self) -> None:
         """Each chunk renders `[N] source_id doc_path (pages P-Q ...)` header + body, blank line."""
         chunks = [
-            _chunk(1, "6.006/lectures/A1_lec01.pdf", "A1"),
-            _chunk(2, "6.830/lectures/B1_lec02.pdf", "B1"),
+            _chunk(1, "fixture/A1_doc01.pdf", "A1"),
+            _chunk(2, "fixture/B1_doc02.pdf", "B1"),
         ]
         out = _format_context(chunks)
-        assert "[1] A1 6.006/lectures/A1_lec01.pdf" in out
-        assert "[2] B1 6.830/lectures/B1_lec02.pdf" in out
+        assert "[1] A1 fixture/A1_doc01.pdf" in out
+        assert "[2] B1 fixture/B1_doc02.pdf" in out
         # Page range rendered in the header (chunk 1 → page_start=1, page_end=1).
         assert "pages 1–1" in out
         assert "chunk-1-body" in out
