@@ -2,21 +2,53 @@
 
 The 100-Q&A golden set, eval-run scripts, and captured run artifacts.
 
-## Layout (planned)
+## Layout
 
 ```
 evals/
   golden/
-    qa.jsonl              # 100 hand-authored Q&As (W1–W2 deliverable)
+    qa.jsonl              # hand-authored Q&As (100 at spec target)
   runs/
     <run_id>/             # one dir per run, gitignored except .gitkeep
-      manifest.json       # git SHA, prompt versions, config, pipeline
-      results.jsonl       # per-Q&A: model answer, citations, judge verdict
+      manifest.json       # git SHA, prompt versions, config, totals, metrics
+      results.jsonl       # per-Q&A: answer, citations, judge verdict, cost
       llm_calls.jsonl     # snapshot of logs/llm_calls.jsonl for this run
-      summary.md          # aggregate metrics, generated
-  score.py                # load golden + run → aggregate metrics (W3)
-  judge.py                # LLM-as-judge wrapper (W3)
+      summary.md          # human-readable metrics table + skipped Q&As
+  metrics.py              # pure-function metric helpers + aggregate()
+  run.py                  # CLI entrypoint: `python -m evals.run --pipeline p1`
+  validate_golden.py      # `make validate` — golden-set linter
 ```
+
+## How to run
+
+Prerequisites:
+
+```
+make db-up          # start local Postgres + pgvector
+make ingest         # populate the P1 chunks table (idempotent)
+make validate       # golden-set integrity check (exit 0 on OK)
+```
+
+Then:
+
+```
+make eval           # runs `uv run python -m evals.run --pipeline p1`
+```
+
+Artifacts land under `evals/runs/eval_<UTC-timestamp>/`. Each run captures
+the git SHA, prompt versions, config, totals, and metrics into
+`manifest.json`; the same numbers render as tables in `summary.md`.
+
+## Exit-code contract
+
+`evals.run.main()` returns **0 on any successful invocation**, including
+runs where individual Q&As were skipped. Skips are reported in the
+"Skipped Q&As" section of `summary.md` and counted in
+`manifest.json:totals.n_skipped`; the operator decides whether to
+investigate. The loop returns **1 only** when it refuses to start —
+today the only such condition is a malformed `qa.jsonl` (parse errors
+listed to stdout). This matches the `make validate` contract: fix the
+golden file before evaluating against it.
 
 ## Golden set
 

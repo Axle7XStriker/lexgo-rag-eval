@@ -26,9 +26,8 @@ db-down: ## Stop the local Postgres container
 validate: ## Lint the golden Q&A set (evals/golden/qa.jsonl)
 	uv run python -m evals.validate_golden
 
-eval: ## Run the eval loop (lands W3)
-	@echo "Eval loop lands in W3 — see evals/README.md for planned layout."
-	@exit 1
+eval: ## Run the P1 eval loop over evals/golden/qa.jsonl
+	uv run python -m evals.run --pipeline p1
 
 test: ## Run pytest
 	uv run pytest
