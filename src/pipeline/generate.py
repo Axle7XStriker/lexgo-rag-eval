@@ -7,9 +7,10 @@ Design notes worth remembering:
     client, `SecretStr` key, `tenacity` retries on transient exceptions only,
     fail-fast on unknown model in `__init__`, exactly one `log_llm_call` per
     API call, dependency-injection seam via `client=` for tests.
-  - `PRICING` uses a nested `{input, output}` dict because Claude has separate
-    per-1M rates for input and output tokens — Voyage's flat float doesn't fit.
-    Anthropic's SDK does NOT return a per-call cost, so cost is computed here.
+  - Shared with `ClaudeJudge`: `is_retryable`, `cost_for`, `PRICING`,
+    `PROVIDER`, and `DEFAULT_TEMPERATURE` live in
+    `src.pipeline.anthropic_utils` so a change there (new retryable
+    exception, price adjustment) is a one-file edit.
   - `temperature=0.0` by default: P1 baseline is a scientific eval — outputs
     must be reproducible across runs so the accuracy delta between P1..P4 is
     signal, not noise. Sonnet 4.6 still accepts `temperature` (removed on
@@ -26,13 +27,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from anthropic import (
-    Anthropic,
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    RateLimitError,
-)
+from anthropic import Anthropic
 from pydantic import SecretStr
 from tenacity import (
     retry,
@@ -41,15 +36,16 @@ from tenacity import (
     wait_exponential,
 )
 
-from src.observability import get_logger, log_llm_call
-from src.pricing import ANTHROPIC_PRICING as PRICING
-from src.pricing import anthropic_cost
-
-_logger = get_logger("generate")
+from src.observability import log_llm_call
+from src.pipeline.anthropic_utils import (
+    DEFAULT_TEMPERATURE,
+    PRICING,
+    PROVIDER,
+    cost_for,
+    is_retryable,
+)
 
 DEFAULT_MAX_TOKENS = 1024
-DEFAULT_TEMPERATURE = 0.0
-PROVIDER = "anthropic"
 
 
 @dataclass(frozen=True)
@@ -60,39 +56,6 @@ class GenerateResult:
     input_tokens: int
     output_tokens: int
     cost_usd: float
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    """True for transient failures; False for deterministic ones.
-
-    RateLimitError, APIConnectionError, APITimeoutError are always transient.
-    APIStatusError catches the raw HTTP surface — we retry only 5xx server
-    errors, not 4xx client errors (BadRequestError, AuthenticationError,
-    NotFoundError, PermissionDeniedError all inherit from APIStatusError but
-    correspond to deterministic mistakes we should surface immediately).
-    """
-    if isinstance(exc, RateLimitError | APIConnectionError | APITimeoutError):
-        return True
-    if isinstance(exc, APIStatusError):
-        # `status_code` is set on typed APIStatusError subclasses; guard with
-        # getattr in case a subclass without one slips through.
-        code = getattr(exc, "status_code", None)
-        return isinstance(code, int) and code >= 500
-    return False
-
-
-def _cost_for(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Cost in USD for a call at `model`'s pricing. Missing model → 0.0."""
-    cost = anthropic_cost(model, input_tokens, output_tokens)
-    if cost is None:
-        _logger.warning(
-            "anthropic_pricing_missing",
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
-        return 0.0
-    return cost
 
 
 class ClaudeGenerator:
@@ -114,8 +77,9 @@ class ClaudeGenerator:
         # the blog's cost story with no visible signal.
         if model not in PRICING:
             raise ValueError(
-                f"unknown Anthropic model {model!r}; add its price to PRICING "
-                f"in src/pipeline/generate.py before use. Known: {sorted(PRICING)}"
+                f"unknown Anthropic model {model!r}; add its price to "
+                f"ANTHROPIC_PRICING in src/pricing.py before use. "
+                f"Known: {sorted(PRICING)}"
             )
         self._model = model
         self._log_path = log_path
@@ -149,7 +113,7 @@ class ClaudeGenerator:
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=1, max=30),
-        retry=retry_if_exception(_is_retryable),
+        retry=retry_if_exception(is_retryable),
         reraise=True,
     )
     def _call(
@@ -182,7 +146,7 @@ class ClaudeGenerator:
 
         input_tokens = int(getattr(response.usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(response.usage, "output_tokens", 0) or 0)
-        cost_usd = _cost_for(self._model, input_tokens, output_tokens)
+        cost_usd = cost_for(self._model, input_tokens, output_tokens)
 
         log_llm_call(
             self._log_path,

@@ -22,12 +22,12 @@ from pathlib import Path
 import pytest
 
 from evals import run as run_module
-from src.pipeline import judge as judge_module
-from src.pipeline import query as query_module
+from src.pipeline import prompts as prompts_module
 from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.generate import GenerateResult
 from src.pipeline.judge import JudgeResult
-from src.pipeline.query import OUT_OF_CORPUS_SENTINEL, PROMPT_VERSION
+from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
+from src.pipeline.query import PROMPT_VERSION
 from src.pipeline.store import RetrievedChunk
 
 # ── Prompt fixture ────────────────────────────────────────────────────
@@ -61,13 +61,10 @@ MC: {model_citations_block}
 """,
         encoding="utf-8",
     )
-    query_module._load_prompt.cache_clear()
-    judge_module._load_prompt.cache_clear()
-    monkeypatch.setattr(query_module, "PROMPTS_DIR", prompts_dir)
-    monkeypatch.setattr(judge_module, "PROMPTS_DIR", prompts_dir)
+    prompts_module.load_prompt.cache_clear()
+    monkeypatch.setattr(prompts_module, "PROMPTS_DIR", prompts_dir)
     yield
-    query_module._load_prompt.cache_clear()
-    judge_module._load_prompt.cache_clear()
+    prompts_module.load_prompt.cache_clear()
 
 
 # ── Fakes ─────────────────────────────────────────────────────────────
@@ -463,11 +460,11 @@ class TestMainSkipRecovery:
         _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
     ) -> None:
         """A raised exception from the generator becomes a skipped QAResult, run still exits 0."""
-        # `_inject_fake_deps` establishes the baseline; below we override the
-        # generator with a raising fake so the pipeline call always fails.
-        del _inject_fake_deps
 
-        # Swap the generator with one that raises on every call.
+        # `_inject_fake_deps` is depended on for its side effects — it wires
+        # get_settings, _git_sha, VectorStore, etc. via monkeypatch. Below we
+        # override just the generator with one that raises on every call, so
+        # the rest of the eval loop still runs (pipeline_failed skip path).
         class _Boom:
             def generate(self, **kwargs):
                 raise RuntimeError("boom")

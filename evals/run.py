@@ -50,9 +50,9 @@ from evals.metrics import (
     RunMetrics,
     aggregate,
     citation_precision_programmatic,
+    hit_rate_at_k,
     qaresult_to_dict,
-    retrieval_hit_at_k,
-    retrieval_recall_at_k,
+    recall_at_k,
     runmetrics_to_dict,
 )
 from src.config import get_settings
@@ -148,8 +148,8 @@ def _run_one(
             model_answer="",
             model_citation_doc_paths=[],
             retrieved_doc_paths_top10=[],
-            citation_precision_programmatic=None,
-            hit_at_5=None,
+            citation_precision_programmatic=citation_precision_programmatic([], gold_doc_paths),
+            hit_rate_at_5=None,
             recall_at_5=None,
             judge_answer_correct=None,
             judge_citations_semantically_valid=None,
@@ -167,8 +167,8 @@ def _run_one(
     model_doc_paths = [c.doc_path for c in query_result.citations]
     retrieved_doc_paths = [c.doc_path for c in query_result.retrieved_chunks]
     prec = citation_precision_programmatic(model_doc_paths, gold_doc_paths)
-    hit5 = retrieval_hit_at_k(retrieved_doc_paths, gold_doc_paths, k=5)
-    recall5 = retrieval_recall_at_k(retrieved_doc_paths, gold_doc_paths, k=5)
+    hit5 = hit_rate_at_k(retrieved_doc_paths, gold_doc_paths, k=5)
+    recall5 = recall_at_k(retrieved_doc_paths, gold_doc_paths, k=5)
 
     try:
         verdict = judge.judge(
@@ -195,7 +195,7 @@ def _run_one(
             model_citation_doc_paths=model_doc_paths,
             retrieved_doc_paths_top10=retrieved_doc_paths[:10],
             citation_precision_programmatic=prec,
-            hit_at_5=hit5,
+            hit_rate_at_5=hit5,
             recall_at_5=recall5,
             judge_answer_correct=None,
             judge_citations_semantically_valid=None,
@@ -220,7 +220,7 @@ def _run_one(
         model_citation_doc_paths=model_doc_paths,
         retrieved_doc_paths_top10=retrieved_doc_paths[:10],
         citation_precision_programmatic=prec,
-        hit_at_5=hit5,
+        hit_rate_at_5=hit5,
         recall_at_5=recall5,
         judge_answer_correct=verdict.answer_correct,
         judge_citations_semantically_valid=verdict.citations_semantically_valid,
@@ -279,8 +279,14 @@ def _format_ms(value: float | None) -> str:
     return f"{value:.0f}ms"
 
 
-def _per_type_counts(results: list[QAResult]) -> dict[QAType, int]:
-    """Non-`None` judge-verdict counts, per QAType — used by the summary table."""
+def _scored_counts_by_type(results: list[QAResult]) -> dict[QAType, int]:
+    """Per-QAType count of records with a non-`None` judge verdict.
+
+    Used to populate the `n` column of the per-type accuracy table in
+    `summary.md`. Skipped records (error is not None) and evaluated-but-
+    judge-failed records (judge_answer_correct is None) are excluded, so
+    the count matches the denominator of the per-type accuracy rate.
+    """
     counts: dict[QAType, int] = {}
     for r in results:
         if r.error is not None or r.judge_answer_correct is None:
@@ -303,7 +309,7 @@ def _write_summary_md(
     which Q&As did not score and why.
     """
     skipped = [r for r in results if r.error is not None]
-    per_type = _per_type_counts(results)
+    per_type = _scored_counts_by_type(results)
 
     lines: list[str] = []
     lines.append(f"# Eval run — {manifest['run_id']}")
@@ -337,8 +343,8 @@ def _write_summary_md(
         f"| citation precision (judge rate) | "
         f"{_format_pct(metrics.citation_precision_judge_rate)} |"
     )
-    lines.append(f"| hit-rate@5 | {_format_pct(metrics.hit_at_5_rate)} |")
-    lines.append(f"| mean recall@5 | {_format_pct(metrics.mean_recall_at_5)} |")
+    lines.append(f"| hit-rate@{metrics.k} | {_format_pct(metrics.hit_at_k_rate)} |")
+    lines.append(f"| mean recall@{metrics.k} | {_format_pct(metrics.mean_recall_at_k)} |")
     lines.append(f"| p50 latency | {_format_ms(metrics.p50_latency_ms)} |")
     lines.append(f"| p95 latency | {_format_ms(metrics.p95_latency_ms)} |")
     lines.append(f"| cost — generate | ${metrics.total_generate_cost_usd:.4f} |")
@@ -488,7 +494,9 @@ def main() -> int:
                 if qa_result.citation_precision_programmatic is not None
                 else "n/a"
             )
-            hit_str = str(qa_result.hit_at_5).lower() if qa_result.hit_at_5 is not None else "n/a"
+            hit_str = (
+                f"{qa_result.hit_rate_at_5:.2f}" if qa_result.hit_rate_at_5 is not None else "n/a"
+            )
             total_cost = qa_result.generate_cost_usd + qa_result.judge_cost_usd
             print(
                 f"  {marker} [{qa_result.qa_id}] {verdict_str}, "
@@ -557,8 +565,8 @@ def main() -> int:
     print(
         f"  accuracy: {_format_pct(metrics.accuracy_overall)}    "
         f"cite_prec: {_format_pct(metrics.citation_precision_programmatic_mean)}    "
-        f"hit@5: {_format_pct(metrics.hit_at_5_rate)}    "
-        f"recall@5: {_format_pct(metrics.mean_recall_at_5)}"
+        f"hit@{metrics.k}: {_format_pct(metrics.hit_at_k_rate)}    "
+        f"recall@{metrics.k}: {_format_pct(metrics.mean_recall_at_k)}"
     )
     print(
         f"  latency  p50: {_format_ms(metrics.p50_latency_ms)}    "

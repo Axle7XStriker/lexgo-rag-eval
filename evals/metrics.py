@@ -1,10 +1,12 @@
 """Pure-function metrics for the eval loop — no I/O, no side effects.
 
 Two families of helpers:
-  1. Per-Q&A metrics — `citation_precision_programmatic`, `retrieval_hit_at_k`,
-     `retrieval_recall_at_k`. Each returns `None` when the metric is
-     undefined for that Q&A (out-of-corpus for retrieval; zero-model-cites
-     for citation precision). The aggregator skips `None`s from denominators.
+  1. Per-Q&A metrics — `citation_precision_programmatic`, `hit_rate_at_k`,
+     `recall_at_k`. Citation precision is always defined (every combination
+     of empty / non-empty model & gold citation sets carries a signal).
+     Retrieval metrics return `None` only for out-of-corpus (no gold docs
+     means no retrieval ground truth). The aggregator skips `None`s from
+     denominators.
   2. `QAResult` + `RunMetrics` dataclasses — the frozen record shapes
      `evals/run.py` persists per Q&A and aggregates at the end of a run.
 
@@ -12,9 +14,10 @@ Design notes worth remembering:
   - Kept adjacent to the aggregator so the record shape and the code that
     reads it don't drift. If either grows enough to justify a split, move
     the aggregator to `evals/aggregate.py` and keep the dataclasses here.
-  - `None` propagation over "0" or "N/A sentinel" — `None` is unambiguously
-    "not applicable" and can never accidentally count as a false verdict
-    (which would bias accuracy downward on every out-of-corpus Q&A).
+  - `hit_rate_at_k` is a fraction in [0, 1] — the count of gold docs that
+    appear in the top-k slice divided by k. Continuous instead of black-
+    and-white ("any gold hit vs. none") so a run that retrieves 3/5 gold
+    docs in a cross-source Q&A reads clearly better than one that gets 1/5.
   - Percentiles use `statistics.quantiles(..., method="inclusive")` so
     single-item inputs return that item's value (numpy would raise).
     Small-sample p95 is a rough number by construction — we surface it
@@ -28,6 +31,11 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from src.qa_schema import QAType
+
+# Fixed for the P1 baseline (matches the pipeline's DEFAULT_TOP_K // 2 headline
+# metric — dense top-10 retrieval, headline slice at 5). Baked into the
+# QAResult field names because the eval loop only reports one k today.
+DEFAULT_K = 5
 
 
 @dataclass(frozen=True)
@@ -54,10 +62,13 @@ class QAResult:
     model_answer: str
     model_citation_doc_paths: list[str]
     retrieved_doc_paths_top10: list[str]
-    # `float | None` per-metric — `None` means "undefined for this Q&A"
-    # (out-of-corpus for retrieval; zero model citations for precision).
-    citation_precision_programmatic: float | None
-    hit_at_5: bool | None
+    # Always defined — see `citation_precision_programmatic` docstring for
+    # how the four (empty/non-empty × model/gold) combinations map to a value.
+    citation_precision_programmatic: float
+    # `float | None` — `None` iff out-of-corpus (no gold docs, so no
+    # retrieval ground truth to score against). Skipped records also carry
+    # None here (populated by the eval loop's error path).
+    hit_rate_at_5: float | None
     recall_at_5: float | None
     judge_answer_correct: bool | None
     judge_citations_semantically_valid: bool | None
@@ -79,6 +90,10 @@ class RunMetrics:
     `accuracy_by_type` covers only QATypes that had at least one evaluated
     (non-skipped) record; missing types are absent, not 0.0 — a report that
     reads 0.0 accuracy on a type with zero samples would be misleading.
+
+    `k` is the retrieval slice depth for the hit-rate + recall aggregates
+    (fixed at 5 today; captured explicitly so future P2..P4 runs that vary
+    it are unambiguous in the manifest).
     """
 
     n_records: int  # total records loaded from qa.jsonl
@@ -88,8 +103,9 @@ class RunMetrics:
     accuracy_by_type: dict[QAType, float] = field(default_factory=dict)
     citation_precision_programmatic_mean: float | None = None
     citation_precision_judge_rate: float | None = None
-    hit_at_5_rate: float | None = None
-    mean_recall_at_5: float | None = None
+    k: int = DEFAULT_K
+    hit_at_k_rate: float | None = None
+    mean_recall_at_k: float | None = None
     p50_latency_ms: float | None = None
     p95_latency_ms: float | None = None
     total_generate_cost_usd: float = 0.0
@@ -103,46 +119,58 @@ class RunMetrics:
 def citation_precision_programmatic(
     model_doc_paths: list[str],
     gold_doc_paths: list[str],
-) -> float | None:
+) -> float:
     """Fraction of the model's cited doc_paths that appear in the gold set.
 
-    Returns `None` when the model made zero citations — the metric is
-    undefined for that Q&A, and it must be excluded from the mean rather
-    than counted as 0.0 (which would smear a citation-abstention penalty
-    into precision).
+    Every combination of empty / non-empty (model, gold) has a well-defined
+    value — none is dropped from the mean:
+
+    - model=[],  gold=[]  → 1.0  (correct: nothing to cite, nothing cited)
+    - model=[],  gold=[x] → 0.0  (model failed to cite when gold existed)
+    - model=[x], gold=[]  → 0.0  (every model citation is unfounded)
+    - otherwise           → |{p in model: p in gold}| / |model|
 
     Model citations are compared as a multiset over doc_paths — if the
     model cited the same doc_path twice, both count. That's the honest
     reading of "precision of the model's citations."
     """
     if not model_doc_paths:
-        return None
+        return 1.0 if not gold_doc_paths else 0.0
     gold_set = set(gold_doc_paths)
     hits = sum(1 for p in model_doc_paths if p in gold_set)
     return hits / len(model_doc_paths)
 
 
-def retrieval_hit_at_k(
+def hit_rate_at_k(
     retrieved_doc_paths: list[str],
     gold_doc_paths: list[str],
-    k: int = 5,
-) -> bool | None:
-    """True iff any gold doc_path appears in the top-k retrieved doc_paths.
+    k: int = DEFAULT_K,
+) -> float | None:
+    """Fraction of the top-k retrieved slots that are a gold doc_path.
 
-    Returns `None` for out-of-corpus (no gold citations exist to hit). The
-    top-k slice is taken with `[:k]` — pipelines that return fewer than k
-    chunks are handled naturally.
+    A continuous rate rather than a boolean "any hit / no hit" — a run that
+    retrieves 3/5 gold docs on a cross-source Q&A reads clearly better than
+    one that gets 1/5, and averaging booleans across queries throws that
+    signal away.
+
+    Returns `None` for out-of-corpus (no gold citations to hit). Returns
+    0.0 when the pipeline retrieved nothing (avoids 0/0). The top-k slice
+    is taken with `[:k]` — pipelines that return fewer than k chunks are
+    handled naturally.
     """
     if not gold_doc_paths:
         return None
-    top_k = set(retrieved_doc_paths[:k])
-    return any(p in top_k for p in gold_doc_paths)
+    top_k = retrieved_doc_paths[:k]
+    if not top_k:
+        return 0.0
+    gold_set = set(gold_doc_paths)
+    return sum(1 for p in top_k if p in gold_set) / len(top_k)
 
 
-def retrieval_recall_at_k(
+def recall_at_k(
     retrieved_doc_paths: list[str],
     gold_doc_paths: list[str],
-    k: int = 5,
+    k: int = DEFAULT_K,
 ) -> float | None:
     """`(# distinct gold doc_paths in top-k) / (# distinct gold doc_paths)`.
 
@@ -194,7 +222,7 @@ def _percentile(values: list[float], pct: float) -> float | None:
     return cuts[idx]
 
 
-def aggregate(results: list[QAResult]) -> RunMetrics:
+def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
     """Collapse per-Q&A `QAResult`s into a `RunMetrics` summary.
 
     Skipped records (error is not None) count toward `n_records` and
@@ -229,12 +257,9 @@ def aggregate(results: list[QAResult]) -> RunMetrics:
         if rate is not None:
             accuracy_by_type[qa_type] = rate
 
-    # Citation precision — programmatic mean over Q&As with >0 model cites.
-    prec_values = [
-        r.citation_precision_programmatic
-        for r in evaluated
-        if r.citation_precision_programmatic is not None
-    ]
+    # Citation precision — programmatic mean over every evaluated record
+    # (the metric is always defined; every combination carries a signal).
+    prec_values = [r.citation_precision_programmatic for r in evaluated]
     citation_precision_programmatic_mean = _mean_or_none(prec_values)
 
     # Citation precision — judge-based (secondary). Rate over Q&As where the
@@ -246,12 +271,12 @@ def aggregate(results: list[QAResult]) -> RunMetrics:
     ]
     citation_precision_judge_rate = _rate_or_none(cite_judge_bools)
 
-    # Retrieval hit + recall over in-corpus Q&As (out-of-corpus rows had
+    # Retrieval hit-rate + recall over in-corpus Q&As (out-of-corpus rows had
     # both metrics set to None by the per-Q&A helpers above).
-    hit_bools: list[bool] = [r.hit_at_5 for r in evaluated if r.hit_at_5 is not None]
-    hit_at_5_rate = _rate_or_none(hit_bools)
+    hit_rates = [r.hit_rate_at_5 for r in evaluated if r.hit_rate_at_5 is not None]
+    hit_at_k_rate = _mean_or_none(hit_rates)
     recall_values = [r.recall_at_5 for r in evaluated if r.recall_at_5 is not None]
-    mean_recall_at_5 = _mean_or_none(recall_values)
+    mean_recall_at_k = _mean_or_none(recall_values)
 
     latencies = [r.latency_ms for r in evaluated]
     p50 = _percentile(latencies, 50)
@@ -271,8 +296,9 @@ def aggregate(results: list[QAResult]) -> RunMetrics:
         accuracy_by_type=accuracy_by_type,
         citation_precision_programmatic_mean=citation_precision_programmatic_mean,
         citation_precision_judge_rate=citation_precision_judge_rate,
-        hit_at_5_rate=hit_at_5_rate,
-        mean_recall_at_5=mean_recall_at_5,
+        k=k,
+        hit_at_k_rate=hit_at_k_rate,
+        mean_recall_at_k=mean_recall_at_k,
         p50_latency_ms=p50,
         p95_latency_ms=p95,
         total_generate_cost_usd=total_gen,
@@ -296,7 +322,7 @@ def qaresult_to_dict(r: QAResult) -> dict[str, Any]:
         "model_citation_doc_paths": r.model_citation_doc_paths,
         "retrieved_doc_paths_top10": r.retrieved_doc_paths_top10,
         "citation_precision_programmatic": r.citation_precision_programmatic,
-        "hit_at_5": r.hit_at_5,
+        "hit_rate_at_5": r.hit_rate_at_5,
         "recall_at_5": r.recall_at_5,
         "judge_answer_correct": r.judge_answer_correct,
         "judge_citations_semantically_valid": r.judge_citations_semantically_valid,
@@ -322,8 +348,9 @@ def runmetrics_to_dict(m: RunMetrics) -> dict[str, Any]:
         "accuracy_by_type": {t.value: v for t, v in m.accuracy_by_type.items()},
         "citation_precision_programmatic_mean": m.citation_precision_programmatic_mean,
         "citation_precision_judge_rate": m.citation_precision_judge_rate,
-        "hit_at_5_rate": m.hit_at_5_rate,
-        "mean_recall_at_5": m.mean_recall_at_5,
+        "k": m.k,
+        "hit_at_k_rate": m.hit_at_k_rate,
+        "mean_recall_at_k": m.mean_recall_at_k,
         "p50_latency_ms": (round(m.p50_latency_ms, 2) if m.p50_latency_ms is not None else None),
         "p95_latency_ms": (round(m.p95_latency_ms, 2) if m.p95_latency_ms is not None else None),
         "total_generate_cost_usd": round(m.total_generate_cost_usd, 6),

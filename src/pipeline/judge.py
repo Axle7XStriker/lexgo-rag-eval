@@ -8,8 +8,9 @@ Design notes worth remembering:
   - Mirrors `ClaudeGenerator` line-for-line: sync `Anthropic` client,
     `SecretStr` key, `tenacity` retries on transient exceptions only,
     fail-fast on unknown model in `__init__`, exactly one `log_llm_call` per
-    API call, dependency-injection seam via `client=`. The two classes are
-    siblings; anything true of one should stay true of the other.
+    API call, dependency-injection seam via `client=`. Shared retry / cost /
+    provider helpers live in `src.pipeline.anthropic_utils`; shared prompt
+    loading + the out-of-corpus sentinel live in `src.pipeline.prompts`.
   - The prompt is a strict-JSON contract. We parse `response.text` with
     `json.loads` and raise `JudgeParseError` on any deviation (malformed
     JSON, missing key, wrong type). The eval loop catches this and skips
@@ -17,31 +18,17 @@ Design notes worth remembering:
     reply is a signal to iterate on the prompt, not an accuracy datapoint.
   - `temperature=0.0` for the same reproducibility reason as the generator:
     the accuracy delta P1 → P4 must be signal, not judge noise.
-  - Prompt loading is a small local variant of `_load_prompt` from
-    `src/pipeline/query.py`. The judge template has different required
-    placeholders (no `{context}`, but `{gold_citations_block}` /
-    `{model_citations_block}` / etc.), so factoring one shared loader
-    would be lossier than duplicating ~30 lines here. Kept literally
-    section-parse-compatible with the answer prompt file format so a
-    reader who knows one knows the other.
 """
 
 from __future__ import annotations
 
-import functools
 import json
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from anthropic import (
-    Anthropic,
-    APIConnectionError,
-    APIStatusError,
-    APITimeoutError,
-    RateLimitError,
-)
+from anthropic import Anthropic
 from pydantic import SecretStr
 from tenacity import (
     retry,
@@ -50,15 +37,17 @@ from tenacity import (
     wait_exponential,
 )
 
-from src.observability import get_logger, log_llm_call
-from src.pricing import ANTHROPIC_PRICING as PRICING
-from src.pricing import anthropic_cost
-
-_logger = get_logger("judge")
+from src.observability import log_llm_call
+from src.pipeline.anthropic_utils import (
+    DEFAULT_TEMPERATURE,
+    PRICING,
+    PROVIDER,
+    cost_for,
+    is_retryable,
+)
+from src.pipeline.prompts import load_prompt
 
 DEFAULT_MAX_TOKENS = 512
-DEFAULT_TEMPERATURE = 0.0
-PROVIDER = "anthropic"
 
 # `role` + `version` locate the prompt file at prompts/<role>/<version>.md.
 # Bump PROMPT_VERSION on any semantic change to the judge prompt; captured
@@ -66,12 +55,14 @@ PROVIDER = "anthropic"
 PROMPT_ROLE = "judge"
 PROMPT_VERSION = "v1"
 
-PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
-
-# Section markers inside a prompt file. Matches the answer prompt convention
-# so both files parse under the same section-based rules.
-_SYSTEM_MARKER = "# System"
-_USER_TEMPLATE_MARKER = "# User template"
+# Placeholders the judge user template MUST contain — enforced at load time.
+_REQUIRED_USER_PLACEHOLDERS: tuple[str, ...] = (
+    "{question}",
+    "{gold_answer}",
+    "{gold_citations_block}",
+    "{model_answer}",
+    "{model_citations_block}",
+)
 
 # JSON keys the judge MUST return. Missing any of them → JudgeParseError.
 # `answer_correct` and `citations_semantically_valid` must be bools;
@@ -106,99 +97,6 @@ class JudgeResult:
     input_tokens: int
     output_tokens: int
     cost_usd: float
-
-
-def _is_retryable(exc: BaseException) -> bool:
-    """True for transient failures; False for deterministic ones.
-
-    Identical policy to `ClaudeGenerator._is_retryable` — retry rate limits,
-    connection/timeout errors, and 5xx server errors; fail fast on
-    everything else (4xx, auth, unknown model at request time).
-    """
-    if isinstance(exc, RateLimitError | APIConnectionError | APITimeoutError):
-        return True
-    if isinstance(exc, APIStatusError):
-        # `status_code` is set on typed APIStatusError subclasses; guard with
-        # getattr in case a subclass without one slips through.
-        code = getattr(exc, "status_code", None)
-        return isinstance(code, int) and code >= 500
-    return False
-
-
-def _cost_for(model: str, input_tokens: int, output_tokens: int) -> float:
-    """Cost in USD for a call at `model`'s pricing. Missing model → 0.0."""
-    cost = anthropic_cost(model, input_tokens, output_tokens)
-    if cost is None:
-        _logger.warning(
-            "anthropic_pricing_missing",
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
-        return 0.0
-    return cost
-
-
-@functools.cache
-def _load_prompt(role: str, version: str) -> tuple[str, str]:
-    """Load a prompt file, return (system_body, user_template).
-
-    Cached per (role, version) — prompt files are immutable once shipped.
-    The system body has `{out_of_corpus_sentinel}` pre-substituted at load
-    time (imported from `src.pipeline.query` so both the answer prompt and
-    the judge prompt share the exact literal); the user template still
-    contains its per-request placeholders for the caller to fill.
-
-    Raises:
-      FileNotFoundError — no file at prompts/<role>/<version>.md.
-      ValueError — missing `# System` / `# User template` sections,
-        missing required placeholders in either section.
-    """
-    # Local import to avoid a package-level cycle with src.pipeline.query,
-    # which itself imports nothing from this module today but would create
-    # a circular import risk if that ever changes.
-    from src.pipeline.query import OUT_OF_CORPUS_SENTINEL
-
-    path = PROMPTS_DIR / role / f"{version}.md"
-    if not path.exists():
-        raise FileNotFoundError(f"prompt not found: {path}")
-    text = path.read_text(encoding="utf-8")
-
-    sys_idx = text.find(_SYSTEM_MARKER)
-    user_idx = text.find(_USER_TEMPLATE_MARKER)
-    if sys_idx == -1 or user_idx == -1 or user_idx <= sys_idx:
-        raise ValueError(
-            f"{path}: expected '{_SYSTEM_MARKER}' then '{_USER_TEMPLATE_MARKER}' sections"
-        )
-    raw_system = text[sys_idx + len(_SYSTEM_MARKER) : user_idx].strip()
-    user_template = text[user_idx + len(_USER_TEMPLATE_MARKER) :].strip()
-
-    # Fail fast on template drift.
-    #   - The system body MUST reference {out_of_corpus_sentinel}, or the
-    #     code constant and the prompt's actual instruction would silently
-    #     drift apart.
-    #   - The user template MUST contain every per-Q&A placeholder the
-    #     caller fills — otherwise a raw literal would be shipped to Claude.
-    if "{out_of_corpus_sentinel}" not in raw_system:
-        raise ValueError(
-            f"{path}: system body must reference '{{out_of_corpus_sentinel}}' "
-            f"so OUT_OF_CORPUS_SENTINEL stays the single source of truth."
-        )
-    required = (
-        "{question}",
-        "{gold_answer}",
-        "{gold_citations_block}",
-        "{model_answer}",
-        "{model_citations_block}",
-    )
-    missing = [p for p in required if p not in user_template]
-    if missing:
-        raise ValueError(
-            f"{path}: user template missing required placeholder(s): {', '.join(missing)}"
-        )
-
-    system_body = raw_system.format(out_of_corpus_sentinel=OUT_OF_CORPUS_SENTINEL)
-    return system_body, user_template
 
 
 def _parse_verdict(text: str) -> tuple[bool, bool, str]:
@@ -265,8 +163,9 @@ class ClaudeJudge:
         # the blog's cost story with no visible signal.
         if model not in PRICING:
             raise ValueError(
-                f"unknown Anthropic model {model!r}; add its price to PRICING "
-                f"in src/pipeline/generate.py before use. Known: {sorted(PRICING)}"
+                f"unknown Anthropic model {model!r}; add its price to "
+                f"ANTHROPIC_PRICING in src/pricing.py before use. "
+                f"Known: {sorted(PRICING)}"
             )
         self._model = model
         self._log_path = log_path
@@ -295,7 +194,11 @@ class ClaudeJudge:
         Raises `JudgeParseError` if the reply is not the strict-JSON contract.
         Raises any Anthropic exception the retry policy did not swallow.
         """
-        system_body, user_template = _load_prompt(PROMPT_ROLE, prompt_version)
+        system_body, user_template = load_prompt(
+            PROMPT_ROLE,
+            prompt_version,
+            required_user_placeholders=_REQUIRED_USER_PLACEHOLDERS,
+        )
         user_text = user_template.format(
             question=question,
             gold_answer=gold_answer,
@@ -315,7 +218,7 @@ class ClaudeJudge:
     @retry(
         stop=stop_after_attempt(5),
         wait=wait_exponential(multiplier=1, min=1, max=30),
-        retry=retry_if_exception(_is_retryable),
+        retry=retry_if_exception(is_retryable),
         reraise=True,
     )
     def _call(
@@ -345,7 +248,7 @@ class ClaudeJudge:
 
         input_tokens = int(getattr(response.usage, "input_tokens", 0) or 0)
         output_tokens = int(getattr(response.usage, "output_tokens", 0) or 0)
-        cost_usd = _cost_for(self._model, input_tokens, output_tokens)
+        cost_usd = cost_for(self._model, input_tokens, output_tokens)
 
         log_llm_call(
             self._log_path,
