@@ -279,7 +279,7 @@ def _format_ms(value: float | None) -> str:
     return f"{value:.0f}ms"
 
 
-def _scored_counts_by_type(results: list[QAResult]) -> dict[QAType, int]:
+def _per_type_counts(results: list[QAResult]) -> dict[QAType, int]:
     """Per-QAType count of records with a non-`None` judge verdict.
 
     Used to populate the `n` column of the per-type accuracy table in
@@ -309,7 +309,7 @@ def _write_summary_md(
     which Q&As did not score and why.
     """
     skipped = [r for r in results if r.error is not None]
-    per_type = _scored_counts_by_type(results)
+    per_type = _per_type_counts(results)
 
     lines: list[str] = []
     lines.append(f"# Eval run — {manifest['run_id']}")

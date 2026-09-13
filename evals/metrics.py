@@ -15,9 +15,10 @@ Design notes worth remembering:
     reads it don't drift. If either grows enough to justify a split, move
     the aggregator to `evals/aggregate.py` and keep the dataclasses here.
   - `hit_rate_at_k` is a fraction in [0, 1] — the count of gold docs that
-    appear in the top-k slice divided by k. Continuous instead of black-
-    and-white ("any gold hit vs. none") so a run that retrieves 3/5 gold
-    docs in a cross-source Q&A reads clearly better than one that gets 1/5.
+    appear in the top-k slice divided by the number of gold docs. Continuous
+    instead of black-and-white ("any gold hit vs. none") so a run that
+    retrieves 3/5 gold docs in a cross-source Q&A reads clearly better than
+    one that gets 1/5.
   - Percentiles use `statistics.quantiles(..., method="inclusive")` so
     single-item inputs return that item's value (numpy would raise).
     Small-sample p95 is a rough number by construction — we surface it
@@ -146,12 +147,17 @@ def hit_rate_at_k(
     gold_doc_paths: list[str],
     k: int = DEFAULT_K,
 ) -> float | None:
-    """Fraction of the top-k retrieved slots that are a gold doc_path.
+    """`(# distinct gold doc_paths in top-k) / (# gold doc_paths)`.
 
     A continuous rate rather than a boolean "any hit / no hit" — a run that
     retrieves 3/5 gold docs on a cross-source Q&A reads clearly better than
     one that gets 1/5, and averaging booleans across queries throws that
     signal away.
+
+    Denominator is the count of gold doc_paths (not `k`) — a gold set of two
+    with one hit in top-k reads as 0.5, not 0.2. Gold count uses `len` rather
+    than distinct so a gold set that lists the same doc_path twice weights
+    that doc_path twice; `recall_at_k` is the distinct-only variant.
 
     Returns `None` for out-of-corpus (no gold citations to hit). Returns
     0.0 when the pipeline retrieved nothing (avoids 0/0). The top-k slice
@@ -163,8 +169,9 @@ def hit_rate_at_k(
     top_k = retrieved_doc_paths[:k]
     if not top_k:
         return 0.0
-    gold_set = set(gold_doc_paths)
-    return sum(1 for p in top_k if p in gold_set) / len(top_k)
+    top_k_set = set(top_k)
+    hits = sum(1 for p in gold_doc_paths if p in top_k_set)
+    return hits / len(gold_doc_paths)
 
 
 def recall_at_k(

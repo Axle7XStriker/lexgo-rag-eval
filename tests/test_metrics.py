@@ -65,22 +65,22 @@ class TestCitationPrecision:
 
 
 class TestHitRateAtK:
-    def test_all_top_k_hit(self) -> None:
-        """Every retrieved slot is a gold doc → hit rate 1.0."""
+    def test_all_gold_present(self) -> None:
+        """Every gold doc appears in top-k → 1.0."""
         assert (
             hit_rate_at_k(
                 retrieved_doc_paths=["a", "b", "c", "d", "e"],
-                gold_doc_paths=["a", "b", "c", "d", "e"],
+                gold_doc_paths=["a", "b"],
             )
             == 1.0
         )
 
     def test_partial_hit(self) -> None:
-        """2 of the top 5 slots are gold → 0.4."""
+        """1 of 2 gold docs present in top-k → 0.5 (denominator is |gold|)."""
         assert hit_rate_at_k(
-            retrieved_doc_paths=["a", "x", "y", "b", "z"],
+            retrieved_doc_paths=["a", "x", "y", "z", "w"],
             gold_doc_paths=["a", "b"],
-        ) == pytest.approx(0.4)
+        ) == pytest.approx(0.5)
 
     def test_no_hit(self) -> None:
         """No gold in top-k → 0.0."""
@@ -110,6 +110,17 @@ class TestHitRateAtK:
     def test_empty_retrieval_zero(self) -> None:
         """Pipeline retrieved nothing but gold exists → 0.0 (no denom crash)."""
         assert hit_rate_at_k(retrieved_doc_paths=[], gold_doc_paths=["a"]) == 0.0
+
+    def test_duplicate_gold_weighted_by_gold_list(self) -> None:
+        """`|gold docs|` counts the raw list — duplicated gold weights the doc twice.
+
+        Distinguishes hit_rate_at_k from recall_at_k, which dedups gold.
+        """
+        # gold has "a" twice (weight 2) and "b" once; top-k covers "a" but not "b".
+        assert hit_rate_at_k(
+            retrieved_doc_paths=["a", "c", "d", "e", "f"],
+            gold_doc_paths=["a", "a", "b"],
+        ) == pytest.approx(2 / 3)
 
 
 class TestRecallAtK:
