@@ -5,7 +5,7 @@ marker handling, out-of-corpus prompt path, empty-retrieval short-circuit,
 context block format.
 
 Tests create a small prompt file rather than use the production prompt, so
-they exercise `_load_prompt` without coupling pipeline behaviour to any
+they exercise `load_prompt` without coupling pipeline behaviour to any
 production prompt's wording.
 """
 
@@ -16,11 +16,11 @@ from pathlib import Path
 
 import pytest
 
-from src.pipeline import query as query_module
+from src.pipeline import prompts as prompts_module
 from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.generate import GenerateResult
+from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import (
-    OUT_OF_CORPUS_SENTINEL,
     PROMPT_VERSION,
     _format_context,
     _parse_citations,
@@ -52,10 +52,10 @@ CTX:
 """,
         encoding="utf-8",
     )
-    query_module._load_prompt.cache_clear()
-    monkeypatch.setattr(query_module, "PROMPTS_DIR", tmp_path / "prompts")
+    prompts_module.load_prompt.cache_clear()
+    monkeypatch.setattr(prompts_module, "PROMPTS_DIR", tmp_path / "prompts")
     yield
-    query_module._load_prompt.cache_clear()
+    prompts_module.load_prompt.cache_clear()
 
 
 # ── Fake dependencies ────────────────────────────────────────────────
