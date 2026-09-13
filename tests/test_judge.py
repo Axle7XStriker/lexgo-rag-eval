@@ -47,7 +47,9 @@ def _judge_prompt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     a prompt-content edit doesn't break unit tests here.
     """
     prompt_path = tmp_path / "prompts" / "judge" / "v1.md"
-    prompt_path.parent.mkdir(parents=True)
+    # exist_ok=True: if another autouse fixture ever also creates prompts/
+    # under this tmp_path, the second one shouldn't blow up on FileExistsError.
+    prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(
         """---
 name: test-judge
@@ -198,6 +200,11 @@ class TestHappyPath:
         assert len(client.messages.calls) == 1
         call = client.messages.calls[0]
         assert call["model"] == "claude-sonnet-4-6"
+        # Reproducibility defaults: temperature 0.0 for deterministic verdicts;
+        # max_tokens 1024 (headroom for a verbose rationale + JSON envelope so
+        # a borderline Q&A doesn't truncate into a silent JudgeParseError).
+        assert call["temperature"] == 0.0
+        assert call["max_tokens"] == 1024
         # Sentinel substituted from the code constant, not a raw literal.
         assert OUT_OF_CORPUS_SENTINEL in call["system"]
         assert "{out_of_corpus_sentinel}" not in call["system"]
@@ -268,6 +275,45 @@ class TestParseErrors:
         )
         j = _make_judge(client=client, log_path=log_path)
         with pytest.raises(JudgeParseError, match="answer_correct"):
+            j.judge(**_judge_kwargs())
+
+    def test_empty_rationale_rejected(self, log_path: Path) -> None:
+        """A blank / whitespace-only rationale defeats the audit column — reject it."""
+        bad = json.dumps(
+            {
+                "answer_correct": True,
+                "citations_semantically_valid": True,
+                "rationale": "   ",
+            }
+        )
+        client = FakeClient(
+            messages=FakeMessagesAPI(
+                responses=[
+                    FakeMessage(
+                        content=[FakeTextBlock(text=bad)],
+                        usage=FakeUsage(input_tokens=1, output_tokens=1),
+                    )
+                ]
+            )
+        )
+        j = _make_judge(client=client, log_path=log_path)
+        with pytest.raises(JudgeParseError, match=r"rationale.*empty"):
+            j.judge(**_judge_kwargs())
+
+    def test_empty_response_content_rejected(self, log_path: Path) -> None:
+        """Zero text blocks → text=='' → not valid JSON → JudgeParseError."""
+        client = FakeClient(
+            messages=FakeMessagesAPI(
+                responses=[
+                    FakeMessage(
+                        content=[],  # no text blocks at all
+                        usage=FakeUsage(input_tokens=1, output_tokens=0),
+                    )
+                ]
+            )
+        )
+        j = _make_judge(client=client, log_path=log_path)
+        with pytest.raises(JudgeParseError, match="not valid JSON"):
             j.judge(**_judge_kwargs())
 
     def test_non_object_reply(self, log_path: Path) -> None:

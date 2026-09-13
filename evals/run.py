@@ -50,7 +50,6 @@ from evals.metrics import (
     RunMetrics,
     aggregate,
     citation_precision_programmatic,
-    hit_rate_at_k,
     qaresult_to_dict,
     recall_at_k,
     runmetrics_to_dict,
@@ -149,7 +148,6 @@ def _run_one(
             model_citation_doc_paths=[],
             retrieved_doc_paths_top10=[],
             citation_precision_programmatic=citation_precision_programmatic([], gold_doc_paths),
-            hit_rate_at_5=None,
             recall_at_5=None,
             judge_answer_correct=None,
             judge_citations_semantically_valid=None,
@@ -167,7 +165,6 @@ def _run_one(
     model_doc_paths = [c.doc_path for c in query_result.citations]
     retrieved_doc_paths = [c.doc_path for c in query_result.retrieved_chunks]
     prec = citation_precision_programmatic(model_doc_paths, gold_doc_paths)
-    hit5 = hit_rate_at_k(retrieved_doc_paths, gold_doc_paths, k=5)
     recall5 = recall_at_k(retrieved_doc_paths, gold_doc_paths, k=5)
 
     try:
@@ -195,7 +192,6 @@ def _run_one(
             model_citation_doc_paths=model_doc_paths,
             retrieved_doc_paths_top10=retrieved_doc_paths[:10],
             citation_precision_programmatic=prec,
-            hit_rate_at_5=hit5,
             recall_at_5=recall5,
             judge_answer_correct=None,
             judge_citations_semantically_valid=None,
@@ -220,7 +216,6 @@ def _run_one(
         model_citation_doc_paths=model_doc_paths,
         retrieved_doc_paths_top10=retrieved_doc_paths[:10],
         citation_precision_programmatic=prec,
-        hit_rate_at_5=hit5,
         recall_at_5=recall5,
         judge_answer_correct=verdict.answer_correct,
         judge_citations_semantically_valid=verdict.citations_semantically_valid,
@@ -343,13 +338,14 @@ def _write_summary_md(
         f"| citation precision (judge rate) | "
         f"{_format_pct(metrics.citation_precision_judge_rate)} |"
     )
-    lines.append(f"| hit-rate@{metrics.k} | {_format_pct(metrics.hit_at_k_rate)} |")
     lines.append(f"| mean recall@{metrics.k} | {_format_pct(metrics.mean_recall_at_k)} |")
     lines.append(f"| p50 latency | {_format_ms(metrics.p50_latency_ms)} |")
     lines.append(f"| p95 latency | {_format_ms(metrics.p95_latency_ms)} |")
     lines.append(f"| cost — generate | ${metrics.total_generate_cost_usd:.4f} |")
     lines.append(f"| cost — judge | ${metrics.total_judge_cost_usd:.4f} |")
-    lines.append(f"| cost — total | ${metrics.total_cost_usd:.4f} |")
+    lines.append(
+        f"| cost — generate + judge | ${metrics.total_generate_judge_cost_usd:.4f} |"
+    )
     lines.append("")
     lines.append("## Accuracy by QA type")
     lines.append("")
@@ -424,7 +420,11 @@ def main() -> int:
         return 0
 
     run_started = datetime.now(UTC)
-    run_id = f"eval_{run_started.strftime('%Y%m%dT%H%M%SZ')}"
+    # Microseconds in the id so two runs kicked off inside the same second
+    # (rerun-fast, accidental `make eval &`) get separate directories AND
+    # the `_snapshot_llm_calls` filter (`rec["run_id"] == run_id`) doesn't
+    # pull the other run's records into this run's snapshot.
+    run_id = f"eval_{run_started.strftime('%Y%m%dT%H%M%S_%fZ')}"
     run_dir = settings.evals_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
@@ -494,13 +494,13 @@ def main() -> int:
                 if qa_result.citation_precision_programmatic is not None
                 else "n/a"
             )
-            hit_str = (
-                f"{qa_result.hit_rate_at_5:.2f}" if qa_result.hit_rate_at_5 is not None else "n/a"
+            recall_str = (
+                f"{qa_result.recall_at_5:.2f}" if qa_result.recall_at_5 is not None else "n/a"
             )
             total_cost = qa_result.generate_cost_usd + qa_result.judge_cost_usd
             print(
                 f"  {marker} [{qa_result.qa_id}] {verdict_str}, "
-                f"cite_prec={cite_prec_str}, hit@5={hit_str}, "
+                f"cite_prec={cite_prec_str}, recall@5={recall_str}, "
                 f"${total_cost:.4f}, {qa_result.latency_ms / 1000:.1f}s  "
                 f"[{i}/{len(records)}]"
             )
@@ -537,7 +537,7 @@ def main() -> int:
             "wall_clock_seconds": round(wall_seconds, 2),
             "cost_usd_generate": round(metrics.total_generate_cost_usd, 6),
             "cost_usd_judge": round(metrics.total_judge_cost_usd, 6),
-            "cost_usd_total": round(metrics.total_cost_usd, 6),
+            "cost_usd_generate_judge": round(metrics.total_generate_judge_cost_usd, 6),
         },
         "metrics": runmetrics_to_dict(metrics),
     }
@@ -565,7 +565,6 @@ def main() -> int:
     print(
         f"  accuracy: {_format_pct(metrics.accuracy_overall)}    "
         f"cite_prec: {_format_pct(metrics.citation_precision_programmatic_mean)}    "
-        f"hit@{metrics.k}: {_format_pct(metrics.hit_at_k_rate)}    "
         f"recall@{metrics.k}: {_format_pct(metrics.mean_recall_at_k)}"
     )
     print(
@@ -575,7 +574,7 @@ def main() -> int:
     print(
         f"  cost     generate: ${metrics.total_generate_cost_usd:.4f}    "
         f"judge: ${metrics.total_judge_cost_usd:.4f}    "
-        f"total: ${metrics.total_cost_usd:.4f}"
+        f"generate+judge: ${metrics.total_generate_judge_cost_usd:.4f}"
     )
     artifacts_display = (
         run_dir.relative_to(REPO_ROOT) if run_dir.is_relative_to(REPO_ROOT) else run_dir

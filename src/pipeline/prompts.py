@@ -11,22 +11,46 @@ the parse rules or the sentinel literal.
 from __future__ import annotations
 
 import functools
+import re
 from pathlib import Path
 
 # Repo-relative prompts directory. `parents[2]` from `src/pipeline/prompts.py`
 # lands on the repo root — the same anchor query.py / judge.py used before.
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 
-# Section markers inside a prompt file. Markdown headings so the file also
-# renders well in a browser / editor preview.
-_SYSTEM_MARKER = "# System"
-_USER_TEMPLATE_MARKER = "# User template"
+# Section markers inside a prompt file. Anchored to line starts (re.MULTILINE)
+# rather than substring `find` — otherwise a body comment like
+# `contrast with the '# User template' section` would silently shift the
+# parsed boundary and truncate the system body.
+_SYSTEM_MARKER_RE = re.compile(r"^# System[ \t]*$", re.MULTILINE)
+_USER_TEMPLATE_MARKER_RE = re.compile(r"^# User template[ \t]*$", re.MULTILINE)
 
 # Exact sentinel string Claude must return when the context doesn't cover
 # the question. Threaded INTO both the answer and judge prompt templates as
 # `{out_of_corpus_sentinel}` so this constant is the single source of truth —
 # the prompt files cannot drift to a different literal string.
 OUT_OF_CORPUS_SENTINEL = "This isn't covered in the provided course materials."
+
+
+def _substitute(template: str, substitutions: dict[str, str]) -> str:
+    """Literal `{key}` → value substitution over an explicit allowlist.
+
+    Deliberately does NOT go through `str.format` / `str.format_map`. The
+    format mini-language treats `:` as the field/spec separator, so a
+    prompt body that contains a JSON example like
+    `{"answer_correct": true}` blows up with `ValueError: Invalid format
+    specifier` even under a passthrough dict. Plain per-key `str.replace`
+    is the only substitution semantic that leaves arbitrary `{…}` bodies
+    (JSON snippets, code fragments, hints like `avoid {backticks}`) alone
+    while still filling our intended placeholders.
+
+    Consequence: only exact `{key}` tokens are substituted. `{ key }` (with
+    spaces), `{{key}}` (doubled), and any nested/computed field-name syntax
+    is left as-is. That's the intended contract.
+    """
+    for key, value in substitutions.items():
+        template = template.replace("{" + key + "}", value)
+    return template
 
 
 @functools.cache
@@ -48,24 +72,29 @@ def load_prompt(
     template or loading fails fast (would otherwise ship a raw literal to
     Claude).
 
+    Substitution is per-key `str.replace` over an explicit allowlist (see
+    `_substitute`), so any `{...}` in the body that isn't a listed placeholder
+    (JSON schema examples, code, literal `{backticks}`) is delivered as-is.
+
     Raises:
       FileNotFoundError — no file at prompts/<role>/<version>.md.
-      ValueError — missing `# System` / `# User template` sections, missing
-        required placeholders in either section.
+      ValueError — missing `# System` / `# User template` line-anchored
+        section headers, or missing required placeholders in either section.
     """
     path = PROMPTS_DIR / role / f"{version}.md"
     if not path.exists():
         raise FileNotFoundError(f"prompt not found: {path}")
     text = path.read_text(encoding="utf-8")
 
-    sys_idx = text.find(_SYSTEM_MARKER)
-    user_idx = text.find(_USER_TEMPLATE_MARKER)
-    if sys_idx == -1 or user_idx == -1 or user_idx <= sys_idx:
+    sys_match = _SYSTEM_MARKER_RE.search(text)
+    user_match = _USER_TEMPLATE_MARKER_RE.search(text)
+    if sys_match is None or user_match is None or user_match.start() <= sys_match.start():
         raise ValueError(
-            f"{path}: expected '{_SYSTEM_MARKER}' then '{_USER_TEMPLATE_MARKER}' sections"
+            f"{path}: expected '# System' then '# User template' section headers "
+            f"(each on its own line)"
         )
-    raw_system = text[sys_idx + len(_SYSTEM_MARKER) : user_idx].strip()
-    user_template = text[user_idx + len(_USER_TEMPLATE_MARKER) :].strip()
+    raw_system = text[sys_match.end() : user_match.start()].strip()
+    user_template = text[user_match.end() :].strip()
 
     # Fail fast on template drift.
     #   - The system body MUST reference {out_of_corpus_sentinel}, or the
@@ -84,5 +113,16 @@ def load_prompt(
             f"{path}: user template missing required placeholder(s): {', '.join(missing)}"
         )
 
-    system_body = raw_system.format(out_of_corpus_sentinel=OUT_OF_CORPUS_SENTINEL)
+    system_body = _substitute(raw_system, {"out_of_corpus_sentinel": OUT_OF_CORPUS_SENTINEL})
     return system_body, user_template
+
+
+def render_user_template(user_template: str, substitutions: dict[str, str]) -> str:
+    """Substitute `substitutions` into `user_template` with the safe allowlist.
+
+    Same `{key}` syntax as before, but implemented via per-key `str.replace`
+    so unknown `{...}` tokens in the template (JSON snippets, code) pass
+    through untouched and can't raise KeyError / ValueError at fill time.
+    Use this at every call site that fills a prompt's user template.
+    """
+    return _substitute(user_template, substitutions)

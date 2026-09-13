@@ -1,12 +1,11 @@
 """Pure-function metrics for the eval loop — no I/O, no side effects.
 
 Two families of helpers:
-  1. Per-Q&A metrics — `citation_precision_programmatic`, `hit_rate_at_k`,
-     `recall_at_k`. Citation precision is always defined (every combination
-     of empty / non-empty model & gold citation sets carries a signal).
-     Retrieval metrics return `None` only for out-of-corpus (no gold docs
-     means no retrieval ground truth). The aggregator skips `None`s from
-     denominators.
+  1. Per-Q&A metrics — `citation_precision_programmatic`, `recall_at_k`.
+     Citation precision is always defined (every combination of empty /
+     non-empty model & gold citation sets carries a signal). `recall_at_k`
+     returns `None` only for out-of-corpus (no gold docs means no retrieval
+     ground truth). The aggregator skips `None`s from denominators.
   2. `QAResult` + `RunMetrics` dataclasses — the frozen record shapes
      `evals/run.py` persists per Q&A and aggregates at the end of a run.
 
@@ -14,15 +13,18 @@ Design notes worth remembering:
   - Kept adjacent to the aggregator so the record shape and the code that
     reads it don't drift. If either grows enough to justify a split, move
     the aggregator to `evals/aggregate.py` and keep the dataclasses here.
-  - `hit_rate_at_k` is a fraction in [0, 1] — the count of gold docs that
-    appear in the top-k slice divided by the number of gold docs. Continuous
-    instead of black-and-white ("any gold hit vs. none") so a run that
-    retrieves 3/5 gold docs in a cross-source Q&A reads clearly better than
-    one that gets 1/5.
+  - Only `recall_at_k` is exposed as the retrieval headline. An earlier
+    `hit_rate_at_k` was multiplicity-weighted over the gold list and either
+    collapsed to `recall_at_k` (distinct gold) or inflated it (duplicated
+    gold doc_path from multi-page factual Q&As) — misleading either way.
   - Percentiles use `statistics.quantiles(..., method="inclusive")` so
     single-item inputs return that item's value (numpy would raise).
     Small-sample p95 is a rough number by construction — we surface it
     for anomaly detection, not for capacity planning.
+  - `total_generate_judge_cost_usd` is exactly what it says: the Anthropic
+    generate + judge spend. Voyage embed spend is logged per-call in
+    `logs/llm_calls.jsonl` but not aggregated here — the field name is
+    honest about that scope so external reports don't misquote it.
 """
 
 from __future__ import annotations
@@ -69,7 +71,6 @@ class QAResult:
     # `float | None` — `None` iff out-of-corpus (no gold docs, so no
     # retrieval ground truth to score against). Skipped records also carry
     # None here (populated by the eval loop's error path).
-    hit_rate_at_5: float | None
     recall_at_5: float | None
     judge_answer_correct: bool | None
     judge_citations_semantically_valid: bool | None
@@ -92,9 +93,12 @@ class RunMetrics:
     (non-skipped) record; missing types are absent, not 0.0 — a report that
     reads 0.0 accuracy on a type with zero samples would be misleading.
 
-    `k` is the retrieval slice depth for the hit-rate + recall aggregates
-    (fixed at 5 today; captured explicitly so future P2..P4 runs that vary
-    it are unambiguous in the manifest).
+    `k` is the retrieval slice depth for the recall aggregate (fixed at 5
+    today; captured explicitly so future P2..P4 runs that vary it are
+    unambiguous in the manifest).
+
+    `total_generate_judge_cost_usd` sums Anthropic generate + judge spend
+    only. Voyage embed spend is NOT included — see the module docstring.
     """
 
     n_records: int  # total records loaded from qa.jsonl
@@ -105,13 +109,12 @@ class RunMetrics:
     citation_precision_programmatic_mean: float | None = None
     citation_precision_judge_rate: float | None = None
     k: int = DEFAULT_K
-    hit_at_k_rate: float | None = None
     mean_recall_at_k: float | None = None
     p50_latency_ms: float | None = None
     p95_latency_ms: float | None = None
     total_generate_cost_usd: float = 0.0
     total_judge_cost_usd: float = 0.0
-    total_cost_usd: float = 0.0
+    total_generate_judge_cost_usd: float = 0.0
 
 
 # ── Per-Q&A metrics ───────────────────────────────────────────────────
@@ -142,38 +145,6 @@ def citation_precision_programmatic(
     return hits / len(model_doc_paths)
 
 
-def hit_rate_at_k(
-    retrieved_doc_paths: list[str],
-    gold_doc_paths: list[str],
-    k: int = DEFAULT_K,
-) -> float | None:
-    """`(# distinct gold doc_paths in top-k) / (# gold doc_paths)`.
-
-    A continuous rate rather than a boolean "any hit / no hit" — a run that
-    retrieves 3/5 gold docs on a cross-source Q&A reads clearly better than
-    one that gets 1/5, and averaging booleans across queries throws that
-    signal away.
-
-    Denominator is the count of gold doc_paths (not `k`) — a gold set of two
-    with one hit in top-k reads as 0.5, not 0.2. Gold count uses `len` rather
-    than distinct so a gold set that lists the same doc_path twice weights
-    that doc_path twice; `recall_at_k` is the distinct-only variant.
-
-    Returns `None` for out-of-corpus (no gold citations to hit). Returns
-    0.0 when the pipeline retrieved nothing (avoids 0/0). The top-k slice
-    is taken with `[:k]` — pipelines that return fewer than k chunks are
-    handled naturally.
-    """
-    if not gold_doc_paths:
-        return None
-    top_k = retrieved_doc_paths[:k]
-    if not top_k:
-        return 0.0
-    top_k_set = set(top_k)
-    hits = sum(1 for p in gold_doc_paths if p in top_k_set)
-    return hits / len(gold_doc_paths)
-
-
 def recall_at_k(
     retrieved_doc_paths: list[str],
     gold_doc_paths: list[str],
@@ -184,6 +155,10 @@ def recall_at_k(
     Returns `None` for out-of-corpus (denominator would be zero). Distinctness
     is on both sides — a gold set with the same doc_path listed twice still
     counts as one target, and a retrieved list with duplicates gets one hit.
+
+    When `len(gold) > k`, the metric caps at `k / len(gold)` even if every
+    top-k slot is a gold hit — the top-k window physically can't cover more
+    distinct docs than it has slots. That's the honest reading, not a bug.
     """
     if not gold_doc_paths:
         return None
@@ -278,10 +253,8 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
     ]
     citation_precision_judge_rate = _rate_or_none(cite_judge_bools)
 
-    # Retrieval hit-rate + recall over in-corpus Q&As (out-of-corpus rows had
-    # both metrics set to None by the per-Q&A helpers above).
-    hit_rates = [r.hit_rate_at_5 for r in evaluated if r.hit_rate_at_5 is not None]
-    hit_at_k_rate = _mean_or_none(hit_rates)
+    # Retrieval recall over in-corpus Q&As (out-of-corpus rows had recall
+    # set to None by the per-Q&A helper above).
     recall_values = [r.recall_at_5 for r in evaluated if r.recall_at_5 is not None]
     mean_recall_at_k = _mean_or_none(recall_values)
 
@@ -304,13 +277,12 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
         citation_precision_programmatic_mean=citation_precision_programmatic_mean,
         citation_precision_judge_rate=citation_precision_judge_rate,
         k=k,
-        hit_at_k_rate=hit_at_k_rate,
         mean_recall_at_k=mean_recall_at_k,
         p50_latency_ms=p50,
         p95_latency_ms=p95,
         total_generate_cost_usd=total_gen,
         total_judge_cost_usd=total_judge,
-        total_cost_usd=total_gen + total_judge,
+        total_generate_judge_cost_usd=total_gen + total_judge,
     )
 
 
@@ -329,7 +301,6 @@ def qaresult_to_dict(r: QAResult) -> dict[str, Any]:
         "model_citation_doc_paths": r.model_citation_doc_paths,
         "retrieved_doc_paths_top10": r.retrieved_doc_paths_top10,
         "citation_precision_programmatic": r.citation_precision_programmatic,
-        "hit_rate_at_5": r.hit_rate_at_5,
         "recall_at_5": r.recall_at_5,
         "judge_answer_correct": r.judge_answer_correct,
         "judge_citations_semantically_valid": r.judge_citations_semantically_valid,
@@ -356,11 +327,10 @@ def runmetrics_to_dict(m: RunMetrics) -> dict[str, Any]:
         "citation_precision_programmatic_mean": m.citation_precision_programmatic_mean,
         "citation_precision_judge_rate": m.citation_precision_judge_rate,
         "k": m.k,
-        "hit_at_k_rate": m.hit_at_k_rate,
         "mean_recall_at_k": m.mean_recall_at_k,
         "p50_latency_ms": (round(m.p50_latency_ms, 2) if m.p50_latency_ms is not None else None),
         "p95_latency_ms": (round(m.p95_latency_ms, 2) if m.p95_latency_ms is not None else None),
         "total_generate_cost_usd": round(m.total_generate_cost_usd, 6),
         "total_judge_cost_usd": round(m.total_judge_cost_usd, 6),
-        "total_cost_usd": round(m.total_cost_usd, 6),
+        "total_generate_judge_cost_usd": round(m.total_generate_judge_cost_usd, 6),
     }

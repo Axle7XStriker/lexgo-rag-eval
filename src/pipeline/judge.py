@@ -45,9 +45,16 @@ from src.pipeline.anthropic_utils import (
     cost_for,
     is_retryable,
 )
-from src.pipeline.prompts import load_prompt
+from src.pipeline.prompts import load_prompt, render_user_template
 
-DEFAULT_MAX_TOKENS = 512
+# Aligned with the generator's 1024. The judge's payload is a 1-3 sentence
+# rationale plus a short strict-JSON envelope — well under 1024 in the common
+# case — but 512 was tight enough that a verbose rationale on a borderline
+# Q&A could stop the reply mid-JSON, trip _parse_verdict, and silently skip
+# the record. Extra headroom costs pennies; a silently-skipped Q&A costs
+# more (and the operator only sees it as "skip: JSON parse error", not as
+# "max_tokens truncation").
+DEFAULT_MAX_TOKENS = 1024
 
 # `role` + `version` locate the prompt file at prompts/<role>/<version>.md.
 # Bump PROMPT_VERSION on any semantic change to the judge prompt; captured
@@ -130,6 +137,11 @@ def _parse_verdict(text: str) -> tuple[bool, bool, str]:
         raise JudgeParseError(
             f"judge reply key 'rationale' must be a str, got {type(obj['rationale']).__name__}"
         )
+    # Empty / whitespace-only rationale defeats the whole point of the field
+    # (it's the audit column in summary.md for borderline verdicts). Reject
+    # instead of quietly storing "" and calling the record valid.
+    if not obj["rationale"].strip():
+        raise JudgeParseError("judge reply key 'rationale' must not be empty")
     return obj["answer_correct"], obj["citations_semantically_valid"], obj["rationale"]
 
 
@@ -199,12 +211,15 @@ class ClaudeJudge:
             prompt_version,
             required_user_placeholders=_REQUIRED_USER_PLACEHOLDERS,
         )
-        user_text = user_template.format(
-            question=question,
-            gold_answer=gold_answer,
-            gold_citations_block=_format_citations_block(gold_citation_doc_paths),
-            model_answer=model_answer,
-            model_citations_block=_format_citations_block(model_citation_doc_paths),
+        user_text = render_user_template(
+            user_template,
+            {
+                "question": question,
+                "gold_answer": gold_answer,
+                "gold_citations_block": _format_citations_block(gold_citation_doc_paths),
+                "model_answer": model_answer,
+                "model_citations_block": _format_citations_block(model_citation_doc_paths),
+            },
         )
         return self._call(
             system=system_body,

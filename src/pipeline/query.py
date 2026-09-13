@@ -25,7 +25,7 @@ from src.observability import get_logger
 from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
-from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL, load_prompt
+from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL, load_prompt, render_user_template
 from src.pipeline.store import RetrievedChunk, VectorStore
 
 _logger = get_logger("query")
@@ -202,7 +202,10 @@ def answer_question(
         )
 
     context_block = _format_context(retrieved)
-    user_text = user_template.format(question=query, context=context_block)
+    user_text = render_user_template(
+        user_template,
+        {"question": query, "context": context_block},
+    )
     gen = generator.generate(
         system=system_body,
         user=user_text,

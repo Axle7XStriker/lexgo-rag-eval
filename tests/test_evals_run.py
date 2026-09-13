@@ -495,3 +495,54 @@ class TestMainSkipRecovery:
         # Skipped section lists each Q&A ID.
         assert "`f001`" in summary
         assert "`x001`" in summary
+
+    def test_judge_exception_becomes_skip_but_preserves_pipeline_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
+    ) -> None:
+        """A raised exception from the judge becomes a skipped QAResult BUT the
+        model_answer, programmatic metrics, and generator cost are preserved —
+        the pipeline output still cost us money and is worth keeping for audit.
+        Exit code is 0; aggregate accuracy denominator excludes the skipped row.
+        """
+
+        class _BoomJudge:
+            def judge(self, **kwargs):
+                raise RuntimeError("judge blew up")
+
+        monkeypatch.setattr(run_module, "ClaudeJudge", lambda **_k: _BoomJudge())
+
+        qa_path = tmp_path / "evals" / "golden" / "qa.jsonl"
+        _write_qa_jsonl(qa_path, _valid_records()[:2])
+        monkeypatch.setattr(sys, "argv", ["evals.run", "--qa-path", str(qa_path)])
+
+        exit_code = run_module.main()
+        assert exit_code == 0
+
+        settings = run_module.get_settings()
+        run_dir = next((settings.evals_dir).glob("eval_*"))
+        results = [json.loads(li) for li in (run_dir / "results.jsonl").read_text().splitlines()]
+        assert len(results) == 2
+        assert all(r["error"] is not None for r in results)
+        assert all("judge_failed" in r["error"] for r in results)
+
+        # Judge fields are None; pipeline output + programmatic metrics survive.
+        for r in results:
+            assert r["judge_answer_correct"] is None
+            assert r["judge_citations_semantically_valid"] is None
+            assert r["judge_rationale"] is None
+            assert r["model_answer"] != ""
+            assert r["recall_at_5"] is not None
+            assert r["citation_precision_programmatic"] is not None
+            # Generator cost preserved (we paid for it); judge cost zero.
+            assert r["generate_cost_usd"] > 0
+            assert r["judge_cost_usd"] == 0.0
+
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        assert manifest["totals"]["n_evaluated"] == 0
+        assert manifest["totals"]["n_skipped"] == 2
+        # accuracy_overall is None (no successfully scored records).
+        assert manifest["metrics"]["accuracy_overall"] is None
