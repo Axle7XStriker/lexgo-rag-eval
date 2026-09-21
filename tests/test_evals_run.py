@@ -23,12 +23,14 @@ import pytest
 
 from evals import run as run_module
 from src.pipeline import prompts as prompts_module
-from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.generate import GenerateResult
 from src.pipeline.judge import JudgeResult
+from src.pipeline.pipeline_config import get_pipeline
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import PROMPT_VERSION
 from src.pipeline.store import RetrievedChunk
+
+_P1_CFG = get_pipeline("p1")
 
 # ── Prompt fixture ────────────────────────────────────────────────────
 
@@ -374,10 +376,20 @@ class TestMainHappyPath:
         # manifest.json: has git_sha, prompt versions, config, metrics.
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert manifest["git_sha"] == "deadbeef1234"
-        assert manifest["pipeline"] == PIPELINE_TAG
+        assert manifest["pipeline"] == _P1_CFG.tag
         assert manifest["prompt_versions"] == {"answer": "v1", "judge": "v1"}
-        assert manifest["config"]["chat_model"] == "claude-sonnet-4-6"
-        assert manifest["config"]["top_k"] == 10
+        # Pipeline config is fully nested + self-describing.
+        pipeline_cfg = manifest["config"]["pipeline"]
+        assert pipeline_cfg["tag"] == _P1_CFG.tag
+        assert pipeline_cfg["key"] == "p1"
+        assert pipeline_cfg["chunker"]["algorithm"] == "fixed"
+        assert pipeline_cfg["chunker"]["target_tokens"] == 500
+        assert pipeline_cfg["chunker"]["overlap_tokens"] == 50
+        assert pipeline_cfg["retriever"]["kind"] == "dense"
+        assert pipeline_cfg["retriever"]["top_k"] == 10
+        assert pipeline_cfg["reranker"] is None
+        # Provider identities kept separately — not part of pipeline identity.
+        assert manifest["config"]["models"]["chat_model"] == "claude-sonnet-4-6"
         assert manifest["golden_set"]["n_records_loaded"] == 5
         assert manifest["totals"]["n_evaluated"] == 5
         assert manifest["totals"]["n_skipped"] == 0

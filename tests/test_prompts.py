@@ -96,9 +96,7 @@ class TestSafePlaceholderPassthrough:
             "v1",
             required_user_placeholders=("{question}", "{context}"),
         )
-        rendered = render_user_template(
-            user_template, {"question": "what?", "context": "ctx-body"}
-        )
+        rendered = render_user_template(user_template, {"question": "what?", "context": "ctx-body"})
         assert "Q: what?" in rendered
         assert "CTX: ctx-body" in rendered
         # Unfilled JSON example survives verbatim.

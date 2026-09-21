@@ -35,9 +35,10 @@ from typing import Any
 
 from src.qa_schema import QAType
 
-# Fixed for the P1 baseline (matches the pipeline's DEFAULT_TOP_K // 2 headline
-# metric — dense top-10 retrieval, headline slice at 5). Baked into the
-# QAResult field names because the eval loop only reports one k today.
+# Recall-at-K headline slice. Set to half of P1's top_k=10 so recall@5 stays
+# a meaningful "top of the retrieval" number even as the retriever fans out
+# further. Baked into the QAResult field names because the eval loop only
+# reports one k today.
 DEFAULT_K = 5
 
 

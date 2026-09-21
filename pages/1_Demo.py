@@ -15,13 +15,17 @@ import streamlit as st
 
 from src.config import Settings
 from src.observability import get_logger
-from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
+from src.pipeline.pipeline_config import get_pipeline
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
-from src.pipeline.query import DEFAULT_TOP_K, QueryResult, answer_question
+from src.pipeline.query import QueryResult, answer_question
 from src.pipeline.store import VectorStore
 from src.ui_helpers import load_settings_or_stop, render_page_header, render_sidebar
+
+# Demo is P1 only until P2/P3/P4 land. Config lives in pipeline_config so a
+# knob change re-derives the tag automatically and lands on new DB rows.
+_P1_CFG = get_pipeline("p1")
 
 st.set_page_config(page_title="lexgo — demo", page_icon="📚", layout="wide")
 
@@ -92,8 +96,7 @@ with st.form("query_form", clear_on_submit=False):
     question = st.text_area(
         "Ask a question about MIT 6.006 or 6.830",
         placeholder=(
-            "e.g. What's the worst-case complexity of quicksort "
-            "with median-of-medians pivot?"
+            "e.g. What's the worst-case complexity of quicksort with median-of-medians pivot?"
         ),
         key="demo_question",
     )
@@ -116,8 +119,8 @@ if submitted:
                     embedder=embedder,
                     store=store,
                     generator=generator,
-                    pipeline_tag=PIPELINE_TAG,
-                    top_k=DEFAULT_TOP_K,
+                    pipeline_tag=_P1_CFG.tag,
+                    top_k=_P1_CFG.retriever.top_k,
                     run_id=run_id,
                 )
             st.session_state["last_result"] = result
