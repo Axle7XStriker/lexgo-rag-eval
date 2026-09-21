@@ -160,7 +160,22 @@ PIPELINES: dict[str, PipelineConfig] = {
         retriever=RetrieverConfig(kind="dense", top_k=10),
         reranker=None,
     ),
-    # P2/P3/P4 slot in here in subsequent PRs.
+    "p2": PipelineConfig(
+        key="p2",
+        chunker=ChunkerConfig(
+            algorithm="semantic",
+            # `target_tokens` documents the intended band center; the
+            # semantic chunker doesn't cut ON it, but min/max are anchored
+            # around it so P2 chunks are roughly comparable in size to P1.
+            target_tokens=500,
+            percentile_threshold=95.0,
+            min_tokens=200,
+            max_tokens=750,
+        ),
+        retriever=RetrieverConfig(kind="dense", top_k=10),
+        reranker=None,
+    ),
+    # P3/P4 slot in here in subsequent PRs.
 }
 
 

@@ -56,6 +56,47 @@ class TestP1RegressionGuard:
         assert PIPELINES["p1"].reranker is None
 
 
+class TestP2RegressionGuard:
+    """P2's knobs match the semantic-chunker defaults declared in the plan.
+
+    Values here anchor the "P1 → P2 delta" story — regressing any of them
+    silently reshapes what P2 is measuring vs P1. If P2 numbers land badly
+    and someone wants to tune, the new tag will land on new DB rows so old
+    P2 data survives for A/B — but only if this test's threshold values
+    are updated deliberately at the same time."""
+
+    def test_p2_registered(self) -> None:
+        assert "p2" in PIPELINES
+
+    def test_p2_chunker_knobs(self) -> None:
+        cfg = PIPELINES["p2"]
+        assert cfg.key == "p2"
+        assert cfg.chunker.algorithm == "semantic"
+        assert cfg.chunker.percentile_threshold == 95.0
+        assert cfg.chunker.min_tokens == 200
+        assert cfg.chunker.max_tokens == 750
+        assert cfg.chunker.encoding == "cl100k_base"
+
+    def test_p2_retriever_matches_p1(self) -> None:
+        # P2's whole job is to isolate the CHUNKING effect. The retriever
+        # (dense top-10) MUST match P1 or the A/B is confounded.
+        assert PIPELINES["p2"].retriever == PIPELINES["p1"].retriever
+
+    def test_p2_no_reranker(self) -> None:
+        assert PIPELINES["p2"].reranker is None
+
+    def test_p2_tag_starts_with_readable_prefix(self) -> None:
+        # Confirms `_readable_prefix` handles the semantic branch and
+        # renders the threshold as `p<int>` — the debug-time affordance.
+        assert PIPELINES["p2"].tag.startswith("p2_semantic_p95_")
+
+    def test_p1_and_p2_tags_distinct(self) -> None:
+        # Trivially true (different keys → different prefixes) but the
+        # invariant is worth pinning: no scenario ever collapses two
+        # pipelines onto the same DB tag.
+        assert PIPELINES["p1"].tag != PIPELINES["p2"].tag
+
+
 class TestGetPipeline:
     def test_known_key(self) -> None:
         assert get_pipeline("p1") is PIPELINES["p1"]

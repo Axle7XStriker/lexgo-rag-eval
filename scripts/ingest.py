@@ -55,6 +55,7 @@ from scripts.corpus_manifest import MANIFEST, ManifestEntry
 from src.config import get_settings
 from src.observability import configure_logging, get_logger
 from src.pipeline.chunk import Chunk, chunk_fixed
+from src.pipeline.chunk_semantic import chunk_semantic
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.extract import ExtractedDoc, extract_pdf
 from src.pipeline.pipeline_config import PIPELINES, PipelineConfig, get_pipeline
@@ -455,10 +456,13 @@ def _build_chunker(
     algorithm = cfg.chunker.algorithm
     if algorithm == "fixed":
         return lambda doc: chunk_fixed(doc, cfg.chunker)
-    # `embedder` is unused for "fixed" but referenced by the semantic branch
-    # that lands in PR 2; kept as an explicit dependency so main() has one
-    # place to wire it.
-    _ = embedder, run_id
+    if algorithm == "semantic":
+        return lambda doc: chunk_semantic(
+            doc,
+            embedder=embedder,
+            config=cfg.chunker,
+            run_id=run_id,
+        )
     raise ValueError(f"no chunker registered for algorithm={algorithm!r}")
 
 
