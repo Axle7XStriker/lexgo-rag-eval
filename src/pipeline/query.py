@@ -1,9 +1,8 @@
 """Query pipeline — query → embed → dense retrieve → generate answer with citations.
 
-One public entrypoint: `answer_question(...)`. Callers pass the pipeline's
-`pipeline_tag` and `top_k` explicitly (derived from `PipelineConfig`), so
-the same function serves every dense-retrieval pipeline (P1/P2). Hybrid
-+ rerank variants (P3/P4) wrap or extend this flow.
+One public entrypoint: `answer_question(...)`. Takes already-built dependencies
+(embedder, store, generator) so tests can inject fakes and Streamlit / eval
+callers can share connections.
 
 Design notes worth remembering:
   - No client construction here. All I/O flows through the injected

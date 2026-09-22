@@ -27,11 +27,6 @@ from src.pipeline.extract import ExtractedDoc
 from src.pipeline.hashing import PAGE_JOIN, sha256_utf8
 from src.pipeline.pipeline_config import ChunkerConfig
 
-# Tokenizer choice, NOT a pipeline knob — kept here so both the fixed and
-# semantic chunkers reference the same constant and produce like-for-like
-# `num_tokens` values across algorithms.
-DEFAULT_ENCODING = "cl100k_base"
-
 
 @dataclass(frozen=True)
 class Chunk:

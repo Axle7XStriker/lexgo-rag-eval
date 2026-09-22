@@ -27,11 +27,8 @@ Design notes worth remembering:
     reuse an existing tag. Adding a field to `ChunkerConfig` therefore never
     creates a stealth data-mixing bug.
   - `_config_hash` uses the full `asdict(self)`, so every field participates.
-    `test_pipeline_config.py` mutates each field one at a time and asserts
-    `.tag` changes each time — the guard that makes this trustworthy.
   - Configs are frozen dataclasses so accidental mutation raises rather than
-    corrupts the registry. `dataclasses.replace(cfg, ...)` for controlled
-    edits (used by tests).
+    corrupts the registry.
   - `key` is the CLI-facing short name (`"p1"`); `tag` is the DB-facing
     unique identifier. Two different concepts, don't conflate.
 """
@@ -42,10 +39,6 @@ import hashlib
 import json
 from dataclasses import asdict, dataclass
 from typing import Any, Literal
-
-# Chunker knob defaults ship as module constants inside `ChunkerConfig`
-# instances (below). No top-level DEFAULT_* here — the registry IS the
-# defaults.
 
 
 @dataclass(frozen=True)

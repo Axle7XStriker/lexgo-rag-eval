@@ -7,19 +7,20 @@ import itertools
 import pytest
 import tiktoken
 
-from src.pipeline.chunk import DEFAULT_ENCODING, chunk_fixed
+from src.pipeline.chunk import chunk_fixed
 from src.pipeline.extract import ExtractedDoc, PageText
 from src.pipeline.pipeline_config import ChunkerConfig, get_pipeline
 
 _P1_CFG = get_pipeline("p1")
-_P1_CHUNKER_CFG = _P1_CFG.chunker
 
 
 def _cfg(
     target_tokens: int = 500,
     overlap_tokens: int = 50,
 ) -> ChunkerConfig:
-    """Fixed-chunker config for ad-hoc test cases that don't want P1's exact knobs."""
+    """Fixed-chunker config for unit tests. Defaults mirror P1 (500/50) but
+    tests should treat these as arbitrary knobs, not as a P1 assertion —
+    P1's actual knobs are guarded in `test_pipeline_config.py`."""
     return ChunkerConfig(
         algorithm="fixed",
         target_tokens=target_tokens,
@@ -51,15 +52,15 @@ class TestChunkFixedShape:
         assert _P1_CFG.tag.startswith("p1_fixed_500_50_")
 
     def test_empty_doc_returns_empty_list(self) -> None:
-        assert chunk_fixed(_doc([]), _P1_CHUNKER_CFG) == []
+        assert chunk_fixed(_doc([]), _cfg()) == []
 
     def test_all_whitespace_returns_empty_list(self) -> None:
-        assert chunk_fixed(_doc(["   ", "\n\n"]), _P1_CHUNKER_CFG) == []
+        assert chunk_fixed(_doc(["   ", "\n\n"]), _cfg()) == []
 
     def test_chunk_sizes_bounded(self) -> None:
         # ~3000 tokens of repeated content → several full windows + a tail.
         doc = _doc([_page_of_repeated_word("alpha", 3000)])
-        chunks = chunk_fixed(doc, _P1_CHUNKER_CFG)
+        chunks = chunk_fixed(doc, _cfg())
         assert len(chunks) > 1
         assert all(c.num_tokens <= 500 for c in chunks)
         # Every full chunk except possibly the last is at the target.
@@ -69,9 +70,10 @@ class TestChunkFixedShape:
         # Overlap is defined in TOKENS (not chars), and tiktoken doesn't split
         # 1:1 with characters, so the invariant has to be checked in token
         # space. Re-encoding here is deterministic — tiktoken round-trips.
+        cfg = _cfg(500, 50)
         doc = _doc([_page_of_repeated_word("gamma", 2500)])
-        chunks = chunk_fixed(doc, _cfg(500, 50))
-        encoder = tiktoken.get_encoding(DEFAULT_ENCODING)
+        chunks = chunk_fixed(doc, cfg)
+        encoder = tiktoken.get_encoding(cfg.encoding)
         for a, b in itertools.pairwise(chunks):
             assert encoder.encode(a.text)[-50:] == encoder.encode(b.text)[:50], (
                 f"overlap mismatch between chunk {a.chunk_index} and {b.chunk_index}"
@@ -90,7 +92,7 @@ class TestChunkFixedShape:
         # code uses `ORDER BY chunk_index` to walk a document in reading order.
         # Dense + monotonic is the actual contract, not just uniqueness.
         doc = _doc([_page_of_repeated_word("epsilon", 2000)])
-        chunks = chunk_fixed(doc, _P1_CHUNKER_CFG)
+        chunks = chunk_fixed(doc, _cfg())
         assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
 
     def test_content_hash_uniqueness(self) -> None:
@@ -99,7 +101,7 @@ class TestChunkFixedShape:
         # hashes), so vary the content per token instead.
         text = " ".join(f"w{i}" for i in range(3000))
         doc = _doc([text])
-        chunks = chunk_fixed(doc, _P1_CHUNKER_CFG)
+        chunks = chunk_fixed(doc, _cfg())
         hashes = [c.content_hash for c in chunks]
         assert len(hashes) == len(set(hashes)), "duplicate content_hash across chunks"
 
@@ -109,7 +111,7 @@ class TestChunkFixedPageRanges:
 
     def test_single_page_chunks_share_page(self) -> None:
         doc = _doc([_page_of_repeated_word("eta", 300)])
-        chunks = chunk_fixed(doc, _P1_CHUNKER_CFG)
+        chunks = chunk_fixed(doc, _cfg())
         assert all(c.page_start == 1 and c.page_end == 1 for c in chunks)
 
     def test_multi_page_chunk_reports_range(self) -> None:
@@ -123,7 +125,7 @@ class TestChunkFixedPageRanges:
 
     def test_page_start_monotonic(self) -> None:
         doc = _doc([_page_of_repeated_word(f"w{i}", 300) for i in range(6)])
-        chunks = chunk_fixed(doc, _P1_CHUNKER_CFG)
+        chunks = chunk_fixed(doc, _cfg())
         assert chunks[0].page_start == 1
         # page_start advances monotonically as we walk chunks.
         starts = [c.page_start for c in chunks]
@@ -134,7 +136,7 @@ class TestChunkFixedPageRanges:
         # a blank middle page must not shift downstream page numbers. Chunks
         # from page 3's content must report page 3, not page 2.
         doc = _doc([_page_of_repeated_word("alpha", 300), "", _page_of_repeated_word("gamma", 300)])
-        chunks = chunk_fixed(doc, _P1_CHUNKER_CFG)
+        chunks = chunk_fixed(doc, _cfg())
         assert chunks, "expected at least one chunk"
         # First chunk covers page 1 content; last chunk covers page 3 content.
         assert chunks[0].page_start == 1

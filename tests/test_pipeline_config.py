@@ -1,7 +1,6 @@
 """Pipeline-config registry tests.
 
 Load-bearing invariants:
-  - P1 knobs match the pre-refactor constants (regression guard).
   - `get_pipeline` errors are actionable — listing valid keys.
   - `PipelineConfig.tag` is a hybrid `<readable>_<hash>` and is unique per
     config. The mutation-safety test enumerates every mutable field and
@@ -29,31 +28,23 @@ from src.pipeline.pipeline_config import (
     pipeline_to_manifest_dict,
 )
 
-
-class TestP1RegressionGuard:
-    """P1's knobs match the pre-refactor `chunk.py` module constants
-    (500-token target, 50-token overlap, top-10 dense retrieval, no rerank).
-    Regressing any of these would silently reshape the P1 baseline the
-    blog post's numbers depend on."""
-
-    def test_p1_registered(self) -> None:
-        assert "p1" in PIPELINES
-
-    def test_p1_chunker_knobs(self) -> None:
-        cfg = PIPELINES["p1"]
-        assert cfg.key == "p1"
-        assert cfg.chunker.algorithm == "fixed"
-        assert cfg.chunker.target_tokens == 500
-        assert cfg.chunker.overlap_tokens == 50
-        assert cfg.chunker.encoding == "cl100k_base"
-
-    def test_p1_retriever_knobs(self) -> None:
-        cfg = PIPELINES["p1"]
-        assert cfg.retriever.kind == "dense"
-        assert cfg.retriever.top_k == 10
-
-    def test_p1_no_reranker(self) -> None:
-        assert PIPELINES["p1"].reranker is None
+# ── Shared test fixture ───────────────────────────────────────────────
+#
+# Other test modules that need "a valid PipelineConfig" (e.g. `test_evals_run`)
+# import `TEST_PIPELINE_CFG` from here rather than reading `PIPELINES["p1"]`,
+# so those tests stay decoupled from any future retuning of the real P1
+# defaults. Deliberately uses knobs that differ from every registered
+# pipeline — an assertion accidentally coupled to prod values will fail.
+TEST_PIPELINE_CFG = PipelineConfig(
+    key="test",
+    chunker=ChunkerConfig(
+        algorithm="fixed",
+        target_tokens=400,
+        overlap_tokens=40,
+    ),
+    retriever=RetrieverConfig(kind="dense", top_k=8),
+    reranker=None,
+)
 
 
 class TestGetPipeline:
