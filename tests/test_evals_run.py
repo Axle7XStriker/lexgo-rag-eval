@@ -379,7 +379,10 @@ class TestMainHappyPath:
         # manifest.json: has git_sha, prompt versions, config, metrics.
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert manifest["git_sha"] == "deadbeef1234"
-        assert manifest["pipeline"] == TEST_PIPELINE_CFG.tag
+        # Tag lives at exactly one location — `config.pipeline.tag`. A
+        # historical top-level `manifest["pipeline"]` was removed so the
+        # two copies could never drift.
+        assert "pipeline" not in manifest
         assert manifest["prompt_versions"] == {"answer": "v1", "judge": "v1"}
         # Pipeline config is fully nested + self-describing — every field on
         # the injected TEST_PIPELINE_CFG round-trips into the manifest.

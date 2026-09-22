@@ -332,7 +332,7 @@ def _write_summary_md(
     lines: list[str] = []
     lines.append(f"# Eval run — {manifest['run_id']}")
     lines.append("")
-    lines.append(f"- pipeline: `{manifest['pipeline']}` (key `{pipeline_cfg['key']}`)")
+    lines.append(f"- pipeline: `{pipeline_cfg['tag']}` (key `{pipeline_cfg['key']}`)")
     lines.append(f"- git_sha: `{manifest['git_sha']}`")
     lines.append(
         f"- prompt versions: answer=`{manifest['prompt_versions']['answer']}`, "
@@ -536,14 +536,17 @@ def main() -> int:
 
     manifest: dict[str, Any] = {
         "run_id": run_id,
-        "pipeline": cfg.tag,
         "git_sha": _git_sha(),
         "prompt_versions": {
             "answer": ANSWER_PROMPT_VERSION,
             "judge": JUDGE_PROMPT_VERSION,
         },
         # `config.pipeline` = full PipelineConfig (chunker/retriever/reranker
-        # knobs + derived tag) so the artifact is self-describing.
+        # knobs + derived tag) so the artifact is self-describing. The tag
+        # is intentionally NOT duplicated at the top level — one source of
+        # truth (`config.pipeline.tag`) keeps a future refactor from
+        # silently letting the two copies disagree. Downstream consumers
+        # should read from `config.pipeline.tag`.
         # `config.models` = provider identities held constant across pipelines
         # (chat, judge, embedding) — kept separate because they're not part of
         # the pipeline's identity (a change here doesn't warrant a new DB tag,

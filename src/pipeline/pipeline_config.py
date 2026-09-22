@@ -54,7 +54,13 @@ class ChunkerConfig:
     algorithm: Literal["fixed", "semantic"]
     # Fixed-window knobs. `target_tokens` also documents the intended
     # band center for the semantic chunker even though it doesn't drive
-    # its cut logic directly.
+    # its cut logic directly — NOTE: every field on this dataclass
+    # participates in `_config_hash` regardless of whether the current
+    # algorithm reads it, so tweaking `target_tokens` on a semantic
+    # config still regenerates the DB tag. This is intentional:
+    # "documentary" fields are still versioned so a future contributor
+    # who reinterprets them as load-bearing gets fresh DB rows
+    # automatically, not silent data-mixing under an old tag.
     target_tokens: int | None = None
     overlap_tokens: int | None = None  # fixed only
     # Semantic-chunker knobs. Only meaningful when algorithm == "semantic".

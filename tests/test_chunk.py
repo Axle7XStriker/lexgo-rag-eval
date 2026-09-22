@@ -151,8 +151,14 @@ class TestChunkFixedValidation:
             chunk_fixed(_doc(["x"]), _cfg(500, 500))
 
     def test_target_zero_raises(self) -> None:
-        with pytest.raises(ValueError, match="target_tokens"):
-            chunk_fixed(_doc(["x"]), _cfg(0, 0))
+        # target=0 with overlap=0 would trip the earlier overlap-ge-target
+        # guard (0 >= 0). Use a strictly-smaller negative overlap so control
+        # flow reaches the `target_tokens <= 0` branch this test names, and
+        # bind `match` to that branch's unique wording rather than the loose
+        # substring "target_tokens" (which also appears in the overlap-check
+        # error).
+        with pytest.raises(ValueError, match=r"target_tokens must be > 0"):
+            chunk_fixed(_doc(["x"]), _cfg(0, -1))
 
     def test_wrong_algorithm_raises(self) -> None:
         # `chunk_fixed` is one branch of the chunker dispatch — a config for

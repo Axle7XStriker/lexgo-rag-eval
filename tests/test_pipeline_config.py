@@ -14,7 +14,8 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import replace
+from dataclasses import fields, replace
+from typing import ClassVar
 
 import pytest
 
@@ -192,6 +193,146 @@ class TestTagChangesOnFieldMutation:
         base = PIPELINES["p1"]
         forked = replace(base, key="p1_smoke")
         assert base.tag != forked.tag
+
+    # Semantic-chunker knob mutations use a locally-constructed base rather
+    # than PIPELINES["p1"] — a fixed-chunker config has these fields as
+    # `None`, and mutating None→200 is a legitimate hash-changing edit but
+    # doesn't exercise the "already-populated field, tweaked" path this
+    # class is meant to cover.
+    _SEMANTIC_BASE = PipelineConfig(
+        key="p2",
+        chunker=ChunkerConfig(
+            algorithm="semantic",
+            target_tokens=500,
+            percentile_threshold=95.0,
+            min_tokens=200,
+            max_tokens=750,
+        ),
+        retriever=RetrieverConfig(kind="dense", top_k=10),
+        reranker=None,
+    )
+
+    def test_chunker_algorithm(self) -> None:
+        # Swapping algorithm implies swapping the surrounding fixed/semantic
+        # knobs to keep the config coherent. The hash MUST catch the shift
+        # even when both configs are otherwise well-formed for their algorithm.
+        base = PIPELINES["p1"]
+        semantic = replace(base, chunker=self._SEMANTIC_BASE.chunker)
+        self._all_tags_distinct([base, semantic])
+
+    def test_chunker_percentile_threshold(self) -> None:
+        base = self._SEMANTIC_BASE
+        variants = [
+            base,
+            replace(base, chunker=replace(base.chunker, percentile_threshold=90.0)),
+            replace(base, chunker=replace(base.chunker, percentile_threshold=95.5)),
+        ]
+        self._all_tags_distinct(variants)
+
+    def test_chunker_min_tokens(self) -> None:
+        base = self._SEMANTIC_BASE
+        variants = [
+            base,
+            replace(base, chunker=replace(base.chunker, min_tokens=150)),
+        ]
+        self._all_tags_distinct(variants)
+
+    def test_chunker_max_tokens(self) -> None:
+        base = self._SEMANTIC_BASE
+        variants = [
+            base,
+            replace(base, chunker=replace(base.chunker, max_tokens=1000)),
+        ]
+        self._all_tags_distinct(variants)
+
+    def test_retriever_kind(self) -> None:
+        # `kind` is a Literal["dense", "hybrid"]; both are valid runtime
+        # values so no `type: ignore` is needed. P3 (hybrid) will lean on
+        # this — a `dense`↔`hybrid` swap MUST land under a fresh DB tag.
+        base = PIPELINES["p1"]
+        variants = [
+            base,
+            replace(base, retriever=replace(base.retriever, kind="hybrid")),
+        ]
+        self._all_tags_distinct(variants)
+
+    def test_reranker_model(self) -> None:
+        base = PIPELINES["p1"]
+        rr_a = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5)
+        rr_b = RerankerConfig(provider="cohere", model="rerank-multilingual-v3.0", top_n=5)
+        self._all_tags_distinct(
+            [
+                replace(base, reranker=rr_a),
+                replace(base, reranker=rr_b),
+            ]
+        )
+
+    def test_reranker_provider(self) -> None:
+        # `provider` is currently Literal["cohere"] (single value). Cast
+        # through `type: ignore` to prove the hash includes this field even
+        # before a second provider joins the Literal — same trick as
+        # `test_unknown_algorithm_raises` uses for algorithm drift.
+        base = PIPELINES["p1"]
+        rr_a = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5)
+        rr_b = replace(rr_a, provider="voyage")  # type: ignore[arg-type]
+        self._all_tags_distinct(
+            [
+                replace(base, reranker=rr_a),
+                replace(base, reranker=rr_b),
+            ]
+        )
+
+
+class TestTagMutationCoverage:
+    """Meta-guard: every field on every config dataclass has a mutation test
+    above. Introspects `dataclasses.fields()` so adding a new field without
+    a corresponding test fails CI loudly — the docstring's "safety net"
+    claim is only true if we enforce it here.
+
+    `PipelineConfig`'s sub-dataclass fields (`chunker`/`retriever`/`reranker`)
+    are covered transitively: any nested-field mutation test also mutates
+    the outer PipelineConfig field that holds the sub-config. Only the
+    scalar `key` needs a direct top-level test (it has one).
+    """
+
+    _COVERED_CHUNKER_FIELDS: ClassVar[set[str]] = {
+        "algorithm",
+        "target_tokens",
+        "overlap_tokens",
+        "percentile_threshold",
+        "min_tokens",
+        "max_tokens",
+        "encoding",
+    }
+    _COVERED_RETRIEVER_FIELDS: ClassVar[set[str]] = {"kind", "top_k"}
+    _COVERED_RERANKER_FIELDS: ClassVar[set[str]] = {"provider", "model", "top_n"}
+    _COVERED_PIPELINE_FIELDS: ClassVar[set[str]] = {"key", "chunker", "retriever", "reranker"}
+
+    def _assert_covered(self, dataclass_type: type, covered: set[str]) -> None:
+        declared = {f.name for f in fields(dataclass_type)}
+        missing = declared - covered
+        assert not missing, (
+            f"{dataclass_type.__name__} has field(s) with no mutation test: "
+            f"{sorted(missing)}. Add a case to TestTagChangesOnFieldMutation, "
+            f"then update the covered set on TestTagMutationCoverage."
+        )
+        stale = covered - declared
+        assert not stale, (
+            f"{dataclass_type.__name__} covered set names field(s) that no "
+            f"longer exist: {sorted(stale)}. Prune the covered set."
+        )
+
+    def test_chunker_fields_all_covered(self) -> None:
+        self._assert_covered(ChunkerConfig, self._COVERED_CHUNKER_FIELDS)
+
+    def test_retriever_fields_all_covered(self) -> None:
+        self._assert_covered(RetrieverConfig, self._COVERED_RETRIEVER_FIELDS)
+
+    def test_reranker_fields_all_covered(self) -> None:
+        self._assert_covered(RerankerConfig, self._COVERED_RERANKER_FIELDS)
+
+    def test_pipeline_fields_all_covered(self) -> None:
+        self._assert_covered(PipelineConfig, self._COVERED_PIPELINE_FIELDS)
 
 
 class TestManifestSerialization:

@@ -35,10 +35,14 @@ from typing import Any
 
 from src.qa_schema import QAType
 
-# Recall-at-K headline slice. Set to half of P1's top_k=10 so recall@5 stays
-# a meaningful "top of the retrieval" number even as the retriever fans out
-# further. Baked into the QAResult field names because the eval loop only
-# reports one k today.
+# Recall-at-K headline slice. Deliberately DECOUPLED from any pipeline's
+# `retriever.top_k` — P1..P4 fan out to different top-K values (10, 10,
+# 10, then P4's Cohere rerank narrows to 5), and reporting a moving-k
+# recall would make cross-pipeline comparison meaningless. Fixing k=5
+# keeps the headline metric an apples-to-apples "top of the retrieval"
+# slice across every pipeline. Baked into the `QAResult.recall_at_5`
+# field name because the eval loop only reports one k today; changing
+# DEFAULT_K also means renaming that field (and its consumers).
 DEFAULT_K = 5
 
 
