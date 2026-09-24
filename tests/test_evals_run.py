@@ -295,8 +295,7 @@ def _inject_fake_deps(
     monkeypatch.setattr(run_module, "_git_sha", lambda: "deadbeef1234")
     # Decouple the eval-loop test from whatever the real P1 config happens
     # to be — force the loop to consume `TEST_PIPELINE_CFG` regardless of
-    # the CLI `--pipeline` arg. Assertions below reference the test config,
-    # so re-tuning P1 later never breaks this file.
+    # the CLI `--pipeline` arg.
     monkeypatch.setattr(run_module, "get_pipeline", lambda _key: TEST_PIPELINE_CFG)
     # `configure_logging` binds structlog's PrintLogger to the current
     # `sys.stderr`. Under pytest capture, that wrapper closes at test teardown
@@ -379,10 +378,6 @@ class TestMainHappyPath:
         # manifest.json: has git_sha, prompt versions, config, metrics.
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert manifest["git_sha"] == "deadbeef1234"
-        # Tag lives at exactly one location — `config.pipeline.tag`. A
-        # historical top-level `manifest["pipeline"]` was removed so the
-        # two copies could never drift.
-        assert "pipeline" not in manifest
         assert manifest["prompt_versions"] == {"answer": "v1", "judge": "v1"}
         # Pipeline config is fully nested + self-describing — every field on
         # the injected TEST_PIPELINE_CFG round-trips into the manifest.

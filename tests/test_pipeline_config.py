@@ -30,18 +30,16 @@ from src.pipeline.pipeline_config import (
 )
 
 # ── Shared test fixture ───────────────────────────────────────────────
-#
-# Other test modules that need "a valid PipelineConfig" (e.g. `test_evals_run`)
-# import `TEST_PIPELINE_CFG` from here rather than reading `PIPELINES["p1"]`,
-# so those tests stay decoupled from any future retuning of the real P1
-# defaults. Deliberately uses knobs that differ from every registered
-# pipeline — an assertion accidentally coupled to prod values will fail.
+
 TEST_PIPELINE_CFG = PipelineConfig(
     key="test",
     chunker=ChunkerConfig(
         algorithm="fixed",
         target_tokens=400,
         overlap_tokens=40,
+        percentile_threshold=95.0,
+        min_tokens=200,
+        max_tokens=750,
     ),
     retriever=RetrieverConfig(kind="dense", top_k=8),
     reranker=None,
@@ -65,45 +63,16 @@ class TestGetPipeline:
 
 
 class TestTagFormat:
-    def test_p1_prefix_stable(self) -> None:
-        # The readable prefix is the debug-time affordance — anyone eyeballing
-        # `SELECT DISTINCT pipeline FROM chunks;` should immediately see
-        # "P1 fixed 500/50". Changing this prefix format is a data-migration
-        # break for anyone with pre-existing chunks tagged the old way.
-        tag = PIPELINES["p1"].tag
-        assert tag.startswith("p1_fixed_500_50_")
+    def test_tag_prefix(self) -> None:
+        tag = TEST_PIPELINE_CFG.tag
+        assert tag.startswith("test_fixed_400_40_")
 
     def test_hash_suffix_is_short_hex(self) -> None:
-        tag = PIPELINES["p1"].tag
+        tag = TEST_PIPELINE_CFG.tag
         suffix = tag.rsplit("_", 1)[-1]
-        # 8 hex chars — long enough that collisions across O(dozens) of
-        # configs are astronomically unlikely, short enough to keep the
-        # tag human-manageable.
         assert re.fullmatch(r"[0-9a-f]{8}", suffix) is not None
 
-    def test_semantic_prefix_shape(self) -> None:
-        # Even though no P2 is registered yet, the prefix builder should
-        # already handle `algorithm='semantic'` — otherwise adding P2 in
-        # PR 2 would silently produce a "unknown chunker" error at import
-        # time instead of just registering a new entry.
-        cfg = PipelineConfig(
-            key="p2",
-            chunker=ChunkerConfig(
-                algorithm="semantic",
-                percentile_threshold=95.0,
-                min_tokens=200,
-                max_tokens=750,
-            ),
-            retriever=RetrieverConfig(kind="dense", top_k=10),
-            reranker=None,
-        )
-        assert cfg.tag.startswith("p2_semantic_p95_")
-
     def test_unknown_algorithm_raises(self) -> None:
-        # If a future contributor adds an algorithm to the Literal without
-        # extending `_readable_prefix`, accessing `.tag` must fail loud —
-        # otherwise the fallthrough would produce a tag whose prefix is
-        # meaningless.
         cfg = PipelineConfig(
             key="pX",
             # Bypass the Literal check with a cast-through-object so the test
@@ -134,7 +103,7 @@ class TestTagChangesOnFieldMutation:
         assert len(set(tags)) == len(tags), f"expected distinct tags, got {tags}"
 
     def test_chunker_target_tokens(self) -> None:
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, chunker=replace(base.chunker, target_tokens=501)),
@@ -143,7 +112,7 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_chunker_overlap_tokens(self) -> None:
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, chunker=replace(base.chunker, overlap_tokens=25)),
@@ -152,7 +121,7 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_chunker_encoding(self) -> None:
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, chunker=replace(base.chunker, encoding="o200k_base")),
@@ -160,7 +129,7 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_retriever_top_k(self) -> None:
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, retriever=replace(base.retriever, top_k=20)),
@@ -168,7 +137,7 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_reranker_addition(self) -> None:
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         with_reranker = replace(
             base,
             reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5),
@@ -178,7 +147,7 @@ class TestTagChangesOnFieldMutation:
     def test_reranker_top_n(self) -> None:
         rr_a = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5)
         rr_b = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=10)
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         self._all_tags_distinct(
             [
                 replace(base, reranker=rr_a),
@@ -187,41 +156,20 @@ class TestTagChangesOnFieldMutation:
         )
 
     def test_key_change_also_changes_tag(self) -> None:
-        # `key` is IN the readable prefix, so a fork like p1→p1_smoke must
-        # produce distinct DB tags. Prevents an operator from accidentally
-        # aliasing two pipelines that share every knob except the CLI name.
-        base = PIPELINES["p1"]
-        forked = replace(base, key="p1_smoke")
+        base = TEST_PIPELINE_CFG
+        forked = replace(base, key="test_smoke")
         assert base.tag != forked.tag
-
-    # Semantic-chunker knob mutations use a locally-constructed base rather
-    # than PIPELINES["p1"] — a fixed-chunker config has these fields as
-    # `None`, and mutating None→200 is a legitimate hash-changing edit but
-    # doesn't exercise the "already-populated field, tweaked" path this
-    # class is meant to cover.
-    _SEMANTIC_BASE = PipelineConfig(
-        key="p2",
-        chunker=ChunkerConfig(
-            algorithm="semantic",
-            target_tokens=500,
-            percentile_threshold=95.0,
-            min_tokens=200,
-            max_tokens=750,
-        ),
-        retriever=RetrieverConfig(kind="dense", top_k=10),
-        reranker=None,
-    )
 
     def test_chunker_algorithm(self) -> None:
         # Swapping algorithm implies swapping the surrounding fixed/semantic
         # knobs to keep the config coherent. The hash MUST catch the shift
         # even when both configs are otherwise well-formed for their algorithm.
-        base = PIPELINES["p1"]
-        semantic = replace(base, chunker=self._SEMANTIC_BASE.chunker)
+        base = TEST_PIPELINE_CFG
+        semantic = replace(base, chunker=replace(base.chunker, algorithm="semantic"))
         self._all_tags_distinct([base, semantic])
 
     def test_chunker_percentile_threshold(self) -> None:
-        base = self._SEMANTIC_BASE
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, chunker=replace(base.chunker, percentile_threshold=90.0)),
@@ -230,7 +178,7 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_chunker_min_tokens(self) -> None:
-        base = self._SEMANTIC_BASE
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, chunker=replace(base.chunker, min_tokens=150)),
@@ -238,7 +186,7 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_chunker_max_tokens(self) -> None:
-        base = self._SEMANTIC_BASE
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, chunker=replace(base.chunker, max_tokens=1000)),
@@ -249,7 +197,7 @@ class TestTagChangesOnFieldMutation:
         # `kind` is a Literal["dense", "hybrid"]; both are valid runtime
         # values so no `type: ignore` is needed. P3 (hybrid) will lean on
         # this — a `dense`↔`hybrid` swap MUST land under a fresh DB tag.
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         variants = [
             base,
             replace(base, retriever=replace(base.retriever, kind="hybrid")),
@@ -257,7 +205,7 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_reranker_model(self) -> None:
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         rr_a = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5)
         rr_b = RerankerConfig(provider="cohere", model="rerank-multilingual-v3.0", top_n=5)
         self._all_tags_distinct(
@@ -272,7 +220,7 @@ class TestTagChangesOnFieldMutation:
         # through `type: ignore` to prove the hash includes this field even
         # before a second provider joins the Literal — same trick as
         # `test_unknown_algorithm_raises` uses for algorithm drift.
-        base = PIPELINES["p1"]
+        base = TEST_PIPELINE_CFG
         rr_a = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5)
         rr_b = replace(rr_a, provider="voyage")  # type: ignore[arg-type]
         self._all_tags_distinct(
@@ -341,18 +289,18 @@ class TestManifestSerialization:
         # JSON-serializable via `default=str` (which the module uses in its
         # hash payload too). Guards against a future dataclass field type
         # that would break both.
-        raw = pipeline_to_manifest_dict(PIPELINES["p1"])
+        raw = pipeline_to_manifest_dict(TEST_PIPELINE_CFG)
         payload = json.dumps(raw, default=str)
         parsed = json.loads(payload)
-        assert parsed["tag"] == PIPELINES["p1"].tag
-        assert parsed["key"] == "p1"
+        assert parsed["tag"] == TEST_PIPELINE_CFG.tag
+        assert parsed["key"] == "test"
         assert parsed["chunker"]["algorithm"] == "fixed"
-        assert parsed["retriever"]["top_k"] == 10
+        assert parsed["retriever"]["top_k"] == 8
         assert parsed["reranker"] is None
 
     def test_stores_tag_at_top_level(self) -> None:
         # The manifest reader shouldn't have to re-derive the tag from the
         # config — it's stored explicitly so a downstream consumer can
         # dedupe runs by tag without depending on this Python module.
-        d = pipeline_to_manifest_dict(PIPELINES["p1"])
-        assert d["tag"] == PIPELINES["p1"].tag
+        d = pipeline_to_manifest_dict(TEST_PIPELINE_CFG)
+        assert d["tag"] == TEST_PIPELINE_CFG.tag

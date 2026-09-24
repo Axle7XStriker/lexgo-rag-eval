@@ -7,14 +7,6 @@ config, not hand-authored — any config change automatically produces a new
 tag, so tuning a knob and re-ingesting yields fresh rows for side-by-side
 comparison rather than silently overwriting the previous run's rows.
 
-Callers:
-  - `scripts.ingest` — reads `PIPELINES[args.pipeline]`, dispatches on
-    `cfg.chunker.algorithm`, writes rows tagged `cfg.tag`.
-  - `evals.run` — reads `PIPELINES[args.pipeline]`, uses `cfg.tag` to filter
-    retrieval and `cfg.retriever.top_k` for retrieval fan-out. Serializes the
-    whole `PipelineConfig` into the run manifest via
-    `pipeline_to_manifest_dict` so the artifact is self-describing.
-
 Adding a new pipeline (P2/P3/P4) is one dict entry — no changes to any
 callsite except the dispatch table in `scripts.ingest` (a new
 `elif algorithm == "..."` branch).
@@ -140,6 +132,9 @@ class PipelineConfig:
         # `default=str` keeps the hash deterministic even if a future field
         # holds something JSON doesn't natively serialize (Path, Enum, etc.).
         payload = json.dumps(asdict(self), sort_keys=True, default=str)
+        # 8 hex chars — long enough that collisions across O(dozens) of
+        # configs are astronomically unlikely, short enough to keep the
+        # tag human-manageable.
         return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
 
 

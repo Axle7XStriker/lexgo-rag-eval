@@ -71,7 +71,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_QA_PATH = REPO_ROOT / "evals" / "golden" / "qa.jsonl"
 
 # CLI keys are exactly the keys registered in `src.pipeline.pipeline_config.PIPELINES`.
-# Adding P2..P4 is a one-line dict entry in that module — no changes needed here.
 SUPPORTED_PIPELINES: tuple[str, ...] = tuple(PIPELINES.keys())
 
 
@@ -108,10 +107,6 @@ def _run_one(
     run_id: str,
 ) -> QAResult:
     """Evaluate one record end-to-end. Never raises — catches → error field.
-
-    `pipeline_tag` + `top_k` come from the active `PipelineConfig` in
-    `main()`. Threaded through as scalars (not the whole config object) so
-    this helper stays focused on the per-Q&A error-handling shape.
 
     Returns a `QAResult` with `error` set to a short string when any step
     raises after its own retries have been exhausted. The caller decides

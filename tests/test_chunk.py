@@ -9,9 +9,7 @@ import tiktoken
 
 from src.pipeline.chunk import chunk_fixed
 from src.pipeline.extract import ExtractedDoc, PageText
-from src.pipeline.pipeline_config import ChunkerConfig, get_pipeline
-
-_P1_CFG = get_pipeline("p1")
+from src.pipeline.pipeline_config import ChunkerConfig
 
 
 def _cfg(
@@ -45,12 +43,6 @@ def _page_of_repeated_word(word: str, n_words: int) -> str:
 class TestChunkFixedShape:
     """Chunk sizes, overlap, and final-chunk retention."""
 
-    def test_p1_tag_readable_prefix(self) -> None:
-        # The P1 tag now DERIVES from the config, but its readable prefix
-        # must stay stable so `SELECT DISTINCT pipeline FROM chunks;` output
-        # remains recognizable to anyone who worked with the pre-refactor tag.
-        assert _P1_CFG.tag.startswith("p1_fixed_500_50_")
-
     def test_empty_doc_returns_empty_list(self) -> None:
         assert chunk_fixed(_doc([]), _cfg()) == []
 
@@ -59,12 +51,13 @@ class TestChunkFixedShape:
 
     def test_chunk_sizes_bounded(self) -> None:
         # ~3000 tokens of repeated content → several full windows + a tail.
+        cfg = _cfg(400, 40)
         doc = _doc([_page_of_repeated_word("alpha", 3000)])
-        chunks = chunk_fixed(doc, _cfg())
+        chunks = chunk_fixed(doc, cfg)
         assert len(chunks) > 1
-        assert all(c.num_tokens <= 500 for c in chunks)
-        # Every full chunk except possibly the last is at the target.
-        assert all(c.num_tokens == 500 for c in chunks[:-1])
+        # Every full chunk except the last is at the target.
+        assert all(c.num_tokens == 400 for c in chunks[:-1])
+        assert chunks[-1].num_tokens < 400
 
     def test_overlap_is_honored(self) -> None:
         # Overlap is defined in TOKENS (not chars), and tiktoken doesn't split

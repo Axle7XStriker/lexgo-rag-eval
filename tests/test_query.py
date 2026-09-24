@@ -18,7 +18,6 @@ import pytest
 
 from src.pipeline import prompts as prompts_module
 from src.pipeline.generate import GenerateResult
-from src.pipeline.pipeline_config import get_pipeline
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import (
     PROMPT_VERSION,
@@ -27,12 +26,7 @@ from src.pipeline.query import (
     answer_question,
 )
 from src.pipeline.store import RetrievedChunk
-
-# Resolve once at import — every answer_question() call below passes these
-# through; a config change in pipeline_config re-derives both in one place.
-_P1_CFG = get_pipeline("p1")
-_P1_TAG = _P1_CFG.tag
-_P1_TOP_K = _P1_CFG.retriever.top_k
+from tests.test_pipeline_config import TEST_PIPELINE_CFG
 
 
 @pytest.fixture(autouse=True)
@@ -142,7 +136,7 @@ def _chunk(marker: int, doc_path: str, source_id: str = "A1") -> RetrievedChunk:
         document_id=1,
         doc_path=doc_path,
         source_id=source_id,
-        pipeline=_P1_TAG,
+        pipeline=TEST_PIPELINE_CFG.tag,
         chunk_index=marker - 1,
         text=f"chunk-{marker}-body",
         page_start=marker,
@@ -178,8 +172,8 @@ class TestEndToEnd:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=_P1_TAG,
-            top_k=_P1_TOP_K,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            top_k=TEST_PIPELINE_CFG.retriever.top_k,
             run_id="run_test",
         )
 
@@ -203,7 +197,7 @@ class TestEndToEnd:
         # Dependencies invoked with the query + run_id threaded through.
         assert embedder.calls == ["what is merge sort?"]
         assert len(store.calls) == 1
-        assert store.calls[0]["pipeline"] == _P1_TAG
+        assert store.calls[0]["pipeline"] == TEST_PIPELINE_CFG.tag
         assert len(generator.calls) == 1
         assert generator.calls[0]["prompt_version"] == PROMPT_VERSION
         assert generator.calls[0]["run_id"] == "run_test"
@@ -223,8 +217,8 @@ class TestEndToEnd:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=_P1_TAG,
-            top_k=_P1_TOP_K,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            top_k=TEST_PIPELINE_CFG.retriever.top_k,
         )
 
         call = generator.calls[0]
@@ -282,8 +276,8 @@ class TestCitationParsing:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=_P1_TAG,
-            top_k=_P1_TOP_K,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            top_k=TEST_PIPELINE_CFG.retriever.top_k,
         )
         assert result.answer == "Something [9] and [42]."
         assert result.citations == []
@@ -304,8 +298,8 @@ class TestOutOfCorpus:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=_P1_TAG,
-            top_k=_P1_TOP_K,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            top_k=TEST_PIPELINE_CFG.retriever.top_k,
         )
         assert result.answer == OUT_OF_CORPUS_SENTINEL
         assert result.citations == []
@@ -322,8 +316,8 @@ class TestOutOfCorpus:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=_P1_TAG,
-            top_k=_P1_TOP_K,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            top_k=TEST_PIPELINE_CFG.retriever.top_k,
         )
         assert result.answer == OUT_OF_CORPUS_SENTINEL
         assert result.citations == []

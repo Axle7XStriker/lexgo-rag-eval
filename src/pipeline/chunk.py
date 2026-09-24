@@ -3,8 +3,7 @@
 Target/overlap tokens are driven by the caller's `ChunkerConfig` (from
 `src.pipeline.pipeline_config`) — the P1 baseline uses 500/50, but any
 `ChunkerConfig(algorithm="fixed", target_tokens=..., overlap_tokens=...)`
-is a valid input. The DB `pipeline` tag under which chunks land is
-derived from that config, not fixed here.
+is a valid input.
 
 Design notes worth remembering:
   - Voyage does not publish a public tokenizer. cl100k_base (OpenAI's) is
