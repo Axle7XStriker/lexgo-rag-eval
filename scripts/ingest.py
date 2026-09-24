@@ -1,14 +1,16 @@
-"""P1 ingest orchestrator — corpus PDFs → pgvector.
+"""Ingest orchestrator — corpus PDFs → pgvector, per pipeline.
 
-For each present PDF in the manifest: extract text → chunk (fixed 500/50) →
-embed via Voyage → upsert into the `documents` and `chunks` tables.
-Idempotent: unchanged documents are skipped by content-hash short-circuit,
-so re-running is cheap.
+For each present PDF in the manifest: extract text → chunk per the
+`--pipeline` selection → embed via Voyage → upsert into the `documents`
+and `chunks` tables. Chunks land tagged with the pipeline's derived DB
+tag (`PipelineConfig.tag`), so multiple pipelines coexist in the same
+table without collision. Idempotent: unchanged documents (for the
+selected pipeline) are skipped by content-hash short-circuit.
 
 CLI::
 
-  python -m scripts.ingest [--only DOC_PATH] [--force] [--dry-run]
-                           [--batch-size N] [--log-level LEVEL]
+  python -m scripts.ingest [--pipeline p1] [--only DOC_PATH] [--force]
+                           [--dry-run] [--batch-size N] [--log-level LEVEL]
 
 Design notes worth remembering:
   - Idempotency key is `(documents.content_hash, chunks-exist-for-pipeline)`.
@@ -41,6 +43,7 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -51,9 +54,10 @@ import psycopg
 from scripts.corpus_manifest import MANIFEST, ManifestEntry
 from src.config import get_settings
 from src.observability import configure_logging, get_logger
-from src.pipeline.chunk import PIPELINE_TAG, chunk_fixed
+from src.pipeline.chunk import Chunk, chunk_fixed
 from src.pipeline.embed import VoyageEmbedder
-from src.pipeline.extract import extract_pdf
+from src.pipeline.extract import ExtractedDoc, extract_pdf
+from src.pipeline.pipeline_config import PIPELINES, PipelineConfig, get_pipeline
 from src.pipeline.store import ChunkRow, DocumentRow, VectorStore
 
 # Finite outcome set for one document's ingest attempt. Kept as a Literal so
@@ -179,6 +183,8 @@ def _process_entry(
     *,
     store: VectorStore | None,
     embedder: VoyageEmbedder,
+    pipeline_tag: str,
+    chunker: Callable[[ExtractedDoc], list[Chunk]],
     force: bool,
     dry_run: bool,
     log_path: Path,
@@ -186,6 +192,14 @@ def _process_entry(
     run_id: str | None = None,
 ) -> DocResult:
     """Extract + chunk + embed + upsert one manifest entry. Never raises.
+
+    `pipeline_tag` — the derived DB tag from the active PipelineConfig
+    (`cfg.tag`). Written into the `chunks.pipeline` column and used by the
+    idempotency short-circuit to check whether THIS pipeline has already
+    ingested this doc.
+
+    `chunker` — a callable that turns an ExtractedDoc into a list of Chunks.
+    Built once per run in `main()` from the active `cfg.chunker.algorithm`.
 
     `store` may be None in --dry-run (no DB is opened at all). Real runs
     must pass a live VectorStore.
@@ -239,7 +253,7 @@ def _process_entry(
     # silently no-op'ing on docs P1 already touched.
     if store is not None:
         try:
-            existing = _fetch_existing(store, entry.dest_path, PIPELINE_TAG)
+            existing = _fetch_existing(store, entry.dest_path, pipeline_tag)
         except psycopg.Error as e:
             # A failed SELECT poisons the connection until rolled back —
             # otherwise every subsequent doc's SELECT fails with
@@ -259,12 +273,12 @@ def _process_entry(
                 "skipped_unchanged",
                 doc_path=entry.dest_path,
                 content_hash=doc.content_hash,
-                pipeline=PIPELINE_TAG,
+                pipeline=pipeline_tag,
             )
             return result
 
-    # Chunk.
-    chunks = chunk_fixed(doc)
+    # Chunk via the pipeline-specific chunker passed in from main().
+    chunks = chunker(doc)
     result.num_chunks = len(chunks)
     if not chunks:
         result.status = "extract_failed"
@@ -334,7 +348,7 @@ def _process_entry(
     )
     chunk_rows = [
         ChunkRow(
-            pipeline=PIPELINE_TAG,
+            pipeline=pipeline_tag,
             chunk_index=c.chunk_index,
             text=c.text,
             num_tokens=c.num_tokens,
@@ -346,7 +360,7 @@ def _process_entry(
         for c, e in zip(chunks, embeddings, strict=True)
     ]
     try:
-        store.replace_document_chunks(doc_row, chunk_rows, pipeline=PIPELINE_TAG)
+        store.replace_document_chunks(doc_row, chunk_rows, pipeline=pipeline_tag)
     except Exception as e:
         # DB errors surface into the summary rather than aborting the whole
         # run — the outer main() exits non-zero if any required entry failed.
@@ -425,10 +439,40 @@ def _is_required(doc_path: str) -> bool:
     return True  # unknown path → treat as required so it stays loud
 
 
+def _build_chunker(
+    cfg: PipelineConfig,
+    *,
+    embedder: VoyageEmbedder,
+    run_id: str,
+) -> Callable[[ExtractedDoc], list[Chunk]]:
+    """Dispatch on `cfg.chunker.algorithm` and return an ExtractedDoc→chunks callable.
+
+    Constructing the closure once per run (rather than per document) means
+    the embedder + run_id are captured for the semantic chunker without
+    threading them through `_process_entry`. Each new chunker algorithm
+    adds one `elif` branch here.
+    """
+    algorithm = cfg.chunker.algorithm
+    if algorithm == "fixed":
+        return lambda doc: chunk_fixed(doc, cfg.chunker)
+    # `embedder` is unused for "fixed" but referenced by the semantic branch
+    # that lands in PR 2; kept as an explicit dependency so main() has one
+    # place to wire it.
+    _ = embedder, run_id
+    raise ValueError(f"no chunker registered for algorithm={algorithm!r}")
+
+
 def main() -> int:
     settings = get_settings()
 
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--pipeline",
+        choices=tuple(PIPELINES.keys()),
+        default="p1",
+        help="Which retrieval pipeline's chunks to ingest. Selects a chunker "
+        "+ knobs from src.pipeline.pipeline_config and derives the DB tag.",
+    )
     parser.add_argument(
         "--only",
         help="Restrict to one doc_path (full manifest dest_path) or one source_id (A1..B5).",
@@ -462,11 +506,15 @@ def main() -> int:
     configure_logging(args.log_level)
     logger = get_logger("ingest")
 
+    cfg = get_pipeline(args.pipeline)
+    pipeline_tag = cfg.tag
+
     entries = _select_manifest_entries(args.only)
     logger.info(
         "ingest_start",
         n_entries=len(entries),
-        pipeline=PIPELINE_TAG,
+        pipeline=pipeline_tag,
+        pipeline_key=cfg.key,
         dry_run=args.dry_run,
         force=args.force,
     )
@@ -489,6 +537,8 @@ def main() -> int:
         **embedder_kwargs,
     )
 
+    chunker = _build_chunker(cfg, embedder=embedder, run_id=run_id)
+
     results: list[DocResult] = []
     # --dry-run runs entirely without a DB — the point of dry-run is to
     # pre-flight the corpus + estimate cost on a laptop with no docker up.
@@ -502,6 +552,8 @@ def main() -> int:
                 entry,
                 store=store,
                 embedder=embedder,
+                pipeline_tag=pipeline_tag,
+                chunker=chunker,
                 force=args.force,
                 dry_run=args.dry_run,
                 log_path=settings.llm_call_log,

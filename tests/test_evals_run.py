@@ -23,12 +23,12 @@ import pytest
 
 from evals import run as run_module
 from src.pipeline import prompts as prompts_module
-from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.generate import GenerateResult
 from src.pipeline.judge import JudgeResult
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import PROMPT_VERSION
 from src.pipeline.store import RetrievedChunk
+from tests.test_pipeline_config import TEST_PIPELINE_CFG
 
 # ── Prompt fixture ────────────────────────────────────────────────────
 
@@ -293,6 +293,10 @@ def _inject_fake_deps(
     settings = _make_settings_stub(tmp_path)
     monkeypatch.setattr(run_module, "get_settings", lambda: settings)
     monkeypatch.setattr(run_module, "_git_sha", lambda: "deadbeef1234")
+    # Decouple the eval-loop test from whatever the real P1 config happens
+    # to be — force the loop to consume `TEST_PIPELINE_CFG` regardless of
+    # the CLI `--pipeline` arg.
+    monkeypatch.setattr(run_module, "get_pipeline", lambda _key: TEST_PIPELINE_CFG)
     # `configure_logging` binds structlog's PrintLogger to the current
     # `sys.stderr`. Under pytest capture, that wrapper closes at test teardown
     # — subsequent tests then crash if any logger.warning() call fires against
@@ -374,10 +378,20 @@ class TestMainHappyPath:
         # manifest.json: has git_sha, prompt versions, config, metrics.
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert manifest["git_sha"] == "deadbeef1234"
-        assert manifest["pipeline"] == PIPELINE_TAG
         assert manifest["prompt_versions"] == {"answer": "v1", "judge": "v1"}
-        assert manifest["config"]["chat_model"] == "claude-sonnet-4-6"
-        assert manifest["config"]["top_k"] == 10
+        # Pipeline config is fully nested + self-describing — every field on
+        # the injected TEST_PIPELINE_CFG round-trips into the manifest.
+        pipeline_cfg = manifest["config"]["pipeline"]
+        assert pipeline_cfg["tag"] == TEST_PIPELINE_CFG.tag
+        assert pipeline_cfg["key"] == TEST_PIPELINE_CFG.key
+        assert pipeline_cfg["chunker"]["algorithm"] == TEST_PIPELINE_CFG.chunker.algorithm
+        assert pipeline_cfg["chunker"]["target_tokens"] == TEST_PIPELINE_CFG.chunker.target_tokens
+        assert pipeline_cfg["chunker"]["overlap_tokens"] == TEST_PIPELINE_CFG.chunker.overlap_tokens
+        assert pipeline_cfg["retriever"]["kind"] == TEST_PIPELINE_CFG.retriever.kind
+        assert pipeline_cfg["retriever"]["top_k"] == TEST_PIPELINE_CFG.retriever.top_k
+        assert pipeline_cfg["reranker"] is None
+        # Provider identities kept separately — not part of pipeline identity.
+        assert manifest["config"]["models"]["chat_model"] == "claude-sonnet-4-6"
         assert manifest["golden_set"]["n_records_loaded"] == 5
         assert manifest["totals"]["n_evaluated"] == 5
         assert manifest["totals"]["n_skipped"] == 0

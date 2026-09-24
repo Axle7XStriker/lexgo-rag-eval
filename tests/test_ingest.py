@@ -25,11 +25,22 @@ import pytest
 
 from scripts import ingest as ingest_mod
 from scripts.corpus_manifest import MANIFEST, ManifestEntry
-from src.pipeline.chunk import PIPELINE_TAG
+from src.pipeline.chunk import chunk_fixed
 from src.pipeline.embed import VoyageEmbedder
+from src.pipeline.pipeline_config import get_pipeline
 from src.pipeline.store import EMBEDDING_DIM, VectorStore
 from src.qa_schema import SourceId
 from tests._pdf_fixtures import write_pdf
+
+# P1 config + derived tag + chunker are shared by every _process_entry call
+# below — resolved once at import time so tests read cleanly and any
+# accidental config change registers in one place.
+_P1_CFG = get_pipeline("p1")
+_P1_TAG = _P1_CFG.tag
+
+
+def _p1_chunker(doc):
+    return chunk_fixed(doc, _P1_CFG.chunker)
 
 
 class _QuietLogger:
@@ -220,6 +231,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -246,6 +259,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -257,13 +272,15 @@ class TestProcessEntryIntegration:
         assert first_calls > 0
 
         # Sanity: chunks landed under the expected pipeline tag.
-        assert clean_store.count_chunks(PIPELINE_TAG) == first.num_chunks
+        assert clean_store.count_chunks(_P1_TAG) == first.num_chunks
 
         # Second run — same file, unchanged → skipped, zero embed calls.
         second = ingest_mod._process_entry(
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -271,7 +288,7 @@ class TestProcessEntryIntegration:
         )
         assert second.status == "skipped_unchanged"
         assert embedder.calls == first_calls, "second run must not call embed"
-        assert clean_store.count_chunks(PIPELINE_TAG) == first.num_chunks
+        assert clean_store.count_chunks(_P1_TAG) == first.num_chunks
 
     def test_force_reembeds(
         self,
@@ -289,6 +306,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -301,6 +320,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=True,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -325,6 +346,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=True,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -334,7 +357,7 @@ class TestProcessEntryIntegration:
         assert result.tokens_embedded > 0  # reports the pre-flight estimate
         assert result.cost_usd == 0.0
         assert embedder.calls == 0
-        assert clean_store.count_chunks(PIPELINE_TAG) == 0
+        assert clean_store.count_chunks(_P1_TAG) == 0
 
     def test_dry_run_works_without_store(
         self,
@@ -353,6 +376,8 @@ class TestProcessEntryIntegration:
             entry,
             store=None,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=True,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -370,7 +395,7 @@ class TestProcessEntryIntegration:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Guards C3: a doc row whose content_hash matches but has ZERO chunks
-        # for PIPELINE_TAG must NOT be skipped. This is the partial-failure
+        # for _P1_TAG must NOT be skipped. This is the partial-failure
         # recovery path AND the future P2/P3/P4-after-P1 path.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
         dest = tmp_path / "corpus" / "test/A1_fake.pdf"
@@ -393,13 +418,15 @@ class TestProcessEntryIntegration:
             )
         )
         clean_store.conn.commit()
-        assert clean_store.count_chunks(PIPELINE_TAG) == 0
+        assert clean_store.count_chunks(_P1_TAG) == 0
 
         embedder = _FakeEmbedder()
         result = ingest_mod._process_entry(
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -407,7 +434,7 @@ class TestProcessEntryIntegration:
         )
         assert result.status == "ingested"  # NOT skipped_unchanged
         assert embedder.calls == 1
-        assert clean_store.count_chunks(PIPELINE_TAG) == result.num_chunks
+        assert clean_store.count_chunks(_P1_TAG) == result.num_chunks
 
     def test_shrinking_chunkset_no_orphans(
         self,
@@ -428,6 +455,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -435,7 +464,7 @@ class TestProcessEntryIntegration:
         )
         assert v1.status == "ingested"
         assert v1.num_chunks > 1
-        v1_count = clean_store.count_chunks(PIPELINE_TAG)
+        v1_count = clean_store.count_chunks(_P1_TAG)
         assert v1_count == v1.num_chunks
 
         # v2: same path, much smaller content → fewer chunks.
@@ -444,6 +473,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -452,7 +483,7 @@ class TestProcessEntryIntegration:
         assert v2.status == "ingested"
         assert v2.num_chunks < v1_count, "test setup should produce fewer v2 chunks"
         # The load-bearing assertion: total chunks == v2's chunks, not v1_count.
-        assert clean_store.count_chunks(PIPELINE_TAG) == v2.num_chunks
+        assert clean_store.count_chunks(_P1_TAG) == v2.num_chunks
 
     def test_partial_failure_leaves_docrow_absent(
         self,
@@ -484,6 +515,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",
@@ -497,7 +530,7 @@ class TestProcessEntryIntegration:
             row = cur.fetchone()
             assert row is not None
             assert row[0] == 0, "partial-failure must not commit the doc row"
-        assert clean_store.count_chunks(PIPELINE_TAG) == 0
+        assert clean_store.count_chunks(_P1_TAG) == 0
 
     def test_optional_missing_does_not_fail(
         self,
@@ -512,6 +545,8 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
+            pipeline_tag=_P1_TAG,
+            chunker=_p1_chunker,
             force=False,
             dry_run=False,
             log_path=tmp_path / "llm_calls.jsonl",

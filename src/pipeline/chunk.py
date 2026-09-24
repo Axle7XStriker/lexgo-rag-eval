@@ -1,8 +1,9 @@
-"""Fixed-window token chunker for P1 baseline.
+"""Fixed-window token chunker.
 
-500-token target with 50-token overlap over the whole document, tokenized
-via `tiktoken cl100k_base`. Chunks carry their originating `page_start` /
-`page_end` so citations can point at a page range.
+Target/overlap tokens are driven by the caller's `ChunkerConfig` (from
+`src.pipeline.pipeline_config`) — the P1 baseline uses 500/50, but any
+`ChunkerConfig(algorithm="fixed", target_tokens=..., overlap_tokens=...)`
+is a valid input.
 
 Design notes worth remembering:
   - Voyage does not publish a public tokenizer. cl100k_base (OpenAI's) is
@@ -11,8 +12,6 @@ Design notes worth remembering:
   - Pages join with `hashing.PAGE_JOIN` into one token stream. The
     separator's tokens are attributed to whichever page's boundary they
     straddle — cheap and honest enough for citations.
-  - `PIPELINE_TAG` is the exact string written to `chunks.pipeline` so all
-    P1 rows are queryable with a single WHERE clause. Do not typo it.
   - The final chunk is kept even if shorter than `target_tokens` — dropping
     the tail would silently lose the last few paragraphs of every doc.
 """
@@ -25,11 +24,7 @@ import tiktoken
 
 from src.pipeline.extract import ExtractedDoc
 from src.pipeline.hashing import PAGE_JOIN, sha256_utf8
-
-PIPELINE_TAG = "p1_fixed_500_50"
-DEFAULT_TARGET_TOKENS = 500
-DEFAULT_OVERLAP_TOKENS = 50
-DEFAULT_ENCODING = "cl100k_base"
+from src.pipeline.pipeline_config import ChunkerConfig
 
 
 @dataclass(frozen=True)
@@ -87,22 +82,29 @@ def _page_of(token_index: int, page_starts: list[int]) -> int:
     return page
 
 
-def chunk_fixed(
-    doc: ExtractedDoc,
-    *,
-    target_tokens: int = DEFAULT_TARGET_TOKENS,
-    overlap_tokens: int = DEFAULT_OVERLAP_TOKENS,
-    encoding_name: str = DEFAULT_ENCODING,
-) -> list[Chunk]:
-    """Split `doc` into fixed-window chunks with per-chunk page ranges.
+def chunk_fixed(doc: ExtractedDoc, config: ChunkerConfig) -> list[Chunk]:
+    """Split `doc` into fixed-window chunks per `config`.
 
     Windows advance by `target_tokens - overlap_tokens`. The last chunk is
     kept even if shorter than the target. Empty documents return an empty
     list (caller decides whether that's a fatal error).
 
     Raises:
-      ValueError — `overlap_tokens >= target_tokens` (would loop forever).
+      ValueError — `config.algorithm != "fixed"`, or the fixed knobs are
+        missing/inconsistent (e.g. `overlap_tokens >= target_tokens`).
     """
+    if config.algorithm != "fixed":
+        raise ValueError(
+            f"chunk_fixed requires ChunkerConfig(algorithm='fixed'), got {config.algorithm!r}"
+        )
+    if config.target_tokens is None or config.overlap_tokens is None:
+        raise ValueError(
+            "chunk_fixed requires target_tokens and overlap_tokens to be set "
+            f"on the ChunkerConfig; got target_tokens={config.target_tokens}, "
+            f"overlap_tokens={config.overlap_tokens}"
+        )
+    target_tokens = config.target_tokens
+    overlap_tokens = config.overlap_tokens
     if overlap_tokens >= target_tokens:
         raise ValueError(
             f"overlap_tokens ({overlap_tokens}) must be strictly less than "
@@ -117,7 +119,7 @@ def chunk_fixed(
     if not any(p.text.strip() for p in doc.pages):
         return []
 
-    encoder = tiktoken.get_encoding(encoding_name)
+    encoder = tiktoken.get_encoding(config.encoding)
     page_starts, tokens = _encode_pages(doc, encoder)
     total = len(tokens)
     if total == 0:

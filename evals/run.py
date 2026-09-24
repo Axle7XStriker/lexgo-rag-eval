@@ -1,10 +1,11 @@
-"""P1 eval orchestrator — golden Q&As → pipeline → judge → per-run artifacts.
+"""Eval orchestrator — golden Q&As → pipeline → judge → per-run artifacts.
 
-Sequential loop over the golden set. For each record: run the P1 pipeline to
-produce an answer, score citations + retrieval programmatically, call the
-judge for accuracy + semantic citation validity, and append a `QAResult`
-line to `results.jsonl`. On any exception, skip the record with an `error`
-string set and continue — a partial run is more valuable than a crashed one.
+Sequential loop over the golden set. For each record: run the selected
+pipeline (P1..P4, via `--pipeline`) to produce an answer, score citations
++ retrieval programmatically, call the judge for accuracy + semantic
+citation validity, and append a `QAResult` line to `results.jsonl`. On any
+exception, skip the record with an `error` string set and continue — a
+partial run is more valuable than a crashed one.
 
 CLI::
 
@@ -15,9 +16,9 @@ Design notes worth remembering:
     `ClaudeJudge` — constructed once in `main()`, reused across every Q&A.
     Same shape as `scripts/ingest.py` opens one embedder + store for the
     document loop.
-  - `--pipeline` only accepts `p1` today. P2/P3/P4 will register their own
-    retrieval variants against this same harness; the arg is a switch, not
-    a plugin registry, until we actually have >1 pipeline.
+  - Pipelines are registered in `src.pipeline.pipeline_config.PIPELINES`;
+    `--pipeline` accepts any key from that registry. Adding P2..P4 is a
+    one-line dict entry, not a change here.
   - Malformed golden file is FATAL. Same contract as `make validate`:
     refuse to run against a broken qa.jsonl rather than silently evaluating
     the parseable subset.
@@ -56,30 +57,21 @@ from evals.metrics import (
 )
 from src.config import get_settings
 from src.observability import configure_logging, get_logger
-from src.pipeline.chunk import (
-    DEFAULT_OVERLAP_TOKENS,
-    DEFAULT_TARGET_TOKENS,
-    PIPELINE_TAG,
-)
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
 from src.pipeline.judge import PROMPT_VERSION as JUDGE_PROMPT_VERSION
 from src.pipeline.judge import ClaudeJudge
-from src.pipeline.query import DEFAULT_TOP_K, answer_question
+from src.pipeline.pipeline_config import PIPELINES, get_pipeline, pipeline_to_manifest_dict
 from src.pipeline.query import PROMPT_VERSION as ANSWER_PROMPT_VERSION
+from src.pipeline.query import answer_question
 from src.pipeline.store import VectorStore
 from src.qa_schema import GOLDEN_TOTAL, QARecord, QAType, counts_by_type, load_jsonl
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_QA_PATH = REPO_ROOT / "evals" / "golden" / "qa.jsonl"
 
-# Only `p1` for now; adding p2..p4 is a switch here + a retrieval branch
-# inside `_run_one`. The registry stays flat until we actually have >1.
-SUPPORTED_PIPELINES: tuple[str, ...] = ("p1",)
-
-# Pipeline column tag persisted per QAResult / manifest so future P2..P4 runs
-# don't collide in `summary.md` when they're compared side-by-side.
-PIPELINE_LABEL_FOR_ARG: dict[str, str] = {"p1": PIPELINE_TAG}
+# CLI keys are exactly the keys registered in `src.pipeline.pipeline_config.PIPELINES`.
+SUPPORTED_PIPELINES: tuple[str, ...] = tuple(PIPELINES.keys())
 
 
 def _git_sha() -> str:
@@ -110,7 +102,8 @@ def _run_one(
     store: VectorStore,
     generator: ClaudeGenerator,
     judge: ClaudeJudge,
-    pipeline_arg: str,
+    pipeline_tag: str,
+    top_k: int,
     run_id: str,
 ) -> QAResult:
     """Evaluate one record end-to-end. Never raises — catches → error field.
@@ -123,14 +116,13 @@ def _run_one(
     started = time.perf_counter()
 
     try:
-        pipeline_tag = PIPELINE_LABEL_FOR_ARG[pipeline_arg]
         query_result = answer_question(
             query=record.question,
             embedder=embedder,
             store=store,
             generator=generator,
             pipeline_tag=pipeline_tag,
-            top_k=DEFAULT_TOP_K,
+            top_k=top_k,
             run_id=run_id,
         )
     except Exception as e:
@@ -267,6 +259,27 @@ def _format_pct(value: float | None) -> str:
     return f"{value * 100:.1f}%"
 
 
+def _chunker_summary(chunker_cfg: dict[str, Any]) -> str:
+    """Render the chunker's algorithm-specific knobs for `summary.md`.
+
+    Kept minimal — the full config is already in `manifest.json` for
+    reproducibility; this line is for a human skimming the summary.
+    """
+    algo = chunker_cfg["algorithm"]
+    if algo == "fixed":
+        return (
+            f"target_tokens={chunker_cfg['target_tokens']}, "
+            f"overlap_tokens={chunker_cfg['overlap_tokens']}"
+        )
+    if algo == "semantic":
+        return (
+            f"percentile_threshold={chunker_cfg['percentile_threshold']}, "
+            f"min_tokens={chunker_cfg['min_tokens']}, "
+            f"max_tokens={chunker_cfg['max_tokens']}"
+        )
+    return "(unknown algorithm)"
+
+
 def _format_ms(value: float | None) -> str:
     """Format a latency in ms as `NNNNms`, or `n/a` for None."""
     if value is None:
@@ -306,19 +319,25 @@ def _write_summary_md(
     skipped = [r for r in results if r.error is not None]
     per_type = _per_type_counts(results)
 
+    pipeline_cfg = manifest["config"]["pipeline"]
+    models = manifest["config"]["models"]
+    chunker_cfg = pipeline_cfg["chunker"]
+    retriever_cfg = pipeline_cfg["retriever"]
+
     lines: list[str] = []
     lines.append(f"# Eval run — {manifest['run_id']}")
     lines.append("")
-    lines.append(f"- pipeline: `{manifest['pipeline']}`")
+    lines.append(f"- pipeline: `{pipeline_cfg['tag']}` (key `{pipeline_cfg['key']}`)")
     lines.append(f"- git_sha: `{manifest['git_sha']}`")
     lines.append(
         f"- prompt versions: answer=`{manifest['prompt_versions']['answer']}`, "
         f"judge=`{manifest['prompt_versions']['judge']}`"
     )
-    lines.append(f"- chat model: `{manifest['config']['chat_model']}`")
-    lines.append(f"- judge model: `{manifest['config']['judge_model']}`")
-    lines.append(f"- embedding model: `{manifest['config']['embedding_model']}`")
-    lines.append(f"- top_k: {manifest['config']['top_k']}")
+    lines.append(f"- chat model: `{models['chat_model']}`")
+    lines.append(f"- judge model: `{models['judge_model']}`")
+    lines.append(f"- embedding model: `{models['embedding_model']}`")
+    lines.append(f"- chunker: `{chunker_cfg['algorithm']}` ({_chunker_summary(chunker_cfg)})")
+    lines.append(f"- retriever: `{retriever_cfg['kind']}`, top_k={retriever_cfg['top_k']}")
     lines.append(f"- golden path: `{manifest['golden_set']['path']}`")
     lines.append(f"- golden loaded: {manifest['golden_set']['n_records_loaded']} / {GOLDEN_TOTAL}")
     lines.append(f"- wall_clock: {manifest['totals']['wall_clock_seconds']:.1f}s")
@@ -343,9 +362,7 @@ def _write_summary_md(
     lines.append(f"| p95 latency | {_format_ms(metrics.p95_latency_ms)} |")
     lines.append(f"| cost — generate | ${metrics.total_generate_cost_usd:.4f} |")
     lines.append(f"| cost — judge | ${metrics.total_judge_cost_usd:.4f} |")
-    lines.append(
-        f"| cost — generate + judge | ${metrics.total_generate_judge_cost_usd:.4f} |"
-    )
+    lines.append(f"| cost — generate + judge | ${metrics.total_generate_judge_cost_usd:.4f} |")
     lines.append("")
     lines.append("## Accuracy by QA type")
     lines.append("")
@@ -419,6 +436,8 @@ def main() -> int:
         print(f"\n{args.qa_path} has zero records — nothing to evaluate. Exiting.\n")
         return 0
 
+    cfg = get_pipeline(args.pipeline)
+
     run_started = datetime.now(UTC)
     # Microseconds in the id so two runs kicked off inside the same second
     # (rerun-fast, accidental `make eval &`) get separate directories AND
@@ -436,7 +455,8 @@ def main() -> int:
     logger.info(
         "eval_start",
         run_id=run_id,
-        pipeline=args.pipeline,
+        pipeline=cfg.tag,
+        pipeline_key=cfg.key,
         n_records=len(records),
         qa_path=str(args.qa_path),
     )
@@ -472,7 +492,8 @@ def main() -> int:
                 store=store,
                 generator=generator,
                 judge=judge,
-                pipeline_arg=args.pipeline,
+                pipeline_tag=cfg.tag,
+                top_k=cfg.retriever.top_k,
                 run_id=run_id,
             )
             results.append(qa_result)
@@ -510,19 +531,28 @@ def main() -> int:
 
     manifest: dict[str, Any] = {
         "run_id": run_id,
-        "pipeline": PIPELINE_LABEL_FOR_ARG[args.pipeline],
         "git_sha": _git_sha(),
         "prompt_versions": {
             "answer": ANSWER_PROMPT_VERSION,
             "judge": JUDGE_PROMPT_VERSION,
         },
+        # `config.pipeline` = full PipelineConfig (chunker/retriever/reranker
+        # knobs + derived tag) so the artifact is self-describing. The tag
+        # is intentionally NOT duplicated at the top level — one source of
+        # truth (`config.pipeline.tag`) keeps a future refactor from
+        # silently letting the two copies disagree. Downstream consumers
+        # should read from `config.pipeline.tag`.
+        # `config.models` = provider identities held constant across pipelines
+        # (chat, judge, embedding) — kept separate because they're not part of
+        # the pipeline's identity (a change here doesn't warrant a new DB tag,
+        # but it DOES belong in the manifest for reproducibility).
         "config": {
-            "chat_model": settings.chat_model,
-            "judge_model": settings.judge_model,
-            "embedding_model": settings.embedding_model,
-            "top_k": DEFAULT_TOP_K,
-            "chunk_size": DEFAULT_TARGET_TOKENS,
-            "chunk_overlap": DEFAULT_OVERLAP_TOKENS,
+            "pipeline": pipeline_to_manifest_dict(cfg),
+            "models": {
+                "chat_model": settings.chat_model,
+                "judge_model": settings.judge_model,
+                "embedding_model": settings.embedding_model,
+            },
         },
         "golden_set": {
             "path": str(args.qa_path.relative_to(REPO_ROOT))

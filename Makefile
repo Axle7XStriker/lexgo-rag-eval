@@ -1,6 +1,11 @@
 .DEFAULT_GOAL := help
 .PHONY: help setup app corpus ingest validate eval test lint format clean db-up db-down
 
+# Which retrieval pipeline `make ingest` / `make eval` target. Override on
+# the command line: `make ingest PIPELINE=p2`, `make eval PIPELINE=p2`.
+# Valid keys come from src.pipeline.pipeline_config.PIPELINES.
+PIPELINE ?= p1
+
 help: ## Show available targets
 	@awk 'BEGIN {FS = ":.*?## "} /^[a-zA-Z_-]+:.*?## / {printf "  \033[36m%-10s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 
@@ -13,8 +18,8 @@ app: ## Run the Streamlit app (Demo + Author pages)
 corpus: ## Download MIT OCW PDFs into corpus/ (idempotent)
 	uv run python -m scripts.fetch_corpus
 
-ingest: ## Ingest corpus PDFs into pgvector (P1 fixed 500/50 chunks)
-	uv run python -m scripts.ingest
+ingest: ## Ingest corpus PDFs into pgvector (default P1; override with PIPELINE=p2)
+	uv run python -m scripts.ingest --pipeline $(PIPELINE)
 
 db-up: ## Start local Postgres+pgvector (docker compose)
 	docker compose up -d
@@ -26,8 +31,8 @@ db-down: ## Stop the local Postgres container
 validate: ## Lint the golden Q&A set (evals/golden/qa.jsonl)
 	uv run python -m evals.validate_golden
 
-eval: ## Run the P1 eval loop over evals/golden/qa.jsonl
-	uv run python -m evals.run --pipeline p1
+eval: ## Run the eval loop over evals/golden/qa.jsonl (default P1; override with PIPELINE=p2)
+	uv run python -m evals.run --pipeline $(PIPELINE)
 
 test: ## Run pytest
 	uv run pytest

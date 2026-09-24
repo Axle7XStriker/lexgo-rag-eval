@@ -1,4 +1,4 @@
-"""P1 query pipeline — query → embed → dense retrieve → generate answer with citations.
+"""Query pipeline — query → embed → dense retrieve → generate answer with citations.
 
 One public entrypoint: `answer_question(...)`. Takes already-built dependencies
 (embedder, store, generator) so tests can inject fakes and Streamlit / eval
@@ -22,16 +22,12 @@ import time
 from dataclasses import dataclass
 
 from src.observability import get_logger
-from src.pipeline.chunk import PIPELINE_TAG
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL, load_prompt, render_user_template
 from src.pipeline.store import RetrievedChunk, VectorStore
 
 _logger = get_logger("query")
-
-# P1 matrix from CLAUDE.md — dense top-10.
-DEFAULT_TOP_K = 10
 
 # `role` + `version` locate the prompt file at prompts/<role>/<version>.md.
 # When we author a v2 answer prompt, bump PROMPT_VERSION here. Any change to
@@ -147,8 +143,8 @@ def answer_question(
     embedder: VoyageEmbedder,
     store: VectorStore,
     generator: ClaudeGenerator,
-    pipeline_tag: str = PIPELINE_TAG,
-    top_k: int = DEFAULT_TOP_K,
+    pipeline_tag: str,
+    top_k: int,
     run_id: str | None = None,
 ) -> QueryResult:
     """Run one query through the P1 pipeline. Never raises for empty retrieval.
