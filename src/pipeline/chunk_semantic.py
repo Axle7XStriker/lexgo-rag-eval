@@ -94,24 +94,92 @@ _SENTENCE_SPLIT_RE = re.compile(
 
 @dataclass(frozen=True)
 class _Sentence:
-    """One sentence with its 1-indexed originating page."""
+    """One sentence with the 1-indexed page range it spans.
+
+    Most sentences fit on one page (`page_start == page_end`). A sentence
+    that wraps line-wise across a PDF page boundary (common in OCW notes)
+    carries both endpoints so page-range attribution on the emitted `Chunk`
+    stays honest.
+    """
 
     text: str
-    page: int
+    page_start: int
+    page_end: int
+
+
+# Single-newline separator used only for splitting sentences across pages.
+# `PAGE_JOIN` from hashing.py is `\n\n`, which would trigger the paragraph-
+# break branch of `_SENTENCE_SPLIT_RE` at every page and fragment sentences
+# that wrap across page boundaries — the exact bug this joiner exists to
+# avoid. Content hashing still uses PAGE_JOIN; only sentence-splitting uses
+# this one.
+_SENTENCE_PAGE_JOIN = "\n"
 
 
 def _split_sentences(doc: ExtractedDoc) -> list[_Sentence]:
-    """Split every page into sentences, tagging each with its page number.
+    """Split the whole doc's text into sentences, tagging each with its page range.
 
-    Filters empty and whitespace-only results. Preserves reading order:
-    all page-1 sentences come first, then page-2, etc.
+    Joins pages before splitting rather than per-page-splitting, because a
+    sentence that line-wraps across a PDF page boundary ("The quicksort
+    algorithm has average-" / "case complexity O(n log n).") would otherwise
+    be fragmented into two half-sentences whose individual embeddings are
+    meaningless and would corrupt the consecutive-sentence distance signal
+    the percentile threshold is computed on. Each sentence's page range is
+    derived from its character offset in the joined string.
+
+    Filters empty and whitespace-only results. Preserves reading order.
     """
+    if not doc.pages:
+        return []
+
+    # rstrip each page's text so page boundaries in the joined string are a
+    # single `\n` — a blank line at the bottom of one page plus a blank at
+    # the top of the next would otherwise reconstruct `\n\s*\n` and trigger
+    # a spurious sentence split at every page break.
+    stripped = [p.text.rstrip() for p in doc.pages]
+
+    # Record the character offset where each page's text begins in the joined
+    # string, so we can map a sentence's start/end offsets back to page numbers.
+    offsets: list[int] = []
+    running = 0
+    for i, text in enumerate(stripped):
+        if i > 0:
+            running += len(_SENTENCE_PAGE_JOIN)
+        offsets.append(running)
+        running += len(text)
+    joined = _SENTENCE_PAGE_JOIN.join(stripped)
+
+    def page_at(offset: int) -> int:
+        """1-indexed PDF page number containing character `offset` in `joined`."""
+        # Linear scan — page counts per doc are small.
+        for i in range(len(offsets) - 1, -1, -1):
+            if offsets[i] <= offset:
+                return doc.pages[i].page_number
+        return doc.pages[0].page_number
+
+    def emit(raw: str, base_offset: int) -> _Sentence | None:
+        text = raw.strip()
+        if not text:
+            return None
+        leading_ws = len(raw) - len(raw.lstrip())
+        abs_start = base_offset + leading_ws
+        abs_end = abs_start + len(text) - 1
+        return _Sentence(
+            text=text,
+            page_start=page_at(abs_start),
+            page_end=page_at(abs_end),
+        )
+
     out: list[_Sentence] = []
-    for page in doc.pages:
-        for raw in _SENTENCE_SPLIT_RE.split(page.text):
-            sentence = raw.strip()
-            if sentence:
-                out.append(_Sentence(text=sentence, page=page.page_number))
+    cursor = 0
+    for match in _SENTENCE_SPLIT_RE.finditer(joined):
+        sentence = emit(joined[cursor : match.start()], cursor)
+        if sentence is not None:
+            out.append(sentence)
+        cursor = match.end()
+    tail = emit(joined[cursor:], cursor)
+    if tail is not None:
+        out.append(tail)
     return out
 
 
@@ -324,7 +392,15 @@ def _fixed_split_single_sentence(
     for start in range(0, len(tokens), max_tokens):
         window = tokens[start : start + max_tokens]
         piece_text = encoder.decode(window)
-        pieces.append([_Sentence(text=piece_text, page=sentence.page)])
+        pieces.append(
+            [
+                _Sentence(
+                    text=piece_text,
+                    page_start=sentence.page_start,
+                    page_end=sentence.page_end,
+                )
+            ]
+        )
     return pieces
 
 
@@ -351,8 +427,8 @@ def _finalize(
                 text=text,
                 num_tokens=num_tokens,
                 chunk_index=idx,
-                page_start=min(s.page for s in group),
-                page_end=max(s.page for s in group),
+                page_start=min(s.page_start for s in group),
+                page_end=max(s.page_end for s in group),
                 content_hash=sha256_utf8(text),
             )
         )

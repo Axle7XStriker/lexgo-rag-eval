@@ -128,11 +128,11 @@ class TestSplitSentences:
     def test_page_tag_preserved(self) -> None:
         doc = _doc(["First. Second.", "Third. Fourth."])
         sents = _split_sentences(doc)
-        assert [(s.text, s.page) for s in sents] == [
-            ("First.", 1),
-            ("Second.", 1),
-            ("Third.", 2),
-            ("Fourth.", 2),
+        assert [(s.text, s.page_start, s.page_end) for s in sents] == [
+            ("First.", 1, 1),
+            ("Second.", 1, 1),
+            ("Third.", 2, 2),
+            ("Fourth.", 2, 2),
         ]
 
     def test_blank_middle_page_preserves_page_numbers(self) -> None:
@@ -140,7 +140,42 @@ class TestSplitSentences:
         # must still report page 3 even if page 2 is empty.
         doc = _doc(["Alpha.", "", "Gamma."])
         sents = _split_sentences(doc)
-        assert [(s.text, s.page) for s in sents] == [("Alpha.", 1), ("Gamma.", 3)]
+        assert [(s.text, s.page_start, s.page_end) for s in sents] == [
+            ("Alpha.", 1, 1),
+            ("Gamma.", 3, 3),
+        ]
+
+    def test_sentence_wrapping_across_pages_is_not_fragmented(self) -> None:
+        # A sentence that line-wraps across a PDF page boundary must remain
+        # one sentence — pre-fix, per-page splitting fragmented it into two
+        # meaningless half-sentences and corrupted the distance signal.
+        doc = _doc(
+            [
+                "Prior sentence. The quicksort algorithm has average-",
+                "case complexity O(n log n). Following sentence.",
+            ]
+        )
+        sents = _split_sentences(doc)
+        # The wrapped sentence stays one _Sentence — both halves are present
+        # in a single entry. The exact joiner between halves (space or `\n`)
+        # is not asserted here; what matters is that they weren't split into
+        # two half-sentences.
+        assert len(sents) == 3
+        assert sents[0].text == "Prior sentence."
+        assert sents[2].text == "Following sentence."
+        assert "average-" in sents[1].text
+        assert "case complexity O(n log n)." in sents[1].text
+        # The wrapped sentence spans both pages; the others sit on one page each.
+        assert [(s.page_start, s.page_end) for s in sents] == [(1, 1), (1, 2), (2, 2)]
+
+    def test_page_boundary_between_sentences_does_not_over_split(self) -> None:
+        # A trailing blank line at the bottom of page 1 plus a leading blank
+        # line at the top of page 2 must not reconstruct `\n\s*\n` and trigger
+        # a spurious paragraph-break split at every page boundary — page-end
+        # rstrip in `_split_sentences` prevents that.
+        doc = _doc(["First. Second.\n\n", "\n\nThird. Fourth."])
+        sents = _split_sentences(doc)
+        assert [s.text for s in sents] == ["First.", "Second.", "Third.", "Fourth."]
 
 
 # ── Percentile helper ────────────────────────────────────────────────
@@ -353,12 +388,7 @@ class TestBoundEnforcement:
         # remaining oversized group must then split at its strongest
         # internal boundary, between Delta and Epsilon.
         chunks = chunk_semantic(
-            _doc(
-                [
-                    "Alpha one. Beta two. Gamma three. Delta four. "
-                    "Epsilon five. Zeta six."
-                ]
-            ),
+            _doc(["Alpha one. Beta two. Gamma three. Delta four. Epsilon five. Zeta six."]),
             embedder=embedder,
             config=_cfg(min_tokens=1, max_tokens=9, percentile_threshold=100.0),
         )
