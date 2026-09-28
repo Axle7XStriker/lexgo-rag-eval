@@ -14,9 +14,7 @@ implementations that follow the same recipe:
 
 We reimplement rather than depending on either library because both add a
 large dependency tree (LangChain in particular), our corpus is small
-enough that our own sentence splitter suffices, and having the algorithm
-inline keeps every knob visible and versioned in `pipeline_config.py` —
-the eval numbers must be fully our code to be defensible.
+enough that our own sentence splitter suffices.
 
 "Semantic chunking" is distinct from adjacent published techniques:
   - **Late chunking** (Günther et al., 2024, [arXiv:2409.04701]) — embeds
@@ -32,7 +30,7 @@ the eval numbers must be fully our code to be defensible.
 Design notes worth remembering:
   - Sentence splitter is regex-based, no external NLP dep. Splits on
     `.!?` followed by whitespace + capital/digit/bracket, and on blank
-    lines. Handles OCW course notes adequately; edge cases (formulas,
+    lines. Handles current corpus adequately; edge cases (formulas,
     footnote glue) surface as short "sentences" that the min-token
     merge step absorbs.
   - Emits the same `Chunk` dataclass P1 emits — DB rows are shape-
@@ -160,7 +158,7 @@ def _percentile(values: list[float], p: float) -> float:
 def _group_by_cuts(sentences: list[_Sentence], cut_after: set[int]) -> list[list[_Sentence]]:
     """Group sentences into runs, cutting after each index in `cut_after`.
 
-    `cut_after[i] = True` means a chunk boundary sits between sentences
+    `i in cut_after` means a chunk boundary sits between sentences
     `i` and `i+1`. Returns a list of runs, each a list of sentences.
     Empty input → empty list.
     """
@@ -274,16 +272,16 @@ def _split_oversized(
     def group_tokens(g: list[_Sentence]) -> int:
         return _tokens_of(" ".join(s.text for s in g), encoder)
 
-    def start_index(g: list[_Sentence], all_flat: list[_Sentence]) -> int:
+    def start_index(g: list[_Sentence], all_sentences: list[_Sentence]) -> int:
         # Sentences are frozen dataclasses shared by identity — find the
         # first occurrence by object identity, not equality (two sentences
         # with the same text on different pages must not collide).
-        for i, s in enumerate(all_flat):
+        for i, s in enumerate(all_sentences):
             if s is g[0]:
                 return i
         raise AssertionError("group[0] not found in flat sentence list")
 
-    all_flat: list[_Sentence] = [s for g in groups for s in g]
+    all_sentences: list[_Sentence] = [s for g in groups for s in g]
 
     def split_one(g: list[_Sentence]) -> list[list[_Sentence]]:
         if group_tokens(g) <= max_tokens:
@@ -294,7 +292,7 @@ def _split_oversized(
             # tag on every fragment.
             return _fixed_split_single_sentence(g[0], encoder=encoder, max_tokens=max_tokens)
         # Find the internal boundary with the highest distance.
-        start = start_index(g, all_flat)
+        start = start_index(g, all_sentences)
         internal_dists = distances[start : start + len(g) - 1]
         cut = max(range(len(internal_dists)), key=lambda i: internal_dists[i])
         left = g[: cut + 1]

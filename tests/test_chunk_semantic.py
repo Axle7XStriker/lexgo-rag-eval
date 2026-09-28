@@ -106,18 +106,20 @@ class TestSplitSentences:
         # A blank line is a hard split even without terminal punctuation.
         doc = _doc(["Alpha paragraph without period\n\nBeta paragraph"])
         sents = _split_sentences(doc)
-        assert len(sents) == 2
-        assert sents[0].text.startswith("Alpha")
-        assert sents[1].text.startswith("Beta")
+        assert [s.text for s in sents] == [
+            "Alpha paragraph without period",
+            "Beta paragraph",
+        ]
 
     def test_ellipsis_not_split_mid_sentence(self) -> None:
         # `...` inside a sentence followed by lowercase should not split.
         # (Regex requires capital/digit/bracket after the whitespace.)
         doc = _doc(["I was thinking... maybe we shouldn't. Second sentence."])
         sents = _split_sentences(doc)
-        assert len(sents) == 2
-        assert "thinking" in sents[0].text
-        assert sents[1].text == "Second sentence."
+        assert [s.text for s in sents] == [
+            "I was thinking... maybe we shouldn't.",
+            "Second sentence.",
+        ]
 
     def test_whitespace_only_page_yields_no_sentences(self) -> None:
         doc = _doc(["   \n\n  "])
@@ -210,11 +212,12 @@ class TestChunkerHappyPath:
             embedder=embedder,
             config=_cfg(min_tokens=1, max_tokens=999),
         )
-        assert len(chunks) == 2
-        assert "Alpha" in chunks[0].text and "Gamma" in chunks[0].text
-        assert "Delta" in chunks[1].text and "Epsilon" in chunks[1].text
+        assert [chunk.text for chunk in chunks] == [
+            "Alpha sentence about dogs. Beta about dogs too. Gamma dogs again.",
+            "Delta about photosynthesis. Epsilon photosynthesis too.",
+        ]
 
-    def test_run_id_threaded_to_embedder(self) -> None:
+    def test_embedder_called_once_with_sentence_count_and_run_id(self) -> None:
         embedder = _FakeEmbedder()
         chunk_semantic(
             _doc(["Only one. And another."]),
@@ -222,7 +225,7 @@ class TestChunkerHappyPath:
             config=_cfg(min_tokens=1),
             run_id="run_abc",
         )
-        assert embedder.calls[0]["run_id"] == "run_abc"
+        assert embedder.calls == [{"n": 2, "run_id": "run_abc"}]
 
     def test_content_hashes_deterministic(self) -> None:
         # Same input + same fake vectors → identical Chunk.content_hash.
@@ -239,7 +242,7 @@ class TestChunkerHappyPath:
             embedder=embedder,
             config=_cfg(min_tokens=1),
         )
-        assert [c.chunk_index for c in chunks] == list(range(len(chunks)))
+        assert [c.chunk_index for c in chunks] == list(range(6))
 
 
 # ── Early returns ────────────────────────────────────────────────────
@@ -280,29 +283,10 @@ class TestPageRanges:
             embedder=embedder,
             config=_cfg(min_tokens=1),
         )
-        assert all(c.page_start == 1 and c.page_end == 1 for c in chunks)
+        assert [(c.page_start, c.page_end) for c in chunks] == [(1, 1)] * 3
 
-    def test_multi_page_chunk_reports_range(self) -> None:
-        # Two pages, same theme (identical embeddings) so no cut → one
-        # chunk spanning both pages.
+    def test_multi_page_chunk_reports_page_range(self) -> None:
         embedder = _FakeEmbedder()  # every sentence gets default_vector
-        chunks = chunk_semantic(
-            _doc(["First sentence.", "Second sentence."]),
-            embedder=embedder,
-            config=_cfg(min_tokens=1, percentile_threshold=99.0),
-        )
-        # With identical vectors all distances = 0, so 99th percentile = 0
-        # and every distance >= threshold → ALL cuts fire. But since only
-        # 1 pair exists (2 sentences), exactly 1 cut → 2 chunks.
-        # Let's use a doc where a cut is IMPOSSIBLE to prove page span.
-        # Actually with 2 sentences even with a cut we get 2 chunks
-        # each on a distinct page. Let's build a case that MUST span.
-        # 3 pages, 3 sentences, identical vectors → distances=[0,0].
-        # percentile=95: threshold = 0, ALL >= 0 → 2 cuts → 3 chunks.
-        # Use percentile=100.001? Out of range. Use very high threshold
-        # via an unreachable value? _percentile clamps ≤ 100.
-        # Simplest: prove multi-page span via `_merge_undersized` forcing
-        # a merge across pages when min_tokens is high enough.
         chunks = chunk_semantic(
             _doc(["Short.", "Also short.", "Third short."]),
             embedder=embedder,
@@ -332,48 +316,58 @@ class TestPageRanges:
 
 class TestBoundEnforcement:
     def test_undersized_groups_merge(self) -> None:
-        # Every sentence stands alone (5 sentences, all cuts fire under
-        # a low threshold), but min_tokens=100 forces merges. End state:
-        # far fewer than 5 groups. This confirms the merge pass runs.
-        embedder = _FakeEmbedder()  # all identical → threshold=0 → every cut
-        chunks = chunk_semantic(
-            _doc(["A short. B short. C short. D short. E short."]),
-            embedder=embedder,
-            config=_cfg(min_tokens=100, max_tokens=999, percentile_threshold=1.0),
-        )
-        assert len(chunks) < 5
-        # All merged content preserved.
-        joined = " ".join(c.text for c in chunks)
-        for token in ("A short", "B short", "C short", "D short", "E short"):
-            assert token in joined
-
-    def test_oversized_group_splits(self) -> None:
-        # One big group with an obvious internal boundary (identical vecs
-        # on left, orthogonal vec in the middle). max_tokens=5 forces the
-        # split to fire even though no percentile-cut fires.
+        # Distances are roughly [0, 0.8, 1, 0], so percentile cutting creates
+        # groups [Alpha, Beta], [Gamma], and [Delta, Epsilon]. The undersized
+        # Gamma group should merge left across the lower-distance boundary.
         embedder = _FakeEmbedder(
             vectors_by_prefix={
                 "Alpha": [1.0, 0.0],
                 "Beta": [1.0, 0.0],
-                "Gamma": [0.0, 1.0],
-                "Delta": [0.0, 1.0],
+                "Gamma": [0.2, 0.9797959],
+                "Delta": [-0.9797959, 0.2],
+                "Epsilon": [-0.9797959, 0.2],
             },
         )
-        # Bump percentile_threshold to 100 so NO percentile cut fires
-        # (every dist < threshold). Only the max_tokens split does work.
         chunks = chunk_semantic(
-            _doc(["Alpha one. Beta two. Gamma three. Delta four."]),
+            _doc(["Alpha one. Beta two. Gamma three. Delta four. Epsilon five."]),
             embedder=embedder,
-            config=_cfg(min_tokens=1, max_tokens=5, percentile_threshold=100.0),
+            config=_cfg(min_tokens=5, max_tokens=999, percentile_threshold=75.0),
         )
-        assert len(chunks) >= 2
-        # Splits happen at the strongest internal boundary; the Alpha/Beta
-        # pair should end up together and separate from Gamma/Delta.
-        first_text = chunks[0].text
-        assert "Alpha" in first_text
-        # Gamma should be in a later chunk (post-split).
-        gamma_chunk = next(c for c in chunks if "Gamma" in c.text)
-        assert "Alpha" not in gamma_chunk.text
+        assert [chunk.text for chunk in chunks] == [
+            "Alpha one. Beta two. Gamma three.",
+            "Delta four. Epsilon five.",
+        ]
+
+    def test_oversized_group_splits(self) -> None:
+        embedder = _FakeEmbedder(
+            vectors_by_prefix={
+                "Alpha": [0.0, -1.0],
+                "Beta": [1.0, 0.0],
+                "Gamma": [1.0, 0.0],
+                "Delta": [1.0, 0.0],
+                "Epsilon": [0.5, 0.8660254],
+                "Zeta": [0.5, 0.8660254],
+            },
+        )
+        # The 100th-percentile cut separates Alpha from the rest. The
+        # remaining oversized group must then split at its strongest
+        # internal boundary, between Delta and Epsilon.
+        chunks = chunk_semantic(
+            _doc(
+                [
+                    "Alpha one. Beta two. Gamma three. Delta four. "
+                    "Epsilon five. Zeta six."
+                ]
+            ),
+            embedder=embedder,
+            config=_cfg(min_tokens=1, max_tokens=9, percentile_threshold=100.0),
+        )
+        assert [chunk.text for chunk in chunks] == [
+            "Alpha one.",
+            "Beta two. Gamma three. Delta four.",
+            "Epsilon five. Zeta six.",
+        ]
+        assert all(chunk.num_tokens <= 9 for chunk in chunks)
 
     def test_single_oversized_sentence_falls_back_to_fixed_split(self) -> None:
         # A single sentence longer than max_tokens has no semantic
@@ -386,7 +380,10 @@ class TestBoundEnforcement:
             config=_cfg(min_tokens=1, max_tokens=50, percentile_threshold=95.0),
         )
         assert len(chunks) > 1  # split into windows
-        assert all(c.num_tokens <= 50 for c in chunks)
+        assert chunks[-1].num_tokens <= 50
+        assert all(c.num_tokens == 50 for c in chunks[:-1])
+        assert "".join(c.text for c in chunks) == long_sentence
+        assert embedder.calls == []
         # All chunks share the sentence's originating page.
         assert all(c.page_start == 1 and c.page_end == 1 for c in chunks)
 
@@ -401,15 +398,34 @@ class TestConfigValidation:
         with pytest.raises(ValueError, match=r"algorithm='semantic'"):
             chunk_semantic(_doc(["A."]), embedder=embedder, config=cfg)
 
-    def test_missing_knobs_raises(self) -> None:
+    @pytest.mark.parametrize(
+        ("cfg", "missing"),
+        [
+            (
+                ChunkerConfig(algorithm="semantic", min_tokens=10, max_tokens=500),
+                "percentile_threshold",
+            ),
+            (
+                ChunkerConfig(
+                    algorithm="semantic",
+                    percentile_threshold=95.0,
+                    max_tokens=500,
+                ),
+                "min_tokens",
+            ),
+            (
+                ChunkerConfig(
+                    algorithm="semantic",
+                    percentile_threshold=95.0,
+                    min_tokens=10,
+                ),
+                "max_tokens",
+            ),
+        ],
+    )
+    def test_missing_knobs_raises(self, cfg: ChunkerConfig, missing: str) -> None:
         embedder = _FakeEmbedder()
-        # Missing min_tokens.
-        cfg = ChunkerConfig(
-            algorithm="semantic",
-            percentile_threshold=95.0,
-            max_tokens=500,
-        )
-        with pytest.raises(ValueError, match="min_tokens"):
+        with pytest.raises(ValueError, match=rf"{missing}=None"):
             chunk_semantic(_doc(["A."]), embedder=embedder, config=cfg)
 
     def test_min_gt_max_raises(self) -> None:
@@ -431,4 +447,4 @@ def test_fake_embedder_signature_matches_real() -> None:
     """Same guard as test_ingest.py — chunker's fake embedder must match Voyage's."""
     real = inspect.signature(VoyageEmbedder.embed_documents)
     fake = inspect.signature(_FakeEmbedder.embed_documents)
-    assert list(real.parameters.keys()) == list(fake.parameters.keys())
+    assert fake == real
