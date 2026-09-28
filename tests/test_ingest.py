@@ -231,7 +231,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -259,7 +259,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -279,7 +279,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -306,7 +306,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -320,7 +320,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=True,
             dry_run=False,
@@ -346,7 +346,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=True,
@@ -358,6 +358,44 @@ class TestProcessEntryIntegration:
         assert result.cost_usd == 0.0
         assert embedder.calls == 0
         assert clean_store.count_chunks(_P1_TAG) == 0
+
+    def test_dry_run_semantic_pipeline_skips_chunker(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        # Semantic chunkers embed sentences internally, so a --dry-run must NOT
+        # invoke the chunker at all — otherwise the "no Voyage calls" contract
+        # documented on --dry-run would silently break and the summary would
+        # under-report spend as $0. The chunker here raises if called so we
+        # get a loud failure if the short-circuit regresses.
+        monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
+        dest = tmp_path / "corpus" / "test/A1_fake.pdf"
+        write_pdf(dest, ["Beta " * 100])
+        entry = _make_entry("test/A1_fake.pdf")
+
+        p2_cfg = get_pipeline("p2")
+
+        def _boom_chunker(_doc):
+            raise AssertionError("chunker must not be called in dry-run for semantic")
+
+        embedder = _FakeEmbedder()
+        result = ingest_mod._process_entry(
+            entry,
+            store=None,
+            embedder=embedder,  # type: ignore[arg-type]
+            cfg=p2_cfg,
+            chunker=_boom_chunker,
+            force=False,
+            dry_run=True,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert result.status == "ingested"
+        assert result.num_chunks == 0  # chunking is skipped in this path
+        assert result.tokens_embedded > 0  # raw-text estimate reported
+        assert result.cost_usd == 0.0
+        assert embedder.calls == 0
 
     def test_dry_run_works_without_store(
         self,
@@ -376,7 +414,7 @@ class TestProcessEntryIntegration:
             entry,
             store=None,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=True,
@@ -425,7 +463,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -455,7 +493,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -473,7 +511,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -515,7 +553,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,
@@ -545,7 +583,7 @@ class TestProcessEntryIntegration:
             entry,
             store=clean_store,
             embedder=embedder,  # type: ignore[arg-type]
-            pipeline_tag=_P1_TAG,
+            cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
             dry_run=False,

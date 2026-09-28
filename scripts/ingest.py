@@ -50,13 +50,16 @@ from pathlib import Path
 from typing import Literal
 
 import psycopg
+import tiktoken
 
 from scripts.corpus_manifest import MANIFEST, ManifestEntry
 from src.config import get_settings
 from src.observability import configure_logging, get_logger
 from src.pipeline.chunk import Chunk, chunk_fixed
+from src.pipeline.chunk_semantic import chunk_semantic
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.extract import ExtractedDoc, extract_pdf
+from src.pipeline.hashing import join_pages
 from src.pipeline.pipeline_config import PIPELINES, PipelineConfig, get_pipeline
 from src.pipeline.store import ChunkRow, DocumentRow, VectorStore
 
@@ -183,7 +186,7 @@ def _process_entry(
     *,
     store: VectorStore | None,
     embedder: VoyageEmbedder,
-    pipeline_tag: str,
+    cfg: PipelineConfig,
     chunker: Callable[[ExtractedDoc], list[Chunk]],
     force: bool,
     dry_run: bool,
@@ -193,10 +196,11 @@ def _process_entry(
 ) -> DocResult:
     """Extract + chunk + embed + upsert one manifest entry. Never raises.
 
-    `pipeline_tag` — the derived DB tag from the active PipelineConfig
-    (`cfg.tag`). Written into the `chunks.pipeline` column and used by the
-    idempotency short-circuit to check whether THIS pipeline has already
-    ingested this doc.
+    `cfg` — the active PipelineConfig. Its `tag` goes into the `chunks.pipeline`
+    column and drives the idempotency short-circuit; its `chunker.algorithm`
+    decides whether dry-run can call `chunker(doc)` at all (semantic chunkers
+    embed sentences internally, so calling one in dry-run would violate the
+    documented "no Voyage calls" contract).
 
     `chunker` — a callable that turns an ExtractedDoc into a list of Chunks.
     Built once per run in `main()` from the active `cfg.chunker.algorithm`.
@@ -204,6 +208,7 @@ def _process_entry(
     `store` may be None in --dry-run (no DB is opened at all). Real runs
     must pass a live VectorStore.
     """
+    pipeline_tag = cfg.tag
     dest = CORPUS_ROOT / entry.dest_path
     result = DocResult(source_id=entry.source_id, doc_path=entry.dest_path, status="error")
     started = time.perf_counter()
@@ -276,6 +281,30 @@ def _process_entry(
                 pipeline=pipeline_tag,
             )
             return result
+
+    # --dry-run early exit for chunkers that themselves call the embedder.
+    # The semantic chunker embeds every sentence internally, so invoking it
+    # here would burn real budget and silently populate `logs/llm_calls.jsonl`
+    # while the summary reports `cost_usd = 0.0`. Instead, estimate the
+    # sentence-embed token count directly from the raw doc text (an upper
+    # bound: the real run also embeds each chunk once at ingest time, but
+    # the sentence pass dominates). num_chunks is left at 0 because the
+    # chunk count is only knowable after actually chunking.
+    if dry_run and cfg.chunker.algorithm == "semantic":
+        encoder = tiktoken.get_encoding(cfg.chunker.encoding)
+        estimated_tokens = len(encoder.encode(join_pages([p.text for p in doc.pages])))
+        result.status = "ingested"  # dry-run success shape
+        result.num_chunks = 0
+        result.tokens_embedded = estimated_tokens
+        result.cost_usd = 0.0
+        result.elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            "dry_run_ok_embedding_chunker",
+            doc_path=entry.dest_path,
+            algorithm=cfg.chunker.algorithm,
+            estimated_sentence_embed_tokens=estimated_tokens,
+        )
+        return result
 
     # Chunk via the pipeline-specific chunker passed in from main().
     chunks = chunker(doc)
@@ -455,10 +484,13 @@ def _build_chunker(
     algorithm = cfg.chunker.algorithm
     if algorithm == "fixed":
         return lambda doc: chunk_fixed(doc, cfg.chunker)
-    # `embedder` is unused for "fixed" but referenced by the semantic branch
-    # that lands in PR 2; kept as an explicit dependency so main() has one
-    # place to wire it.
-    _ = embedder, run_id
+    if algorithm == "semantic":
+        return lambda doc: chunk_semantic(
+            doc,
+            embedder=embedder,
+            config=cfg.chunker,
+            run_id=run_id,
+        )
     raise ValueError(f"no chunker registered for algorithm={algorithm!r}")
 
 
@@ -552,7 +584,7 @@ def main() -> int:
                 entry,
                 store=store,
                 embedder=embedder,
-                pipeline_tag=pipeline_tag,
+                cfg=cfg,
                 chunker=chunker,
                 force=args.force,
                 dry_run=args.dry_run,
