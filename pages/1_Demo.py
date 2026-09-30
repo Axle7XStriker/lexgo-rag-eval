@@ -1,8 +1,10 @@
 """Streamlit demo page — query → answer + citations + retrieved chunks.
 
-P1 baseline wired end-to-end: dense Voyage top-10 -> Claude answer with `[N]`
-citations. P2-P4 pipelines are not built yet, so the sidebar selector stays
-disabled with a tooltip.
+P1 (dense), P2 (semantic + dense), and P3 (hybrid BM25 + dense, RRF-fused) are
+wired end-to-end via the pipeline_config registry: pick one from the sidebar
+and the same `answer_question` code path runs, dispatching on the pipeline's
+`RetrieverConfig.kind`. P4 (hybrid + Cohere rerank) is not built yet — its
+selector option stays disabled.
 """
 
 from __future__ import annotations
@@ -23,9 +25,14 @@ from src.pipeline.query import QueryResult, answer_question
 from src.pipeline.store import VectorStore
 from src.ui_helpers import load_settings_or_stop, render_page_header, render_sidebar
 
-# Demo is P1 only until P2/P3/P4 land. Config lives in pipeline_config so a
-# knob change re-derives the tag automatically and lands on new DB rows.
-_P1_CFG = get_pipeline("p1")
+# Selector labels → pipeline_config keys. Order matches the P1..P4 progression
+# in the blog-post story. P4 is disabled in the selectbox until it lands.
+_PIPELINE_OPTIONS: dict[str, str | None] = {
+    "P1 baseline (dense)": "p1",
+    "P2 semantic (dense)": "p2",
+    "P3 hybrid (BM25 + dense, RRF)": "p3",
+    "P4 hybrid + rerank": None,  # placeholder, disabled
+}
 
 st.set_page_config(page_title="lexgo — demo", page_icon="📚", layout="wide")
 
@@ -84,12 +91,27 @@ def _get_store(database_url: str) -> VectorStore:
 
 with st.sidebar:
     st.subheader("Pipeline variant")
-    st.selectbox(
+    # Streamlit's selectbox doesn't natively disable individual options,
+    # so we render the disabled P4 entry via `format_func` and re-filter
+    # after selection — if the user somehow lands on P4, we surface a
+    # notice and fall back to P1 rather than crashing on a None key.
+    selected_label = st.selectbox(
         "Variant",
-        ["P1 baseline", "P2 semantic", "P3 hybrid", "P4 hybrid+rerank"],
+        list(_PIPELINE_OPTIONS.keys()),
         index=0,
-        disabled=True,
-        help="Only P1 is wired today; P2–P4 land later in W3.",
+        format_func=lambda label: (
+            f"{label}  (coming in W3)" if _PIPELINE_OPTIONS[label] is None else label
+        ),
+        help="Select a retrieval pipeline. P4 lands later in W3.",
+    )
+    selected_key = _PIPELINE_OPTIONS[selected_label]
+    if selected_key is None:
+        st.info("P4 isn't wired yet — using P1 baseline.")
+        selected_key = "p1"
+    active_cfg = get_pipeline(selected_key)
+    st.caption(
+        f"tag: `{active_cfg.tag}`  ·  kind: `{active_cfg.retriever.kind}`  ·  "
+        f"top_k: {active_cfg.retriever.top_k}"
     )
 
 with st.form("query_form", clear_on_submit=False):
@@ -119,8 +141,8 @@ if submitted:
                     embedder=embedder,
                     store=store,
                     generator=generator,
-                    pipeline_tag=_P1_CFG.tag,
-                    top_k=_P1_CFG.retriever.top_k,
+                    pipeline_tag=active_cfg.tag,
+                    retriever=active_cfg.retriever,
                     run_id=run_id,
                 )
             st.session_state["last_result"] = result

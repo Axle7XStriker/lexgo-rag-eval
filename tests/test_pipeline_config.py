@@ -136,6 +136,19 @@ class TestTagChangesOnFieldMutation:
         ]
         self._all_tags_distinct(variants)
 
+    def test_retriever_rrf_k(self) -> None:
+        # P3's fusion knob. rrf_k is None on dense pipelines (P1/P2), so
+        # None→60 must change the tag — otherwise a hybrid config added
+        # later would silently collide with an existing dense tag on the
+        # same top_k. Also exercise 60→30 to prove tuning re-hashes.
+        base = TEST_PIPELINE_CFG
+        variants = [
+            base,
+            replace(base, retriever=replace(base.retriever, rrf_k=60)),
+            replace(base, retriever=replace(base.retriever, rrf_k=30)),
+        ]
+        self._all_tags_distinct(variants)
+
     def test_reranker_addition(self) -> None:
         base = TEST_PIPELINE_CFG
         with_reranker = replace(
@@ -252,7 +265,7 @@ class TestTagMutationCoverage:
         "max_tokens",
         "encoding",
     }
-    _COVERED_RETRIEVER_FIELDS: ClassVar[set[str]] = {"kind", "top_k"}
+    _COVERED_RETRIEVER_FIELDS: ClassVar[set[str]] = {"kind", "top_k", "rrf_k"}
     _COVERED_RERANKER_FIELDS: ClassVar[set[str]] = {"provider", "model", "top_n"}
     _COVERED_PIPELINE_FIELDS: ClassVar[set[str]] = {"key", "chunker", "retriever", "reranker"}
 

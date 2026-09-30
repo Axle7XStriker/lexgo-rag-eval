@@ -18,6 +18,7 @@ import pytest
 
 from src.pipeline import prompts as prompts_module
 from src.pipeline.generate import GenerateResult
+from src.pipeline.pipeline_config import RetrieverConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import (
     PROMPT_VERSION,
@@ -75,16 +76,51 @@ class _FakeEmbedder:
 
 @dataclass
 class _FakeStore:
-    """Duck-types VectorStore — only .dense_search is called by the pipeline."""
+    """Duck-types VectorStore — implements both dense_search and hybrid_search.
+
+    `to_return` is shared across both — pipeline tests don't care which
+    call served the row set; retrieval-mode dispatch is what's under test.
+    Separate `dense_calls` / `hybrid_calls` lists let tests assert which
+    branch actually ran (only one should, per `retriever.kind`).
+    """
 
     to_return: list[RetrievedChunk] = field(default_factory=list)
-    calls: list[dict] = field(default_factory=list)
+    dense_calls: list[dict] = field(default_factory=list)
+    hybrid_calls: list[dict] = field(default_factory=list)
 
     def dense_search(
         self, pipeline: str, query_embedding: list[float], k: int
     ) -> list[RetrievedChunk]:
-        self.calls.append({"pipeline": pipeline, "k": k, "embedding_len": len(query_embedding)})
+        self.dense_calls.append(
+            {"pipeline": pipeline, "k": k, "embedding_len": len(query_embedding)}
+        )
         return list(self.to_return)
+
+    def hybrid_search(
+        self,
+        pipeline: str,
+        query_embedding: list[float],
+        query_text: str,
+        k: int,
+        rrf_k: int,
+    ) -> list[RetrievedChunk]:
+        self.hybrid_calls.append(
+            {
+                "pipeline": pipeline,
+                "k": k,
+                "rrf_k": rrf_k,
+                "query_text": query_text,
+                "embedding_len": len(query_embedding),
+            }
+        )
+        return list(self.to_return)
+
+    # Back-compat alias so existing assertions on `store.calls` keep working —
+    # every test's flow uses the dense retriever unless it opts into hybrid,
+    # so `.calls` mirrors the dense call log.
+    @property
+    def calls(self) -> list[dict]:
+        return self.dense_calls
 
 
 @dataclass
@@ -173,7 +209,7 @@ class TestEndToEnd:
             store=store,
             generator=generator,
             pipeline_tag=TEST_PIPELINE_CFG.tag,
-            top_k=TEST_PIPELINE_CFG.retriever.top_k,
+            retriever=TEST_PIPELINE_CFG.retriever,
             run_id="run_test",
         )
 
@@ -218,7 +254,7 @@ class TestEndToEnd:
             store=store,
             generator=generator,
             pipeline_tag=TEST_PIPELINE_CFG.tag,
-            top_k=TEST_PIPELINE_CFG.retriever.top_k,
+            retriever=TEST_PIPELINE_CFG.retriever,
         )
 
         call = generator.calls[0]
@@ -277,7 +313,7 @@ class TestCitationParsing:
             store=store,
             generator=generator,
             pipeline_tag=TEST_PIPELINE_CFG.tag,
-            top_k=TEST_PIPELINE_CFG.retriever.top_k,
+            retriever=TEST_PIPELINE_CFG.retriever,
         )
         assert result.answer == "Something [9] and [42]."
         assert result.citations == []
@@ -299,7 +335,7 @@ class TestOutOfCorpus:
             store=store,
             generator=generator,
             pipeline_tag=TEST_PIPELINE_CFG.tag,
-            top_k=TEST_PIPELINE_CFG.retriever.top_k,
+            retriever=TEST_PIPELINE_CFG.retriever,
         )
         assert result.answer == OUT_OF_CORPUS_SENTINEL
         assert result.citations == []
@@ -317,7 +353,7 @@ class TestOutOfCorpus:
             store=store,
             generator=generator,
             pipeline_tag=TEST_PIPELINE_CFG.tag,
-            top_k=TEST_PIPELINE_CFG.retriever.top_k,
+            retriever=TEST_PIPELINE_CFG.retriever,
         )
         assert result.answer == OUT_OF_CORPUS_SENTINEL
         assert result.citations == []
@@ -351,3 +387,108 @@ class TestFormatContext:
         assert "chunk-2-body" in out
         # Blank line between chunks.
         assert "\n\n" in out
+
+
+# ── Retriever dispatch (dense vs hybrid) ─────────────────────────────
+
+
+class TestRetrieverDispatch:
+    """`answer_question` picks the store method based on `retriever.kind`.
+
+    The pipeline-config registry entries (P1/P2 dense, P3 hybrid) are
+    exercised at the module level; here we assert the dispatch layer
+    directly so a bug in the branch selection surfaces without needing
+    a live DB or a specific registry entry.
+    """
+
+    def test_dense_routes_to_dense_search(self, tmp_path: Path) -> None:
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        generator = _FakeGenerator(reply_text="ok [1]")
+
+        answer_question(
+            query="q",
+            embedder=embedder,
+            store=store,
+            generator=generator,
+            pipeline_tag="test_dense_tag",
+            retriever=RetrieverConfig(kind="dense", top_k=5),
+        )
+
+        assert len(store.dense_calls) == 1
+        assert store.dense_calls[0] == {
+            "pipeline": "test_dense_tag",
+            "k": 5,
+            "embedding_len": len(embedder.vector),
+        }
+        assert store.hybrid_calls == []
+
+    def test_hybrid_routes_to_hybrid_search(self, tmp_path: Path) -> None:
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        generator = _FakeGenerator(reply_text="ok [1]")
+
+        answer_question(
+            query="what is quicksort?",
+            embedder=embedder,
+            store=store,
+            generator=generator,
+            pipeline_tag="test_hybrid_tag",
+            retriever=RetrieverConfig(kind="hybrid", top_k=7, rrf_k=60),
+        )
+
+        assert store.dense_calls == []
+        assert len(store.hybrid_calls) == 1
+        assert store.hybrid_calls[0] == {
+            "pipeline": "test_hybrid_tag",
+            "k": 7,
+            "rrf_k": 60,
+            "query_text": "what is quicksort?",
+            "embedding_len": len(embedder.vector),
+        }
+
+    def test_hybrid_without_rrf_k_raises(self, tmp_path: Path) -> None:
+        """Config-authoring error: `kind='hybrid'` with `rrf_k=None` must fail loud."""
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=[])
+        generator = _FakeGenerator()
+
+        with pytest.raises(ValueError, match=r"hybrid retriever requires rrf_k"):
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag="test_broken_hybrid",
+                retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=None),
+            )
+        # Never called the store — validation happens before I/O.
+        assert store.dense_calls == []
+        assert store.hybrid_calls == []
+
+    def test_unknown_kind_raises(self, tmp_path: Path) -> None:
+        """Literal drift guard: adding a new `kind` without a dispatch branch fails loud.
+
+        Same test-shape as `TestTagFormat.test_unknown_algorithm_raises` in
+        test_pipeline_config.py — cast through `type: ignore` so the runtime
+        `raise` gets exercised even though mypy would reject this at author
+        time.
+        """
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=[])
+        generator = _FakeGenerator()
+        broken = RetrieverConfig(kind="mystery", top_k=5)  # type: ignore[arg-type]
+
+        with pytest.raises(ValueError, match=r"unknown retriever\.kind"):
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag="test_broken",
+                retriever=broken,
+            )
+        assert store.dense_calls == []
+        assert store.hybrid_calls == []
