@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from src.observability import get_logger
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
+from src.pipeline.pipeline_config import RetrieverConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL, load_prompt, render_user_template
 from src.pipeline.store import RetrievedChunk, VectorStore
 
@@ -137,6 +138,39 @@ def _parse_citations(
     return citations
 
 
+def _retrieve(
+    *,
+    store: VectorStore,
+    retriever: RetrieverConfig,
+    pipeline_tag: str,
+    query: str,
+    query_embedding: list[float],
+) -> list[RetrievedChunk]:
+    """Dispatch on `retriever.kind` — dense or hybrid. New kinds add an `elif`.
+
+    Kept as a private helper (rather than inline in `answer_question`) so the
+    dispatch is testable without dragging in the whole embed + generate loop.
+    """
+    if retriever.kind == "dense":
+        return store.dense_search(pipeline_tag, query_embedding, k=retriever.top_k)
+    if retriever.kind == "hybrid":
+        if retriever.rrf_k is None:
+            # RetrieverConfig allows rrf_k=None (for dense) but requires it
+            # for hybrid. This is a config-authoring error — surface it
+            # loudly rather than silently defaulting to some rrf_k.
+            raise ValueError(
+                "hybrid retriever requires rrf_k to be set on RetrieverConfig"
+            )
+        return store.hybrid_search(
+            pipeline_tag,
+            query_embedding,
+            query_text=query,
+            k=retriever.top_k,
+            rrf_k=retriever.rrf_k,
+        )
+    raise ValueError(f"unknown retriever.kind: {retriever.kind!r}")
+
+
 def answer_question(
     *,
     query: str,
@@ -144,15 +178,16 @@ def answer_question(
     store: VectorStore,
     generator: ClaudeGenerator,
     pipeline_tag: str,
-    top_k: int,
+    retriever: RetrieverConfig,
     run_id: str | None = None,
 ) -> QueryResult:
-    """Run one query through the P1 pipeline. Never raises for empty retrieval.
+    """Run one query through the selected pipeline. Never raises for empty retrieval.
 
     Steps:
       1. Load prompt v1 (cached).
       2. Embed `query` with Voyage.
-      3. Dense top-k retrieve from pgvector.
+      3. Retrieve top-k via `retriever.kind` (dense — pgvector cosine;
+         hybrid — dense + BM25 fused via RRF).
       4. If retrieval is empty: short-circuit with the out-of-corpus sentinel;
          no generator call, cost 0.
       5. Format enumerated context block, substitute into the user template.
@@ -171,7 +206,13 @@ def answer_question(
     )
 
     query_embedding = embedder.embed_query(query, run_id=run_id)
-    retrieved = store.dense_search(pipeline_tag, query_embedding, k=top_k)
+    retrieved = _retrieve(
+        store=store,
+        retriever=retriever,
+        pipeline_tag=pipeline_tag,
+        query=query,
+        query_embedding=query_embedding,
+    )
 
     if not retrieved:
         # Empty retrieval → the prompt would have Claude respond with the
@@ -182,7 +223,8 @@ def answer_question(
             "empty_retrieval",
             query=query,
             pipeline_tag=pipeline_tag,
-            top_k=top_k,
+            retriever_kind=retriever.kind,
+            top_k=retriever.top_k,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
         return QueryResult(
