@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS chunks (
     pipeline      TEXT         NOT NULL,
     chunk_index   INT          NOT NULL,
     text          TEXT         NOT NULL,
+    -- Full-text search column for the P3/P4 hybrid retrievers.
+    -- Postgres materializes the tsvector from `text` at insert time, so
+    -- ingest can continue using the standard INSERT INTO chunks (...) path.
+    -- `english` uses the standard stemmer and stopword dictionary.
+    text_tsv      tsvector     GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
     num_tokens    INT          NOT NULL,
     page_start    INT          NOT NULL,
     page_end      INT          NOT NULL,
@@ -54,22 +59,6 @@ CREATE INDEX IF NOT EXISTS chunks_document_id_idx ON chunks (document_id);
 -- Guarded with IF NOT EXISTS so re-apply is a no-op.
 CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
     ON chunks USING hnsw (embedding vector_cosine_ops);
-
--- Full-text search column for the P3/P4 hybrid retrievers.
--- STORED generated column: Postgres materializes the tsvector at insert
--- time from `text`, so ingest never has to know about it — the standard
--- INSERT INTO chunks (...) path just works. Storage overhead is ~10-20%
--- of the text column; at our scale (a few thousand chunks per pipeline)
--- that's trivial and buys constant-time reads at query time.
---
--- `english` config: standard stemmer + stopwords. Acceptable first pass;
--- if BM25-heavy Q&As lag, revisit with a custom dictionary or `simple`.
---
--- Guarded with IF NOT EXISTS so `ensure_schema()` stays idempotent on
--- pre-P3 databases (adds column + index) and no-ops on new ones.
-ALTER TABLE chunks
-    ADD COLUMN IF NOT EXISTS text_tsv tsvector
-    GENERATED ALWAYS AS (to_tsvector('english', text)) STORED;
 
 -- GIN is the standard index type for tsvector: fast lookups by lexeme,
 -- slower writes than GiST but our write path is a batch ingest, not

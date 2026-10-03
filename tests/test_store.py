@@ -1,16 +1,15 @@
-"""Store-layer tests. Currently: RRF fusion math only (no live DB required).
+"""Store-layer tests for RRF fusion and hybrid-search orchestration.
 
-The BM25 SQL path (`lexical_search`) and the fused end-to-end (`hybrid_search`)
-are best exercised against a real Postgres — that's a manual smoke via
-`make db-up && make ingest --pipeline p3 && make eval --pipeline p3`, not a
-pytest run. The fusion math is where the interesting bugs live (rank
-off-by-one, tie-break drift, wrong per-chunk RetrievedChunk carried forward)
-and this file locks that down offline.
+The BM25 SQL path (`lexical_search`) is best exercised against a real Postgres —
+that's a manual smoke via `make db-up && make ingest --pipeline p3 && make eval
+--pipeline p3`. Fusion math and hybrid branch orchestration are tested offline.
 """
 
 from __future__ import annotations
 
-from src.pipeline.store import RetrievedChunk, _rrf_fuse
+import pytest
+
+from src.pipeline.store import RetrievedChunk, VectorStore, _rrf_fuse
 
 
 def _chunk(chunk_id: int, *, score: float = 0.0, doc_path: str | None = None) -> RetrievedChunk:
@@ -79,6 +78,19 @@ class TestRRFFuseMath:
         fused = _rrf_fuse(dense, lexical, rrf_k=60, top_k=3)
         assert [c.chunk_id for c in fused] == [1, 2, 3]
 
+    @pytest.mark.parametrize(
+        ("rrf_k", "top_k", "invalid_name"),
+        [
+            (0, 1, "rrf_k"),
+            (-1, 1, "rrf_k"),
+            (60, 0, "top_k"),
+            (60, -1, "top_k"),
+        ],
+    )
+    def test_non_positive_parameters_raise(self, rrf_k: int, top_k: int, invalid_name: str) -> None:
+        with pytest.raises(ValueError, match=rf"{invalid_name} must be positive"):
+            _rrf_fuse([_chunk(1)], [], rrf_k=rrf_k, top_k=top_k)
+
     def test_empty_both_returns_empty(self) -> None:
         """Neither source returned anything → empty fusion; no crash."""
         assert _rrf_fuse([], [], rrf_k=60, top_k=10) == []
@@ -99,8 +111,7 @@ class TestRRFFuseMath:
 
     def test_dense_provenance_wins_on_overlap(self) -> None:
         """When a chunk appears in both lists, the dense list's `RetrievedChunk`
-        is what's carried into the fused result. Cosine score displays
-        better than ts_rank_cd in the UI — this locks in that preference."""
+        deterministically supplies the fused result's non-score fields."""
         dense_chunk = _chunk(42, doc_path="fixture/from_dense.pdf")
         lexical_chunk = _chunk(42, doc_path="fixture/from_lexical.pdf")
         fused = _rrf_fuse([dense_chunk], [lexical_chunk], rrf_k=60, top_k=1)
@@ -128,3 +139,58 @@ class TestRRFFuseMath:
         fused = _rrf_fuse(dense, [], rrf_k=60, top_k=1)
         assert fused[0].score != 0.99
         assert abs(fused[0].score - 1.0 / 61) < 1e-9
+
+
+class TestHybridSearch:
+    def test_runs_both_branches_and_fuses_results(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        store = VectorStore("unused")
+        query_embedding = [0.1, 0.2]
+        calls: list[tuple] = []
+
+        def dense_search(pipeline: str, embedding: list[float], k: int) -> list[RetrievedChunk]:
+            calls.append(("dense", pipeline, embedding, k))
+            return [_chunk(1), _chunk(2)]
+
+        def lexical_search(pipeline: str, query_text: str, k: int) -> list[RetrievedChunk]:
+            calls.append(("lexical", pipeline, query_text, k))
+            return [_chunk(2), _chunk(3)]
+
+        monkeypatch.setattr(store, "dense_search", dense_search)
+        monkeypatch.setattr(store, "lexical_search", lexical_search)
+
+        fused = store.hybrid_search(
+            "test_pipeline",
+            query_embedding,
+            "what is merge sort?",
+            k=2,
+            rrf_k=60,
+        )
+
+        assert calls == [
+            ("dense", "test_pipeline", query_embedding, 2),
+            ("lexical", "test_pipeline", "what is merge sort?", 2),
+        ]
+        assert [chunk.chunk_id for chunk in fused] == [2, 1]
+
+    @pytest.mark.parametrize(("k", "rrf_k"), [(0, 60), (2, 0)])
+    def test_invalid_parameters_fail_before_search(
+        self, monkeypatch: pytest.MonkeyPatch, k: int, rrf_k: int
+    ) -> None:
+        store = VectorStore("unused")
+        calls: list[str] = []
+
+        monkeypatch.setattr(
+            store,
+            "dense_search",
+            lambda *_args, **_kwargs: calls.append("dense"),
+        )
+        monkeypatch.setattr(
+            store,
+            "lexical_search",
+            lambda *_args, **_kwargs: calls.append("lexical"),
+        )
+
+        with pytest.raises(ValueError, match="must be positive"):
+            store.hybrid_search("test_pipeline", [0.1], "query", k=k, rrf_k=rrf_k)
+
+        assert calls == []

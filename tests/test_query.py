@@ -1,8 +1,8 @@
-"""P1 query pipeline tests. Fully offline — fake embedder, store, generator.
+"""Query pipeline tests. Fully offline — fake embedder, store, generator.
 
 Covers: end-to-end shape, citation dedup + first-mention order, out-of-range
 marker handling, out-of-corpus prompt path, empty-retrieval short-circuit,
-context block format.
+context block format, and dense/hybrid retriever dispatch.
 
 Tests create a small prompt file rather than use the production prompt, so
 they exercise `load_prompt` without coupling pipeline behaviour to any
@@ -115,13 +115,6 @@ class _FakeStore:
         )
         return list(self.to_return)
 
-    # Back-compat alias so existing assertions on `store.calls` keep working —
-    # every test's flow uses the dense retriever unless it opts into hybrid,
-    # so `.calls` mirrors the dense call log.
-    @property
-    def calls(self) -> list[dict]:
-        return self.dense_calls
-
 
 @dataclass
 class _FakeGenerator:
@@ -232,8 +225,8 @@ class TestEndToEnd:
 
         # Dependencies invoked with the query + run_id threaded through.
         assert embedder.calls == ["what is merge sort?"]
-        assert len(store.calls) == 1
-        assert store.calls[0]["pipeline"] == TEST_PIPELINE_CFG.tag
+        assert len(store.dense_calls) == 1
+        assert store.dense_calls[0]["pipeline"] == TEST_PIPELINE_CFG.tag
         assert len(generator.calls) == 1
         assert generator.calls[0]["prompt_version"] == PROMPT_VERSION
         assert generator.calls[0]["run_id"] == "run_test"
@@ -365,7 +358,7 @@ class TestOutOfCorpus:
         assert generator.calls == []
         # Embedder + store both ran (retrieval was attempted).
         assert embedder.calls == ["q"]
-        assert len(store.calls) == 1
+        assert len(store.dense_calls) == 1
 
 
 # ── Context formatter ────────────────────────────────────────────────
@@ -401,7 +394,7 @@ class TestRetrieverDispatch:
     a live DB or a specific registry entry.
     """
 
-    def test_dense_routes_to_dense_search(self, tmp_path: Path) -> None:
+    def test_dense_routes_to_dense_search(self) -> None:
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -424,7 +417,7 @@ class TestRetrieverDispatch:
         }
         assert store.hybrid_calls == []
 
-    def test_hybrid_routes_to_hybrid_search(self, tmp_path: Path) -> None:
+    def test_hybrid_routes_to_hybrid_search(self) -> None:
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -449,7 +442,7 @@ class TestRetrieverDispatch:
             "embedding_len": len(embedder.vector),
         }
 
-    def test_hybrid_without_rrf_k_raises(self, tmp_path: Path) -> None:
+    def test_hybrid_without_rrf_k_raises(self) -> None:
         """Config-authoring error: `kind='hybrid'` with `rrf_k=None` must fail loud."""
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
@@ -464,17 +457,17 @@ class TestRetrieverDispatch:
                 pipeline_tag="test_broken_hybrid",
                 retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=None),
             )
-        # Never called the store — validation happens before I/O.
+        # Validation happens before any injected dependency performs I/O.
+        assert embedder.calls == []
         assert store.dense_calls == []
         assert store.hybrid_calls == []
+        assert generator.calls == []
 
-    def test_unknown_kind_raises(self, tmp_path: Path) -> None:
+    def test_unknown_kind_raises(self) -> None:
         """Literal drift guard: adding a new `kind` without a dispatch branch fails loud.
 
-        Same test-shape as `TestTagFormat.test_unknown_algorithm_raises` in
-        test_pipeline_config.py — cast through `type: ignore` so the runtime
-        `raise` gets exercised even though mypy would reject this at author
-        time.
+        Cast through `type: ignore` so the runtime `raise` gets exercised even
+        though mypy would reject this at author time.
         """
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
@@ -490,5 +483,7 @@ class TestRetrieverDispatch:
                 pipeline_tag="test_broken",
                 retriever=broken,
             )
+        assert embedder.calls == []
         assert store.dense_calls == []
         assert store.hybrid_calls == []
+        assert generator.calls == []

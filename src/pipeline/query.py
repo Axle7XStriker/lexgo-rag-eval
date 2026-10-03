@@ -138,37 +138,35 @@ def _parse_citations(
     return citations
 
 
+def _validate_retriever_config(retriever_config: RetrieverConfig) -> None:
+    """Reject unsupported or incomplete retriever configurations."""
+    if retriever_config.kind not in ("dense", "hybrid"):
+        raise ValueError(f"unknown retriever.kind: {retriever_config.kind!r}")
+    if retriever_config.kind == "hybrid" and retriever_config.rrf_k is None:
+        raise ValueError("hybrid retriever requires rrf_k to be set on RetrieverConfig")
+
+
 def _retrieve(
     *,
     store: VectorStore,
-    retriever: RetrieverConfig,
+    retriever_config: RetrieverConfig,
     pipeline_tag: str,
     query: str,
     query_embedding: list[float],
 ) -> list[RetrievedChunk]:
-    """Dispatch on `retriever.kind` — dense or hybrid. New kinds add an `elif`.
+    """Retrieve chunks closely related to the query."""
+    _validate_retriever_config(retriever_config)
+    if retriever_config.kind == "dense":
+        return store.dense_search(pipeline_tag, query_embedding, k=retriever_config.top_k)
 
-    Kept as a private helper (rather than inline in `answer_question`) so the
-    dispatch is testable without dragging in the whole embed + generate loop.
-    """
-    if retriever.kind == "dense":
-        return store.dense_search(pipeline_tag, query_embedding, k=retriever.top_k)
-    if retriever.kind == "hybrid":
-        if retriever.rrf_k is None:
-            # RetrieverConfig allows rrf_k=None (for dense) but requires it
-            # for hybrid. This is a config-authoring error — surface it
-            # loudly rather than silently defaulting to some rrf_k.
-            raise ValueError(
-                "hybrid retriever requires rrf_k to be set on RetrieverConfig"
-            )
-        return store.hybrid_search(
-            pipeline_tag,
-            query_embedding,
-            query_text=query,
-            k=retriever.top_k,
-            rrf_k=retriever.rrf_k,
-        )
-    raise ValueError(f"unknown retriever.kind: {retriever.kind!r}")
+    assert retriever_config.rrf_k is not None
+    return store.hybrid_search(
+        pipeline_tag,
+        query_embedding,
+        query_text=query,
+        k=retriever_config.top_k,
+        rrf_k=retriever_config.rrf_k,
+    )
 
 
 def answer_question(
@@ -184,21 +182,23 @@ def answer_question(
     """Run one query through the selected pipeline. Never raises for empty retrieval.
 
     Steps:
-      1. Load prompt v1 (cached).
-      2. Embed `query` with Voyage.
-      3. Retrieve top-k via `retriever.kind` (dense — pgvector cosine;
+      1. Validate the retriever configuration.
+      2. Load prompt v1 (cached).
+      3. Embed `query` with Voyage.
+      4. Retrieve top-k via `retriever.kind` (dense — pgvector cosine;
          hybrid — dense + BM25 fused via RRF).
-      4. If retrieval is empty: short-circuit with the out-of-corpus sentinel;
+      5. If retrieval is empty: short-circuit with the out-of-corpus sentinel;
          no generator call, cost 0.
-      5. Format enumerated context block, substitute into the user template.
-      6. Call Claude for the answer.
-      7. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
+      6. Format enumerated context block, substitute into the user template.
+      7. Call Claude for the answer.
+      8. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
 
-    Wall-clock `latency_ms` covers the whole run (steps 1-6, whichever ran);
+    Wall-clock `latency_ms` covers the whole run (steps 1-8, whichever ran);
     individual provider tokens/cost land in `logs/llm_calls.jsonl` per the
     embedder and generator's own bookkeeping.
     """
     started = time.perf_counter()
+    _validate_retriever_config(retriever)
     system_body, user_template = load_prompt(
         PROMPT_ROLE,
         PROMPT_VERSION,
@@ -208,7 +208,7 @@ def answer_question(
     query_embedding = embedder.embed_query(query, run_id=run_id)
     retrieved = _retrieve(
         store=store,
-        retriever=retriever,
+        retriever_config=retriever,
         pipeline_tag=pipeline_tag,
         query=query,
         query_embedding=query_embedding,

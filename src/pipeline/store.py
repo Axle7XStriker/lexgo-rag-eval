@@ -78,12 +78,7 @@ class RetrievedChunk:
     score: float  # cosine similarity in [-1, 1] (higher is closer)
 
 
-# ── Row + fusion helpers (module-level for testability) ──────────────
-#
-# Pure functions kept out of the class body so the fusion math is
-# testable without a live psycopg connection. `_row_to_retrieved`
-# adapts a psycopg row tuple (matching `VectorStore._SELECT_COLUMNS`
-# + a trailing score column) into a `RetrievedChunk`.
+# ────────────── Row + fusion helpers ──────────────
 
 
 def _row_to_retrieved(row: tuple) -> RetrievedChunk:
@@ -103,6 +98,13 @@ def _row_to_retrieved(row: tuple) -> RetrievedChunk:
     )
 
 
+def _validate_rrf_params(*, rrf_k: int, top_k: int) -> None:
+    if rrf_k <= 0:
+        raise ValueError(f"rrf_k must be positive, got {rrf_k}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+
+
 def _rrf_fuse(
     dense: list[RetrievedChunk],
     lexical: list[RetrievedChunk],
@@ -118,13 +120,14 @@ def _rrf_fuse(
 
     The returned `RetrievedChunk.score` is the RRF score (small float,
     upper-bounded by `2 / (rrf_k + 1)`), not either source's original
-    score. Provenance from the dense list wins on tie (dense chunks
-    tend to carry a cosine score that's more informative for display
-    than a `ts_rank_cd` value).
+    score. When a chunk appears in both lists, its non-score fields are
+    carried forward from the dense result for deterministic provenance.
 
-    Cost: O(N + M) construction, O((N+M) log (N+M)) sort. N and M ≤ top_k
+    Cost: O(N+M) construction, O((N+M) log (N+M)) sort. N and M ≤ top_k
     for us (~10 each), so this is free.
     """
+    _validate_rrf_params(rrf_k=rrf_k, top_k=top_k)
+
     # Sum inverse ranks per chunk_id. Rank is 1-indexed per RRF spec.
     scores: dict[int, float] = {}
     for rank, chunk in enumerate(dense, start=1):
@@ -132,10 +135,8 @@ def _rrf_fuse(
     for rank, chunk in enumerate(lexical, start=1):
         scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
 
-    # Prefer the dense list's RetrievedChunk for provenance — cosine
-    # score displays better than ts_rank_cd when the UI ignores the
-    # fused score and reads the original. Fall back to lexical for
-    # chunks not present in the dense list.
+    # Prefer the dense result's non-score fields when a chunk appears in
+    # both lists; fall back to lexical for chunks absent from dense.
     by_id: dict[int, RetrievedChunk] = {c.chunk_id: c for c in lexical}
     for chunk in dense:
         by_id[chunk.chunk_id] = chunk
@@ -459,6 +460,7 @@ class VectorStore:
         Downstream renders it verbatim; document this in any UI that
         surfaces the number.
         """
+        _validate_rrf_params(rrf_k=rrf_k, top_k=k)
         # Both source pulls fetch `k` candidates each (matches the "top-N
         # from each" recipe). Fetching more would trade DB cost for
         # marginal recall gain — not worth it at our scale.

@@ -66,19 +66,13 @@ class ChunkerConfig:
 
 @dataclass(frozen=True)
 class RetrieverConfig:
-    """Retriever parameters. Fields not used by `kind` are `None`.
-
-    P3 (hybrid) adds `rrf_k` for Reciprocal Rank Fusion. It's `None` for
-    dense-only pipelines so P1/P2's already-published tags don't change
-    on the field's introduction (a new field with a non-`None` default
-    would rehash every existing config → new DB tags → orphaned rows).
-    """
+    """Retriever parameters. Fields not used by `kind` are `None`."""
 
     kind: Literal["dense", "hybrid"]
     top_k: int
-    # RRF fusion constant. Only meaningful when kind == "hybrid".
-    # Standard value is 60 (per Cormack et al. 2009); larger values
-    # flatten rank-source weighting, smaller values sharpen it.
+    # RRF (Reciprocal Rank Fusion) fusion constant. Only meaningful when
+    # kind == "hybrid". Standard value is 60 (per Cormack et al. 2009);
+    # larger values flatten rank-source weighting, smaller values sharpen it.
     rrf_k: int | None = None
 
 
@@ -188,7 +182,7 @@ PIPELINES: dict[str, PipelineConfig] = {
         ),
         # Hybrid: BM25 (Postgres FTS ts_rank_cd) ∪ dense (pgvector cosine),
         # fused via Reciprocal Rank Fusion with k=60. top_k=10 = same
-        # final size as P1/P2 so eval accuracy is comparable head-to-head.
+        # final size as others so eval accuracy is comparable head-to-head.
         retriever=RetrieverConfig(kind="hybrid", top_k=10, rrf_k=60),
         reranker=None,
     ),
