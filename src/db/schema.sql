@@ -33,6 +33,11 @@ CREATE TABLE IF NOT EXISTS chunks (
     pipeline      TEXT         NOT NULL,
     chunk_index   INT          NOT NULL,
     text          TEXT         NOT NULL,
+    -- Full-text search column for the P3/P4 hybrid retrievers.
+    -- Postgres materializes the tsvector from `text` at insert time, so
+    -- ingest can continue using the standard INSERT INTO chunks (...) path.
+    -- `english` uses the standard stemmer and stopword dictionary.
+    text_tsv      tsvector     GENERATED ALWAYS AS (to_tsvector('english', text)) STORED,
     num_tokens    INT          NOT NULL,
     page_start    INT          NOT NULL,
     page_end      INT          NOT NULL,
@@ -54,3 +59,10 @@ CREATE INDEX IF NOT EXISTS chunks_document_id_idx ON chunks (document_id);
 -- Guarded with IF NOT EXISTS so re-apply is a no-op.
 CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
     ON chunks USING hnsw (embedding vector_cosine_ops);
+
+-- GIN is the standard index type for tsvector: fast lookups by lexeme,
+-- slower writes than GiST but our write path is a batch ingest, not
+-- online serving. Composes with WHERE pipeline = $1 via bitmap-scan,
+-- same shape as the HNSW index above.
+CREATE INDEX IF NOT EXISTS chunks_text_tsv_gin
+    ON chunks USING gin (text_tsv);

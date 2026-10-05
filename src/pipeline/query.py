@@ -24,6 +24,7 @@ from dataclasses import dataclass
 from src.observability import get_logger
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
+from src.pipeline.pipeline_config import RetrieverConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL, load_prompt, render_user_template
 from src.pipeline.store import RetrievedChunk, VectorStore
 
@@ -77,19 +78,22 @@ class QueryResult:
 
 
 def _format_context(chunks: list[RetrievedChunk]) -> str:
-    """Enumerate chunks as `[N] source_id doc_path (pages P-Q, score S.SS)\\nTEXT`.
+    """Enumerate chunks as `[N] source_id doc_path (pages P-Q)\\nTEXT`.
 
     The header line is what Claude reads to know which bracket to cite; the
     text below is what it grounds the answer in. Newline between chunks so a
     citation on one chunk can't accidentally get glued to the next chunk's
     header in the prompt.
+
+    Score is intentionally omitted — it's not useful signal to the model,
+    and it carries different semantics across retrievers (cosine for dense,
+    small RRF value for hybrid), so surfacing it to Claude would at best be
+    ignored and at worst be misread as a confidence hint. UI consumers still
+    see the score via `RetrievedChunk.score` directly.
     """
     lines: list[str] = []
     for i, c in enumerate(chunks, start=1):
-        header = (
-            f"[{i}] {c.source_id} {c.doc_path} "
-            f"(pages {c.page_start}–{c.page_end}, score {c.score:.2f})"
-        )
+        header = f"[{i}] {c.source_id} {c.doc_path} (pages {c.page_start}–{c.page_end})"
         lines.append(f"{header}\n{c.text}")
     return "\n\n".join(lines)
 
@@ -137,6 +141,48 @@ def _parse_citations(
     return citations
 
 
+def _validate_retriever_config(retriever_config: RetrieverConfig) -> None:
+    """Reject unsupported or incomplete retriever configurations.
+
+    Hybrid-only: `rrf_k` must be set and positive. Catching `rrf_k <= 0`
+    here (not deeper in `_rrf_fuse`) means a misconfigured pipeline fails
+    before `embed_query` spends a Voyage call — the pipeline embed cost
+    for a run that was always going to fail is strictly waste.
+    """
+    if retriever_config.kind not in ("dense", "hybrid"):
+        raise ValueError(f"unknown retriever.kind: {retriever_config.kind!r}")
+    if retriever_config.kind == "hybrid":
+        if retriever_config.rrf_k is None:
+            raise ValueError("hybrid retriever requires rrf_k to be set on RetrieverConfig")
+        if retriever_config.rrf_k <= 0:
+            raise ValueError(
+                f"hybrid retriever rrf_k must be positive, got {retriever_config.rrf_k}"
+            )
+
+
+def _retrieve(
+    *,
+    store: VectorStore,
+    retriever_config: RetrieverConfig,
+    pipeline_tag: str,
+    query: str,
+    query_embedding: list[float],
+) -> list[RetrievedChunk]:
+    """Retrieve chunks closely related to the query."""
+    _validate_retriever_config(retriever_config)
+    if retriever_config.kind == "dense":
+        return store.dense_search(pipeline_tag, query_embedding, k=retriever_config.top_k)
+
+    assert retriever_config.rrf_k is not None
+    return store.hybrid_search(
+        pipeline_tag,
+        query_embedding,
+        query_text=query,
+        k=retriever_config.top_k,
+        rrf_k=retriever_config.rrf_k,
+    )
+
+
 def answer_question(
     *,
     query: str,
@@ -144,26 +190,29 @@ def answer_question(
     store: VectorStore,
     generator: ClaudeGenerator,
     pipeline_tag: str,
-    top_k: int,
+    retriever: RetrieverConfig,
     run_id: str | None = None,
 ) -> QueryResult:
-    """Run one query through the P1 pipeline. Never raises for empty retrieval.
+    """Run one query through the selected pipeline. Never raises for empty retrieval.
 
     Steps:
-      1. Load prompt v1 (cached).
-      2. Embed `query` with Voyage.
-      3. Dense top-k retrieve from pgvector.
-      4. If retrieval is empty: short-circuit with the out-of-corpus sentinel;
+      1. Validate the retriever configuration.
+      2. Load prompt v1 (cached).
+      3. Embed `query` with Voyage.
+      4. Retrieve top-k via `retriever.kind` (dense — pgvector cosine;
+         hybrid — dense + BM25 fused via RRF).
+      5. If retrieval is empty: short-circuit with the out-of-corpus sentinel;
          no generator call, cost 0.
-      5. Format enumerated context block, substitute into the user template.
-      6. Call Claude for the answer.
-      7. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
+      6. Format enumerated context block, substitute into the user template.
+      7. Call Claude for the answer.
+      8. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
 
-    Wall-clock `latency_ms` covers the whole run (steps 1-6, whichever ran);
+    Wall-clock `latency_ms` covers the whole run (steps 1-8, whichever ran);
     individual provider tokens/cost land in `logs/llm_calls.jsonl` per the
     embedder and generator's own bookkeeping.
     """
     started = time.perf_counter()
+    _validate_retriever_config(retriever)
     system_body, user_template = load_prompt(
         PROMPT_ROLE,
         PROMPT_VERSION,
@@ -171,7 +220,13 @@ def answer_question(
     )
 
     query_embedding = embedder.embed_query(query, run_id=run_id)
-    retrieved = store.dense_search(pipeline_tag, query_embedding, k=top_k)
+    retrieved = _retrieve(
+        store=store,
+        retriever_config=retriever,
+        pipeline_tag=pipeline_tag,
+        query=query,
+        query_embedding=query_embedding,
+    )
 
     if not retrieved:
         # Empty retrieval → the prompt would have Claude respond with the
@@ -182,7 +237,8 @@ def answer_question(
             "empty_retrieval",
             query=query,
             pipeline_tag=pipeline_tag,
-            top_k=top_k,
+            retriever_kind=retriever.kind,
+            top_k=retriever.top_k,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
         return QueryResult(

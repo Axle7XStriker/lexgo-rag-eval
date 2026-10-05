@@ -61,7 +61,12 @@ from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
 from src.pipeline.judge import PROMPT_VERSION as JUDGE_PROMPT_VERSION
 from src.pipeline.judge import ClaudeJudge
-from src.pipeline.pipeline_config import PIPELINES, get_pipeline, pipeline_to_manifest_dict
+from src.pipeline.pipeline_config import (
+    PIPELINES,
+    RetrieverConfig,
+    get_pipeline,
+    pipeline_to_manifest_dict,
+)
 from src.pipeline.query import PROMPT_VERSION as ANSWER_PROMPT_VERSION
 from src.pipeline.query import answer_question
 from src.pipeline.store import VectorStore
@@ -103,7 +108,7 @@ def _run_one(
     generator: ClaudeGenerator,
     judge: ClaudeJudge,
     pipeline_tag: str,
-    top_k: int,
+    retriever: RetrieverConfig,
     run_id: str,
 ) -> QAResult:
     """Evaluate one record end-to-end. Never raises — catches → error field.
@@ -122,7 +127,7 @@ def _run_one(
             store=store,
             generator=generator,
             pipeline_tag=pipeline_tag,
-            top_k=top_k,
+            retriever=retriever,
             run_id=run_id,
         )
     except Exception as e:
@@ -398,8 +403,9 @@ def main() -> int:
         "--pipeline",
         choices=SUPPORTED_PIPELINES,
         default="p1",
-        help="Retrieval pipeline to evaluate. Only 'p1' is wired today; "
-        "p2..p4 join this switch when they exist.",
+        help="Retrieval pipeline to evaluate. Choices are the registered keys "
+        "in src.pipeline.pipeline_config.PIPELINES (currently p1..p3; "
+        "p4 joins this switch when it lands).",
     )
     parser.add_argument(
         "--qa-path",
@@ -493,7 +499,7 @@ def main() -> int:
                 generator=generator,
                 judge=judge,
                 pipeline_tag=cfg.tag,
-                top_k=cfg.retriever.top_k,
+                retriever=cfg.retriever,
                 run_id=run_id,
             )
             results.append(qa_result)

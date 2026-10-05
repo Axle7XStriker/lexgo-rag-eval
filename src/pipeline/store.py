@@ -78,6 +78,93 @@ class RetrievedChunk:
     score: float  # cosine similarity in [-1, 1] (higher is closer)
 
 
+# ────────────── Row + fusion helpers ──────────────
+
+
+def _row_to_retrieved(row: tuple) -> RetrievedChunk:
+    """Adapt a psycopg row (columns per `VectorStore._SELECT_COLUMNS + score`)
+    into a `RetrievedChunk`. Keeps dense + lexical branches in lockstep."""
+    return RetrievedChunk(
+        chunk_id=row[0],
+        document_id=row[1],
+        doc_path=row[2],
+        source_id=row[3],
+        pipeline=row[4],
+        chunk_index=row[5],
+        text=row[6],
+        page_start=row[7],
+        page_end=row[8],
+        score=row[9],
+    )
+
+
+def _validate_rrf_params(*, rrf_k: int, top_k: int) -> None:
+    if rrf_k <= 0:
+        raise ValueError(f"rrf_k must be positive, got {rrf_k}")
+    if top_k <= 0:
+        raise ValueError(f"top_k must be positive, got {top_k}")
+
+
+def _rrf_fuse(
+    dense: list[RetrievedChunk],
+    lexical: list[RetrievedChunk],
+    *,
+    rrf_k: int,
+    top_k: int,
+) -> list[RetrievedChunk]:
+    """Reciprocal Rank Fusion of two ranked lists → top-`top_k` fused.
+
+    For each chunk (identified by `chunk_id`), sum `1 / (rrf_k + rank)`
+    across the two lists it appears in (1-indexed rank). Sort by fused
+    score DESC, break ties by chunk_id ASC for determinism.
+
+    The returned `RetrievedChunk.score` is the RRF score (small float,
+    upper-bounded by `2 / (rrf_k + 1)`), not either source's original
+    score. When a chunk appears in both lists, its non-score fields are
+    carried forward from the dense result for deterministic provenance.
+
+    Cost: O(N+M) construction, O((N+M) log (N+M)) sort. N and M ≤ top_k
+    for us (~10 each), so this is free.
+    """
+    _validate_rrf_params(rrf_k=rrf_k, top_k=top_k)
+
+    # Sum inverse ranks per chunk_id. Rank is 1-indexed per RRF spec.
+    scores: dict[int, float] = {}
+    for rank, chunk in enumerate(dense, start=1):
+        scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
+    for rank, chunk in enumerate(lexical, start=1):
+        scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
+
+    # Prefer the dense result's non-score fields when a chunk appears in
+    # both lists; fall back to lexical for chunks absent from dense.
+    by_id: dict[int, RetrievedChunk] = {c.chunk_id: c for c in lexical}
+    for chunk in dense:
+        by_id[chunk.chunk_id] = chunk
+
+    # Sort by fused score DESC, break ties by chunk_id ASC (deterministic
+    # so two eval runs return the exact same fused ordering).
+    ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
+
+    fused: list[RetrievedChunk] = []
+    for chunk_id, fused_score in ranked[:top_k]:
+        base = by_id[chunk_id]
+        fused.append(
+            RetrievedChunk(
+                chunk_id=base.chunk_id,
+                document_id=base.document_id,
+                doc_path=base.doc_path,
+                source_id=base.source_id,
+                pipeline=base.pipeline,
+                chunk_index=base.chunk_index,
+                text=base.text,
+                page_start=base.page_start,
+                page_end=base.page_end,
+                score=fused_score,
+            )
+        )
+    return fused
+
+
 # ── Store ─────────────────────────────────────────────────────────────
 
 
@@ -97,7 +184,9 @@ class VectorStore:
         self._conn: psycopg.Connection | None = None
 
     def __enter__(self) -> Self:
-        self._conn = psycopg.connect(self._dsn, autocommit=False)
+        # Short connect_timeout so a down DB fails fast — otherwise the eval
+        # loop and the Streamlit worker thread sit on the socket forever.
+        self._conn = psycopg.connect(self._dsn, autocommit=False, connect_timeout=5)
         # register_vector needs the `vector` type to exist, but on a fresh
         # DB nothing has installed it yet — ensure_schema() would, but the
         # caller can't reach it until __enter__ returns. Break the cycle by
@@ -270,6 +359,14 @@ class VectorStore:
 
     # ── Retrieval ─────────────────────────────────────────────────────
 
+    # Column list shared by both retrievers so their SELECT bodies stay
+    # in lockstep — any new field on `RetrievedChunk` needs updating in
+    # one place. `{score_expr}` is the only per-caller substitution.
+    _SELECT_COLUMNS = (
+        "c.id, c.document_id, d.doc_path, d.source_id, "
+        "c.pipeline, c.chunk_index, c.text, c.page_start, c.page_end"
+    )
+
     def dense_search(
         self,
         pipeline: str,
@@ -287,48 +384,105 @@ class VectorStore:
             raise ValueError(
                 f"query embedding dim {len(query_embedding)} ≠ expected {EMBEDDING_DIM}"
             )
+        # Explicit ::vector cast: on INSERT the destination column type
+        # tells psycopg to adapt the Python list as a vector, but as a
+        # bare `%s` parameter the type is inferred as double precision[]
+        # and pgvector's <=> operator has no such overload.
+        sql = f"""
+            SELECT
+                {self._SELECT_COLUMNS},
+                1 - (c.embedding <=> %s::vector) AS score
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id
+            WHERE c.pipeline = %s
+            ORDER BY c.embedding <=> %s::vector
+            LIMIT %s
+        """
         with self.conn.cursor() as cur:
-            # Explicit ::vector cast: on INSERT the destination column type
-            # tells psycopg to adapt the Python list as a vector, but as a
-            # bare `%s` parameter the type is inferred as double precision[]
-            # and pgvector's <=> operator has no such overload.
-            cur.execute(
-                """
-                SELECT
-                    c.id,
-                    c.document_id,
-                    d.doc_path,
-                    d.source_id,
-                    c.pipeline,
-                    c.chunk_index,
-                    c.text,
-                    c.page_start,
-                    c.page_end,
-                    1 - (c.embedding <=> %s::vector) AS score
-                FROM chunks c
-                JOIN documents d ON d.id = c.document_id
-                WHERE c.pipeline = %s
-                ORDER BY c.embedding <=> %s::vector
-                LIMIT %s
-                """,
-                (query_embedding, pipeline, query_embedding, k),
-            )
+            cur.execute(sql, (query_embedding, pipeline, query_embedding, k))
             rows = cur.fetchall()
-        return [
-            RetrievedChunk(
-                chunk_id=r[0],
-                document_id=r[1],
-                doc_path=r[2],
-                source_id=r[3],
-                pipeline=r[4],
-                chunk_index=r[5],
-                text=r[6],
-                page_start=r[7],
-                page_end=r[8],
-                score=r[9],
-            )
-            for r in rows
-        ]
+        return [_row_to_retrieved(r) for r in rows]
+
+    def lexical_search(
+        self,
+        pipeline: str,
+        query_text: str,
+        k: int,
+    ) -> list[RetrievedChunk]:
+        """Top-k BM25-alike search via Postgres FTS (ts_rank_cd + GIN index).
+
+        `websearch_to_tsquery` (not `to_tsquery`) accepts free-form English
+        text — never raises on operator-looking punctuation, and lets a
+        caller type quoted phrases ("query optimizer") or `OR` to broaden
+        explicitly. Unquoted multi-word input is AND-joined (same as
+        `plainto_tsquery`), so a long question must have every stem land
+        in a chunk to match — precision-biased by default. If P3 numbers
+        underwhelm, the first thing to try is app-level OR-joining of
+        lexemes via `to_tsquery` so lexical fires on partial-term matches
+        and dense keeps supplying the recall branch.
+
+        `ts_rank_cd` weights term proximity (BM25-inspired). Normalization
+        flag `32` is `rank / (rank + 1)` — a monotonic squash that bounds
+        the score into [0, 1); it does NOT penalize document length. RRF
+        downstream only reads rank order, so the squash is harmless here.
+
+        Returned `score` is `ts_rank_cd` (in [0, 1) after the flag-32
+        squash); NOT comparable to `dense_search`'s cosine score. Callers
+        that want a unified score across both use `hybrid_search`, which
+        fuses by rank via RRF instead.
+        """
+        sql = f"""
+            SELECT
+                {self._SELECT_COLUMNS},
+                ts_rank_cd(c.text_tsv, query, 32) AS score
+            FROM chunks c
+            JOIN documents d ON d.id = c.document_id,
+                 websearch_to_tsquery('english', %s) AS query
+            WHERE c.pipeline = %s
+              AND c.text_tsv @@ query
+            ORDER BY score DESC
+            LIMIT %s
+        """
+        with self.conn.cursor() as cur:
+            cur.execute(sql, (query_text, pipeline, k))
+            rows = cur.fetchall()
+        return [_row_to_retrieved(r) for r in rows]
+
+    def hybrid_search(
+        self,
+        pipeline: str,
+        query_embedding: list[float],
+        query_text: str,
+        k: int,
+        rrf_k: int,
+    ) -> list[RetrievedChunk]:
+        """Fetch top-k from dense + lexical, RRF-fuse, return top-k fused.
+
+        Reciprocal Rank Fusion (Cormack et al. 2009): a chunk's fused score
+        is the sum of `1 / (rrf_k + rank)` across the source lists it
+        appears in (1-indexed rank). Rank-based, so the two sources'
+        wildly-different score scales (cosine in [-1, 1] vs ts_rank_cd
+        unbounded) don't need normalization — the algorithm is robust
+        by construction.
+
+        Returned `RetrievedChunk.score` is the RRF score (small float,
+        roughly bounded by `2 / (rrf_k + 1)`), NOT cosine or ts_rank_cd.
+        Downstream renders it verbatim; document this in any UI that
+        surfaces the number.
+        """
+        _validate_rrf_params(rrf_k=rrf_k, top_k=k)
+        # Pull a wider pool per source than the final `k` so RRF has more
+        # fusion opportunities before truncation. With a tight per-source
+        # pool of `k`, heavy dense/lexical overlap collapses the fused
+        # unique set to roughly `k`, which (a) hurts recall@k vs the
+        # dense-only baseline and (b) makes P3's effective top-k size
+        # vary query-by-query while P1/P2 are always exactly `k`.
+        # 2x–3x per source is standard practice; `max(k*2, 20)` floors it
+        # so very small `k` still gets a meaningful candidate pool.
+        pool = max(k * 2, 20)
+        dense = self.dense_search(pipeline, query_embedding, k=pool)
+        lexical = self.lexical_search(pipeline, query_text, k=pool)
+        return _rrf_fuse(dense, lexical, rrf_k=rrf_k, top_k=k)
 
     # ── Smoke / observability helpers ─────────────────────────────────
 
