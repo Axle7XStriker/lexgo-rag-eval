@@ -366,7 +366,7 @@ class TestOutOfCorpus:
 
 class TestFormatContext:
     def test_shape(self) -> None:
-        """Each chunk renders `[N] source_id doc_path (pages P-Q ...)` header + body, blank line."""
+        """Each chunk renders `[N] source_id doc_path (pages P-Q)` header + body, blank line."""
         chunks = [
             _chunk(1, "fixture/A1_doc01.pdf", "A1"),
             _chunk(2, "fixture/B1_doc02.pdf", "B1"),
@@ -380,6 +380,18 @@ class TestFormatContext:
         assert "chunk-2-body" in out
         # Blank line between chunks.
         assert "\n\n" in out
+
+    def test_score_not_rendered_in_llm_prompt(self) -> None:
+        """Guard: score was intentionally dropped from the LLM context block.
+
+        Different retrievers emit different score semantics (cosine for dense,
+        tiny RRF values for hybrid) — surfacing them to Claude is at best noise
+        and at worst a false confidence signal. If score creeps back in, this
+        test fails and the author gets to re-decide, not accidentally regress.
+        """
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf", "A1")]
+        out = _format_context(chunks)
+        assert "score" not in out.lower()
 
 
 # ── Retriever dispatch (dense vs hybrid) ─────────────────────────────
@@ -458,6 +470,33 @@ class TestRetrieverDispatch:
                 retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=None),
             )
         # Validation happens before any injected dependency performs I/O.
+        assert embedder.calls == []
+        assert store.dense_calls == []
+        assert store.hybrid_calls == []
+        assert generator.calls == []
+
+    @pytest.mark.parametrize("bad_rrf_k", [0, -1, -60])
+    def test_hybrid_with_non_positive_rrf_k_raises_before_embed(self, bad_rrf_k: int) -> None:
+        """`rrf_k <= 0` must fail at config validation, not deep in `_rrf_fuse`.
+
+        Catching it at the `answer_question` entrypoint means a misconfigured
+        pipeline doesn't bill a Voyage embed call before `_rrf_fuse` raises
+        — the embed on a doomed run is strictly waste.
+        """
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=[])
+        generator = _FakeGenerator()
+
+        with pytest.raises(ValueError, match=r"rrf_k must be positive"):
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag="test_bad_rrf_k",
+                retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=bad_rrf_k),
+            )
+        # The cost-protection assertion: embed MUST NOT have been called.
         assert embedder.calls == []
         assert store.dense_calls == []
         assert store.hybrid_calls == []

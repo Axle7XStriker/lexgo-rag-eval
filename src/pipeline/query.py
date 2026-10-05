@@ -78,19 +78,22 @@ class QueryResult:
 
 
 def _format_context(chunks: list[RetrievedChunk]) -> str:
-    """Enumerate chunks as `[N] source_id doc_path (pages P-Q, score S.SS)\\nTEXT`.
+    """Enumerate chunks as `[N] source_id doc_path (pages P-Q)\\nTEXT`.
 
     The header line is what Claude reads to know which bracket to cite; the
     text below is what it grounds the answer in. Newline between chunks so a
     citation on one chunk can't accidentally get glued to the next chunk's
     header in the prompt.
+
+    Score is intentionally omitted — it's not useful signal to the model,
+    and it carries different semantics across retrievers (cosine for dense,
+    small RRF value for hybrid), so surfacing it to Claude would at best be
+    ignored and at worst be misread as a confidence hint. UI consumers still
+    see the score via `RetrievedChunk.score` directly.
     """
     lines: list[str] = []
     for i, c in enumerate(chunks, start=1):
-        header = (
-            f"[{i}] {c.source_id} {c.doc_path} "
-            f"(pages {c.page_start}–{c.page_end}, score {c.score:.2f})"
-        )
+        header = f"[{i}] {c.source_id} {c.doc_path} (pages {c.page_start}–{c.page_end})"
         lines.append(f"{header}\n{c.text}")
     return "\n\n".join(lines)
 
@@ -139,11 +142,22 @@ def _parse_citations(
 
 
 def _validate_retriever_config(retriever_config: RetrieverConfig) -> None:
-    """Reject unsupported or incomplete retriever configurations."""
+    """Reject unsupported or incomplete retriever configurations.
+
+    Hybrid-only: `rrf_k` must be set and positive. Catching `rrf_k <= 0`
+    here (not deeper in `_rrf_fuse`) means a misconfigured pipeline fails
+    before `embed_query` spends a Voyage call — the pipeline embed cost
+    for a run that was always going to fail is strictly waste.
+    """
     if retriever_config.kind not in ("dense", "hybrid"):
         raise ValueError(f"unknown retriever.kind: {retriever_config.kind!r}")
-    if retriever_config.kind == "hybrid" and retriever_config.rrf_k is None:
-        raise ValueError("hybrid retriever requires rrf_k to be set on RetrieverConfig")
+    if retriever_config.kind == "hybrid":
+        if retriever_config.rrf_k is None:
+            raise ValueError("hybrid retriever requires rrf_k to be set on RetrieverConfig")
+        if retriever_config.rrf_k <= 0:
+            raise ValueError(
+                f"hybrid retriever rrf_k must be positive, got {retriever_config.rrf_k}"
+            )
 
 
 def _retrieve(

@@ -1,15 +1,27 @@
-"""Store-layer tests for RRF fusion and hybrid-search orchestration.
+"""Store-layer tests.
 
-The BM25 SQL path (`lexical_search`) is best exercised against a real Postgres —
-that's a manual smoke via `make db-up && make ingest --pipeline p3 && make eval
---pipeline p3`. Fusion math and hybrid branch orchestration are tested offline.
+Two layers:
+  - Pure RRF math + offline hybrid-search orchestration (fakes stand in for
+    the two retriever branches).
+  - Real-Postgres tests for the BM25 SQL path (`lexical_search`) + the full
+    `hybrid_search` end-to-end — the FTS SQL string, GIN index, generated
+    `text_tsv` column, and `websearch_to_tsquery` behavior are all things a
+    monkeypatch would silently green-light while shipping broken SQL. Skipped
+    automatically when the local Postgres isn't up (see tests/conftest.py).
 """
 
 from __future__ import annotations
 
 import pytest
 
-from src.pipeline.store import RetrievedChunk, VectorStore, _rrf_fuse
+from src.pipeline.store import (
+    EMBEDDING_DIM,
+    ChunkRow,
+    DocumentRow,
+    RetrievedChunk,
+    VectorStore,
+    _rrf_fuse,
+)
 
 
 def _chunk(chunk_id: int, *, score: float = 0.0, doc_path: str | None = None) -> RetrievedChunk:
@@ -143,6 +155,7 @@ class TestRRFFuseMath:
 
 class TestHybridSearch:
     def test_runs_both_branches_and_fuses_results(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Both branches ran, were pulled at the widened pool size, and RRF-fused."""
         store = VectorStore("unused")
         query_embedding = [0.1, 0.2]
         calls: list[tuple] = []
@@ -166,11 +179,50 @@ class TestHybridSearch:
             rrf_k=60,
         )
 
+        # Widened per-source pool: max(k*2, 20) = max(4, 20) = 20 for k=2.
+        # Pulling > k per source so RRF has more fusion opportunities before
+        # truncation to final k; see hybrid_search's comment for the rationale.
         assert calls == [
-            ("dense", "test_pipeline", query_embedding, 2),
-            ("lexical", "test_pipeline", "what is merge sort?", 2),
+            ("dense", "test_pipeline", query_embedding, 20),
+            ("lexical", "test_pipeline", "what is merge sort?", 20),
         ]
+        # Final result truncated to k=2; chunk_id=2 appears in both branches
+        # so it ranks first (sum of two reciprocals).
         assert [chunk.chunk_id for chunk in fused] == [2, 1]
+
+    @pytest.mark.parametrize(
+        ("k", "expected_pool"),
+        [
+            (2, 20),  # floor dominates
+            (10, 20),  # k*2 == floor — same value
+            (15, 30),  # k*2 dominates
+        ],
+    )
+    def test_per_source_pool_formula(
+        self, monkeypatch: pytest.MonkeyPatch, k: int, expected_pool: int
+    ) -> None:
+        """Pool = max(k*2, 20) — guards the widened fetch against regression.
+
+        Smaller `k` than the floor still gets a meaningful candidate pool
+        (otherwise k=1 would pull a single candidate per source and never
+        exercise fusion); larger `k` scales linearly.
+        """
+        store = VectorStore("unused")
+        pool_calls: list[int] = []
+
+        def dense_search(pipeline: str, embedding: list[float], k: int) -> list[RetrievedChunk]:
+            pool_calls.append(k)
+            return []
+
+        def lexical_search(pipeline: str, query_text: str, k: int) -> list[RetrievedChunk]:
+            pool_calls.append(k)
+            return []
+
+        monkeypatch.setattr(store, "dense_search", dense_search)
+        monkeypatch.setattr(store, "lexical_search", lexical_search)
+
+        store.hybrid_search("test_pipeline", [0.1], "query", k=k, rrf_k=60)
+        assert pool_calls == [expected_pool, expected_pool]
 
     @pytest.mark.parametrize(("k", "rrf_k"), [(0, 60), (2, 0)])
     def test_invalid_parameters_fail_before_search(
@@ -194,3 +246,173 @@ class TestHybridSearch:
             store.hybrid_search("test_pipeline", [0.1], "query", k=k, rrf_k=rrf_k)
 
         assert calls == []
+
+
+# ── Real-Postgres FTS + hybrid tests ──────────────────────────────────
+#
+# Everything below talks to a live Postgres via the `clean_store` fixture
+# (tests/conftest.py). Skipped automatically if the DB isn't reachable.
+# Seeds a small deterministic corpus and asserts the SQL paths behave on
+# a real `tsvector` + GIN index + `websearch_to_tsquery` round-trip.
+
+
+_PIPELINE_TAG = "test_p3_hybrid_real"
+
+
+def _seed_text_chunk(
+    store: VectorStore,
+    *,
+    document_id: int,
+    chunk_index: int,
+    text: str,
+    embedding: list[float] | None = None,
+) -> None:
+    """Insert one chunk with a known text and a deterministic embedding.
+
+    Embedding defaults to a one-hot-ish vector keyed off `chunk_index` so
+    dense retrieval has a reproducible ordering; lexical tests don't read it.
+    """
+    if embedding is None:
+        embedding = [0.0] * EMBEDDING_DIM
+        embedding[chunk_index % EMBEDDING_DIM] = 1.0
+    store.upsert_chunks(
+        document_id,
+        [
+            ChunkRow(
+                pipeline=_PIPELINE_TAG,
+                chunk_index=chunk_index,
+                text=text,
+                num_tokens=max(1, len(text.split())),
+                page_start=chunk_index + 1,
+                page_end=chunk_index + 1,
+                content_hash=f"testhash_{chunk_index}",
+                embedding=embedding,
+            )
+        ],
+    )
+
+
+@pytest.fixture
+def seeded_store(clean_store: VectorStore) -> VectorStore:
+    """Four-chunk corpus with distinct lexical signatures.
+
+    Keyword plan:
+      - chunk 0: "quicksort" — hit by `quicksort` queries, not by `database`.
+      - chunk 1: "hash table" + "collision" — hit by `hash` / `collision`.
+      - chunk 2: "database" + "transaction" — hit by `database` / `transaction`.
+      - chunk 3: "quicksort" + "pivot" — overlaps chunk 0 on `quicksort`.
+    """
+    doc_id = clean_store.upsert_document(
+        DocumentRow(
+            source_id="A1",
+            doc_path="test/fts_fixture.pdf",
+            title="FTS fixture",
+            num_pages=4,
+            content_hash="doc_fixture_hash",
+        )
+    )
+    _seed_text_chunk(
+        clean_store,
+        document_id=doc_id,
+        chunk_index=0,
+        text="Quicksort is a comparison-based sorting algorithm.",
+    )
+    _seed_text_chunk(
+        clean_store,
+        document_id=doc_id,
+        chunk_index=1,
+        text="A hash table resolves a collision via open addressing or chaining.",
+    )
+    _seed_text_chunk(
+        clean_store,
+        document_id=doc_id,
+        chunk_index=2,
+        text="A database transaction preserves atomicity across multiple writes.",
+    )
+    _seed_text_chunk(
+        clean_store,
+        document_id=doc_id,
+        chunk_index=3,
+        text="Quicksort with a median-of-medians pivot is worst-case linearithmic.",
+    )
+    clean_store.conn.commit()
+    return clean_store
+
+
+class TestLexicalSearchReal:
+    def test_single_term_match_returns_chunk(self, seeded_store: VectorStore) -> None:
+        """A term that appears in exactly one chunk returns that chunk."""
+        hits = seeded_store.lexical_search(_PIPELINE_TAG, "collision", k=5)
+        assert len(hits) == 1
+        assert "collision" in hits[0].text
+        assert hits[0].source_id == "A1"
+        assert hits[0].score > 0
+
+    def test_multi_term_match_ranks_chunks(self, seeded_store: VectorStore) -> None:
+        """A shared term returns every matching chunk ranked with a positive score."""
+        hits = seeded_store.lexical_search(_PIPELINE_TAG, "quicksort", k=5)
+        chunk_indexes = sorted(h.chunk_index for h in hits)
+        assert chunk_indexes == [0, 3]
+        assert all(h.score > 0 for h in hits)
+
+    def test_no_match_returns_empty_list(self, seeded_store: VectorStore) -> None:
+        """A term absent from every chunk returns [], not an error."""
+        hits = seeded_store.lexical_search(_PIPELINE_TAG, "zebra", k=5)
+        assert hits == []
+
+    def test_operator_input_does_not_raise(self, seeded_store: VectorStore) -> None:
+        """websearch_to_tsquery must swallow operator-looking input gracefully.
+
+        plainto_tsquery would also not raise here; the point is to lock in
+        the parser we picked and prove quoted-phrase + OR syntax reach FTS.
+        """
+        # Quoted phrase: matches chunk 1 as an exact-ish phrase lookup.
+        quoted = seeded_store.lexical_search(_PIPELINE_TAG, '"hash table"', k=5)
+        assert any("hash table" in h.text for h in quoted)
+        # Explicit OR: broadens recall across two chunks.
+        or_query = seeded_store.lexical_search(_PIPELINE_TAG, "quicksort OR transaction", k=5)
+        or_indexes = {hit.chunk_index for hit in or_query}
+        assert 2 in or_indexes
+        assert or_indexes & {0, 3}
+
+    def test_pipeline_filter_isolates_rows(self, seeded_store: VectorStore) -> None:
+        """A query against an unknown pipeline tag returns nothing even when the
+        lexeme matches rows under a different tag — the WHERE clause composes."""
+        hits = seeded_store.lexical_search("nonexistent_pipeline_tag", "quicksort", k=5)
+        assert hits == []
+
+
+class TestHybridSearchReal:
+    def test_fuses_dense_and_lexical_end_to_end(self, seeded_store: VectorStore) -> None:
+        """Hybrid returns a non-empty fused list over a real DB; chunks come from
+        both branches when they disagree."""
+        # Query embedding aligned with chunk 2's one-hot vector so dense ranks
+        # chunk 2 near the top; lexical hits chunk 0 and chunk 3 on 'quicksort'.
+        # Fused list must include chunks from both branches.
+        query_embedding = [0.0] * EMBEDDING_DIM
+        query_embedding[2] = 1.0
+
+        fused = seeded_store.hybrid_search(
+            _PIPELINE_TAG,
+            query_embedding,
+            query_text="quicksort",
+            k=5,
+            rrf_k=60,
+        )
+        chunk_indexes = {h.chunk_index for h in fused}
+        assert 2 in chunk_indexes  # Dense match: one-hot embedding aligned to chunk 2.
+        assert chunk_indexes & {0, 3}  # Lexical matches: "quicksort" occurs in chunks 0 and 3.
+        # Scores are RRF values — positive floats, bounded by 2/(rrf_k+1).
+        assert all(h.score > 0 for h in fused)
+        assert all(h.score <= 2.0 / (60 + 1) + 1e-9 for h in fused)
+
+    def test_hybrid_filters_by_pipeline_tag(self, seeded_store: VectorStore) -> None:
+        """An unknown pipeline tag returns empty from both branches → empty fusion."""
+        fused = seeded_store.hybrid_search(
+            "nonexistent_pipeline_tag",
+            [0.1] * EMBEDDING_DIM,
+            query_text="quicksort",
+            k=5,
+            rrf_k=60,
+        )
+        assert fused == []

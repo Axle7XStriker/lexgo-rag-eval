@@ -184,7 +184,9 @@ class VectorStore:
         self._conn: psycopg.Connection | None = None
 
     def __enter__(self) -> Self:
-        self._conn = psycopg.connect(self._dsn, autocommit=False)
+        # Short connect_timeout so a down DB fails fast — otherwise the eval
+        # loop and the Streamlit worker thread sit on the socket forever.
+        self._conn = psycopg.connect(self._dsn, autocommit=False, connect_timeout=5)
         # register_vector needs the `vector` type to exist, but on a fresh
         # DB nothing has installed it yet — ensure_schema() would, but the
         # caller can't reach it until __enter__ returns. Break the cycle by
@@ -409,17 +411,25 @@ class VectorStore:
     ) -> list[RetrievedChunk]:
         """Top-k BM25-alike search via Postgres FTS (ts_rank_cd + GIN index).
 
-        `plainto_tsquery` (not `to_tsquery`) accepts free-form English
-        text — a user question with punctuation or a stopword-only
-        phrase won't error, it'll just return an empty result set.
-        `ts_rank_cd` weights term proximity (BM25-inspired); the `32`
-        normalization flag divides by log(unique_words) so long docs
-        aren't unfairly boosted.
+        `websearch_to_tsquery` (not `to_tsquery`) accepts free-form English
+        text — never raises on operator-looking punctuation, and lets a
+        caller type quoted phrases ("query optimizer") or `OR` to broaden
+        explicitly. Unquoted multi-word input is AND-joined (same as
+        `plainto_tsquery`), so a long question must have every stem land
+        in a chunk to match — precision-biased by default. If P3 numbers
+        underwhelm, the first thing to try is app-level OR-joining of
+        lexemes via `to_tsquery` so lexical fires on partial-term matches
+        and dense keeps supplying the recall branch.
 
-        Returned `score` is `ts_rank_cd` (small positive float, unbounded
-        upper end but typically < 1.0); NOT comparable to `dense_search`'s
-        cosine score. Callers that want a unified score across both use
-        `hybrid_search`, which fuses by rank via RRF instead.
+        `ts_rank_cd` weights term proximity (BM25-inspired). Normalization
+        flag `32` is `rank / (rank + 1)` — a monotonic squash that bounds
+        the score into [0, 1); it does NOT penalize document length. RRF
+        downstream only reads rank order, so the squash is harmless here.
+
+        Returned `score` is `ts_rank_cd` (in [0, 1) after the flag-32
+        squash); NOT comparable to `dense_search`'s cosine score. Callers
+        that want a unified score across both use `hybrid_search`, which
+        fuses by rank via RRF instead.
         """
         sql = f"""
             SELECT
@@ -427,7 +437,7 @@ class VectorStore:
                 ts_rank_cd(c.text_tsv, query, 32) AS score
             FROM chunks c
             JOIN documents d ON d.id = c.document_id,
-                 plainto_tsquery('english', %s) AS query
+                 websearch_to_tsquery('english', %s) AS query
             WHERE c.pipeline = %s
               AND c.text_tsv @@ query
             ORDER BY score DESC
@@ -461,11 +471,17 @@ class VectorStore:
         surfaces the number.
         """
         _validate_rrf_params(rrf_k=rrf_k, top_k=k)
-        # Both source pulls fetch `k` candidates each (matches the "top-N
-        # from each" recipe). Fetching more would trade DB cost for
-        # marginal recall gain — not worth it at our scale.
-        dense = self.dense_search(pipeline, query_embedding, k=k)
-        lexical = self.lexical_search(pipeline, query_text, k=k)
+        # Pull a wider pool per source than the final `k` so RRF has more
+        # fusion opportunities before truncation. With a tight per-source
+        # pool of `k`, heavy dense/lexical overlap collapses the fused
+        # unique set to roughly `k`, which (a) hurts recall@k vs the
+        # dense-only baseline and (b) makes P3's effective top-k size
+        # vary query-by-query while P1/P2 are always exactly `k`.
+        # 2x–3x per source is standard practice; `max(k*2, 20)` floors it
+        # so very small `k` still gets a meaningful candidate pool.
+        pool = max(k * 2, 20)
+        dense = self.dense_search(pipeline, query_embedding, k=pool)
+        lexical = self.lexical_search(pipeline, query_text, k=pool)
         return _rrf_fuse(dense, lexical, rrf_k=rrf_k, top_k=k)
 
     # ── Smoke / observability helpers ─────────────────────────────────

@@ -15,12 +15,10 @@ constraint enforcement).
 
 from __future__ import annotations
 
-import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import psycopg
 import pytest
 
 from scripts import ingest as ingest_mod
@@ -52,47 +50,8 @@ class _QuietLogger:
     def debug(self, *args: Any, **kwargs: Any) -> None: ...
 
 
-# ── DB fixtures ───────────────────────────────────────────────────────
-
-
-def _dsn_from_env() -> str:
-    return os.environ.get("DATABASE_URL", "postgresql://lexgo:lexgo@localhost:5432/lexgo")
-
-
-@pytest.fixture
-def db_dsn() -> str:
-    """Real Postgres DSN. Skips the test if the DB isn't reachable."""
-    dsn = _dsn_from_env()
-    try:
-        with psycopg.connect(dsn, connect_timeout=2):
-            pass
-    except Exception as e:
-        # Any connect failure means "no DB" — skip rather than fail so unit-only
-        # runs stay green.
-        pytest.skip(f"Postgres not reachable at {dsn}: {e}")
-    return dsn
-
-
-@pytest.fixture
-def clean_store(db_dsn: str):
-    """VectorStore against a fresh schema; wipes `chunks` + `documents` on entry.
-
-    A hard TRUNCATE isolates the test from any pre-existing rows (e.g. from
-    a prior `make ingest` run).
-      - TRUNCATE removes all rows in one shot (faster than DELETE and doesn't
-        write per-row WAL).
-      - RESTART IDENTITY resets the SERIAL sequences so `documents.id` starts
-        at 1 again — makes test assertions on ids stable across runs.
-      - CASCADE follows the chunks→documents foreign key; without it the
-        TRUNCATE on `documents` would be refused while chunks reference it.
-    """
-    with VectorStore(db_dsn) as store:
-        store.ensure_schema()
-        with store.conn.cursor() as cur:
-            cur.execute("TRUNCATE chunks, documents RESTART IDENTITY CASCADE")
-        store.conn.commit()
-        yield store
-
+# `db_dsn` and `clean_store` fixtures live in tests/conftest.py — any test
+# in this directory inherits them. See conftest for the Postgres-skip shape.
 
 # ── Fake embedder ─────────────────────────────────────────────────────
 

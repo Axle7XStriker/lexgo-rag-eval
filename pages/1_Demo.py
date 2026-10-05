@@ -26,12 +26,14 @@ from src.pipeline.store import VectorStore
 from src.ui_helpers import load_settings_or_stop, render_page_header, render_sidebar
 
 # Selector labels → pipeline_config keys. Order matches the P1..P4 progression
-# in the blog-post story. P4 is disabled in the selectbox until it lands.
-_PIPELINE_OPTIONS: dict[str, str | None] = {
+# in the blog-post story. P4 isn't offered until it lands — a disabled-but-visible
+# entry (previous iteration) silently fell back to P1 when picked, which showed
+# "P4 selected" alongside P1 results in the UI. Omitting the row removes that
+# bug class entirely; `help=` on the selectbox calls out that P4 is coming.
+_PIPELINE_OPTIONS: dict[str, str] = {
     "P1 baseline (dense)": "p1",
     "P2 semantic (dense)": "p2",
     "P3 hybrid (BM25 + dense, RRF)": "p3",
-    "P4 hybrid + rerank": None,  # placeholder, disabled
 }
 
 st.set_page_config(page_title="lexgo — demo", page_icon="📚", layout="wide")
@@ -52,7 +54,8 @@ render_sidebar(settings)
 render_page_header(
     "Demo",
     "Rigorously-evaluated RAG over MIT 6.006 (Algorithms) + MIT 6.830 (Databases). "
-    "Query → answer + citations + retrieved chunks. P1 baseline is wired; P2–P4 land later.",
+    "Query → answer + citations + retrieved chunks. P1 (dense), P2 (semantic + dense), "
+    "and P3 (hybrid BM25 + dense, RRF-fused) are wired; P4 (hybrid + rerank) lands later.",
 )
 
 
@@ -91,23 +94,13 @@ def _get_store(database_url: str) -> VectorStore:
 
 with st.sidebar:
     st.subheader("Pipeline variant")
-    # Streamlit's selectbox doesn't natively disable individual options,
-    # so we render the disabled P4 entry via `format_func` and re-filter
-    # after selection — if the user somehow lands on P4, we surface a
-    # notice and fall back to P1 rather than crashing on a None key.
     selected_label = st.selectbox(
         "Variant",
         list(_PIPELINE_OPTIONS.keys()),
         index=0,
-        format_func=lambda label: (
-            f"{label}  (coming in W3)" if _PIPELINE_OPTIONS[label] is None else label
-        ),
-        help="Select a retrieval pipeline. P4 lands later in W3.",
+        help="Select a retrieval pipeline. P4 (hybrid + Cohere rerank) lands in W3.",
     )
     selected_key = _PIPELINE_OPTIONS[selected_label]
-    if selected_key is None:
-        st.info("P4 isn't wired yet — using P1 baseline.")
-        selected_key = "p1"
     active_cfg = get_pipeline(selected_key)
     st.caption(
         f"tag: `{active_cfg.tag}`  ·  kind: `{active_cfg.retriever.kind}`  ·  "
