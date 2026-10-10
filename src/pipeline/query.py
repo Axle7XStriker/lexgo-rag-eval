@@ -24,8 +24,9 @@ from dataclasses import dataclass
 from src.observability import get_logger
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
-from src.pipeline.pipeline_config import RetrieverConfig
+from src.pipeline.pipeline_config import RerankerConfig, RetrieverConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL, load_prompt, render_user_template
+from src.pipeline.rerank import CohereReranker
 from src.pipeline.store import RetrievedChunk, VectorStore
 
 _logger = get_logger("query")
@@ -64,17 +65,24 @@ class RetrievedCitation:
 
 @dataclass(frozen=True)
 class QueryResult:
-    """Full return shape of `answer_question`. Consumed by Streamlit + eval loop."""
+    """Full return shape of `answer_question`. Consumed by Streamlit + eval loop.
+
+    Cost fields are per-stage so the eval + UI can attribute spend
+    separately: `cost_usd` is generation-only (Claude), `rerank_cost_usd`
+    is Cohere Rerank (0.0 when the pipeline has no reranker). Voyage embed
+    cost lives per-call in `logs/llm_calls.jsonl` and is not duplicated here.
+    """
 
     query: str
     answer: str
     citations: list[RetrievedCitation]  # first-mention order, deduped
-    retrieved_chunks: list[RetrievedChunk]  # full top-k, for UI + eval
+    retrieved_chunks: list[RetrievedChunk]  # final top-k seen by the LLM
     prompt_version: str
-    latency_ms: float  # end-to-end wall time (embed + retrieve + generate)
+    latency_ms: float  # end-to-end wall time (embed + retrieve + rerank + generate)
     tokens_input: int  # generation only; embed is logged separately
     tokens_output: int
     cost_usd: float  # generation only; embed cost logged separately
+    rerank_cost_usd: float = 0.0  # Cohere rerank only; 0.0 when no reranker
 
 
 def _format_context(chunks: list[RetrievedChunk]) -> str:
@@ -86,10 +94,11 @@ def _format_context(chunks: list[RetrievedChunk]) -> str:
     header in the prompt.
 
     Score is intentionally omitted — it's not useful signal to the model,
-    and it carries different semantics across retrievers (cosine for dense,
-    small RRF value for hybrid), so surfacing it to Claude would at best be
-    ignored and at worst be misread as a confidence hint. UI consumers still
-    see the score via `RetrievedChunk.score` directly.
+    and it carries different semantics across pipelines (cosine for dense,
+    small RRF value for hybrid, Cohere relevance for rerank-active P4), so
+    surfacing it to Claude would at best be ignored and at worst be misread
+    as a confidence hint. UI consumers still see the score via
+    `RetrievedChunk.score` directly.
     """
     lines: list[str] = []
     for i, c in enumerate(chunks, start=1):
@@ -183,6 +192,25 @@ def _retrieve(
     )
 
 
+def _validate_reranker_pair(
+    reranker: CohereReranker | None,
+    reranker_config: RerankerConfig | None,
+) -> None:
+    """Enforce the both-or-neither invariant on the reranker/config pair.
+
+    Having one without the other is a caller bug — a reranker with no
+    `top_n` has no way to know how many results to return, and a config
+    with no client has no way to actually rerank. Catching this at the
+    boundary beats a confusing AttributeError five frames deep.
+    """
+    if (reranker is None) != (reranker_config is None):
+        raise ValueError(
+            "reranker and reranker_config must both be provided or both omitted; "
+            f"got reranker={type(reranker).__name__ if reranker else None}, "
+            f"reranker_config={reranker_config}"
+        )
+
+
 def answer_question(
     *,
     query: str,
@@ -191,28 +219,39 @@ def answer_question(
     generator: ClaudeGenerator,
     pipeline_tag: str,
     retriever: RetrieverConfig,
+    reranker: CohereReranker | None = None,
+    reranker_config: RerankerConfig | None = None,
     run_id: str | None = None,
 ) -> QueryResult:
     """Run one query through the selected pipeline. Never raises for empty retrieval.
 
     Steps:
-      1. Validate the retriever configuration.
+      1. Validate the retriever + reranker configurations.
       2. Load prompt v1 (cached).
       3. Embed `query` with Voyage.
       4. Retrieve top-k via `retriever.kind` (dense — pgvector cosine;
          hybrid — dense + BM25 fused via RRF).
       5. If retrieval is empty: short-circuit with the out-of-corpus sentinel;
-         no generator call, cost 0.
-      6. Format enumerated context block, substitute into the user template.
-      7. Call Claude for the answer.
-      8. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
+         no generator call, no rerank call, cost 0.
+      6. If reranker set: call Cohere Rerank; replace `retrieved` with the
+         top-`reranker_config.top_n` reranked list (score field now holds
+         Cohere relevance in [0, 1]).
+      7. Format enumerated context block, substitute into the user template.
+      8. Call Claude for the answer.
+      9. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
 
-    Wall-clock `latency_ms` covers the whole run (steps 1-8, whichever ran);
-    individual provider tokens/cost land in `logs/llm_calls.jsonl` per the
-    embedder and generator's own bookkeeping.
+    `reranker` and `reranker_config` must both be provided or both omitted
+    (invariant enforced in `_validate_reranker_pair`). For P1-P3 both stay
+    None; P4 passes both.
+
+    Wall-clock `latency_ms` covers the whole run (steps 1-9, whichever ran);
+    individual provider tokens/cost land in `logs/llm_calls.jsonl` per each
+    client's own bookkeeping. `QueryResult.rerank_cost_usd` is populated
+    from the Cohere call when the reranker ran (0.0 otherwise).
     """
     started = time.perf_counter()
     _validate_retriever_config(retriever)
+    _validate_reranker_pair(reranker, reranker_config)
     system_body, user_template = load_prompt(
         PROMPT_ROLE,
         PROMPT_VERSION,
@@ -232,7 +271,8 @@ def answer_question(
         # Empty retrieval → the prompt would have Claude respond with the
         # sentinel anyway; skipping the call saves the token spend and keeps
         # cost accounting clean for the degenerate case (wrong pipeline_tag,
-        # empty DB, over-filtering).
+        # empty DB, over-filtering). Reranker is also skipped — no candidates
+        # to re-order means no reason to spend $0.002.
         _logger.info(
             "empty_retrieval",
             query=query,
@@ -251,7 +291,22 @@ def answer_question(
             tokens_input=0,
             tokens_output=0,
             cost_usd=0.0,
+            rerank_cost_usd=0.0,
         )
+
+    rerank_cost_usd = 0.0
+    if reranker is not None:
+        # `_validate_reranker_pair` already enforced that reranker_config
+        # is non-None when reranker is non-None; assert for the type checker.
+        assert reranker_config is not None
+        rr = reranker.rerank(
+            query=query,
+            chunks=retrieved,
+            top_n=reranker_config.top_n,
+            run_id=run_id,
+        )
+        retrieved = rr.chunks
+        rerank_cost_usd = rr.cost_usd
 
     context_block = _format_context(retrieved)
     user_text = render_user_template(
@@ -277,4 +332,5 @@ def answer_question(
         tokens_input=gen.input_tokens,
         tokens_output=gen.output_tokens,
         cost_usd=gen.cost_usd,
+        rerank_cost_usd=rerank_cost_usd,
     )

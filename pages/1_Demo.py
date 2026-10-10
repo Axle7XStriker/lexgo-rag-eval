@@ -1,10 +1,11 @@
 """Streamlit demo page — query → answer + citations + retrieved chunks.
 
-P1 (dense), P2 (semantic + dense), and P3 (hybrid BM25 + dense, RRF-fused) are
-wired end-to-end via the pipeline_config registry: pick one from the sidebar
-and the same `answer_question` code path runs, dispatching on the pipeline's
-`RetrieverConfig.kind`. P4 (hybrid + Cohere rerank) is not built yet — its
-selector option stays disabled.
+All four pipelines are wired end-to-end via the pipeline_config registry:
+pick one from the sidebar and the same `answer_question` code path runs,
+dispatching on the pipeline's `RetrieverConfig.kind` and (for P4) its
+`RerankerConfig`. The Demo UI only ever shows the FINAL chunk set the LLM
+saw — for P4 that's the post-rerank 5, not the pre-rerank 20 (consistent
+with how recall@5 is measured in the eval loop).
 """
 
 from __future__ import annotations
@@ -22,18 +23,17 @@ from src.pipeline.generate import ClaudeGenerator
 from src.pipeline.pipeline_config import get_pipeline
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import QueryResult, answer_question
+from src.pipeline.rerank import CohereReranker
 from src.pipeline.store import VectorStore
 from src.ui_helpers import load_settings_or_stop, render_page_header, render_sidebar
 
 # Selector labels → pipeline_config keys. Order matches the P1..P4 progression
-# in the blog-post story. P4 isn't offered until it lands — a disabled-but-visible
-# entry (previous iteration) silently fell back to P1 when picked, which showed
-# "P4 selected" alongside P1 results in the UI. Omitting the row removes that
-# bug class entirely; `help=` on the selectbox calls out that P4 is coming.
+# in the blog-post story.
 _PIPELINE_OPTIONS: dict[str, str] = {
     "P1 baseline (dense)": "p1",
     "P2 semantic (dense)": "p2",
     "P3 hybrid (BM25 + dense, RRF)": "p3",
+    "P4 hybrid + Cohere rerank": "p4",
 }
 
 st.set_page_config(page_title="lexgo — demo", page_icon="📚", layout="wide")
@@ -54,8 +54,8 @@ render_sidebar(settings)
 render_page_header(
     "Demo",
     "Rigorously-evaluated RAG over MIT 6.006 (Algorithms) + MIT 6.830 (Databases). "
-    "Query → answer + citations + retrieved chunks. P1 (dense), P2 (semantic + dense), "
-    "and P3 (hybrid BM25 + dense, RRF-fused) are wired; P4 (hybrid + rerank) lands later.",
+    "Query → answer + citations + retrieved chunks. Four pipelines wired: P1 (dense), "
+    "P2 (semantic + dense), P3 (hybrid BM25 + dense, RRF-fused), P4 (hybrid + Cohere rerank).",
 )
 
 
@@ -81,6 +81,17 @@ def _get_generator(_settings: Settings) -> ClaudeGenerator:
 
 
 @st.cache_resource
+def _get_reranker(_settings: Settings) -> CohereReranker:
+    # Built eagerly on first P4 selection; cached for the process lifetime.
+    # Settings already requires COHERE_API_KEY, so no "missing key" branch here.
+    return CohereReranker(
+        api_key=_settings.cohere_api_key,
+        model=_settings.rerank_model,
+        log_path=_settings.llm_call_log,
+    )
+
+
+@st.cache_resource
 def _get_store(database_url: str) -> VectorStore:
     # VectorStore is a context manager (opens the psycopg connection + registers
     # pgvector on __enter__). Streamlit reruns the script per interaction, so a
@@ -98,14 +109,21 @@ with st.sidebar:
         "Variant",
         list(_PIPELINE_OPTIONS.keys()),
         index=0,
-        help="Select a retrieval pipeline. P4 (hybrid + Cohere rerank) lands in W3.",
+        help="Select a retrieval pipeline. Each uses the same answer prompt + judge.",
     )
     selected_key = _PIPELINE_OPTIONS[selected_label]
     active_cfg = get_pipeline(selected_key)
-    st.caption(
-        f"tag: `{active_cfg.tag}`  ·  kind: `{active_cfg.retriever.kind}`  ·  "
-        f"top_k: {active_cfg.retriever.top_k}"
-    )
+    caption_parts = [
+        f"tag: `{active_cfg.tag}`",
+        f"kind: `{active_cfg.retriever.kind}`",
+        f"top_k: {active_cfg.retriever.top_k}",
+    ]
+    if active_cfg.reranker is not None:
+        caption_parts.append(
+            f"rerank: `{active_cfg.reranker.provider}/{active_cfg.reranker.model}`, "
+            f"top_n={active_cfg.reranker.top_n}"
+        )
+    st.caption("  ·  ".join(caption_parts))
 
 with st.form("query_form", clear_on_submit=False):
     question = st.text_area(
@@ -128,6 +146,10 @@ if submitted:
             embedder = _get_embedder(settings)
             generator = _get_generator(settings)
             store = _get_store(settings.database_url)
+            # Reranker only built for pipelines that configure one (P4).
+            # answer_question's both-or-neither invariant means we pass
+            # BOTH reranker + reranker_config here, or NEITHER.
+            reranker = _get_reranker(settings) if active_cfg.reranker is not None else None
             with st.spinner("Retrieving and generating…"), _query_lock:
                 result = answer_question(
                     query=question,
@@ -136,6 +158,8 @@ if submitted:
                     generator=generator,
                     pipeline_tag=active_cfg.tag,
                     retriever=active_cfg.retriever,
+                    reranker=reranker,
+                    reranker_config=active_cfg.reranker,
                     run_id=run_id,
                 )
             st.session_state["last_result"] = result
@@ -166,6 +190,11 @@ def _render_run_details(r: QueryResult) -> None:
         # Generation cost only — Voyage embed cost is logged per-call to
         # logs/llm_calls.jsonl, not summed here.
         st.write(f"**Generation cost:** ${r.cost_usd:.4f}")
+        # Rerank cost only shown when it ran (P4). Hiding the $0.0000 row
+        # for P1-P3 keeps the panel compact and signals "this pipeline
+        # didn't do a rerank step" by its absence.
+        if r.rerank_cost_usd > 0:
+            st.write(f"**Rerank cost:** ${r.rerank_cost_usd:.4f}")
         st.write(f"**Prompt version:** {r.prompt_version}")
 
 
