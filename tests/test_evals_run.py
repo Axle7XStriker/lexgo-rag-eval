@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -25,8 +25,10 @@ from evals import run as run_module
 from src.pipeline import prompts as prompts_module
 from src.pipeline.generate import GenerateResult
 from src.pipeline.judge import JudgeResult
+from src.pipeline.pipeline_config import RerankerConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import PROMPT_VERSION
+from src.pipeline.rerank import RerankResult
 from src.pipeline.store import RetrievedChunk
 from tests.test_pipeline_config import TEST_PIPELINE_CFG
 
@@ -140,6 +142,31 @@ class _FakeGenerator:
         return GenerateResult(
             text=self.default_reply, input_tokens=150, output_tokens=25, cost_usd=0.002
         )
+
+
+@dataclass
+class _FakeReranker:
+    """Duck-types CohereReranker — reorder is identity-reverse by default.
+
+    Lets us prove the eval loop constructed one and passed it through, and
+    that `QAResult.rerank_cost_usd` lands at the configured per-call price.
+    """
+
+    cost_usd: float = 0.002
+    calls: list[dict] = field(default_factory=list)
+
+    def rerank(
+        self,
+        *,
+        query: str,
+        chunks: list[RetrievedChunk],
+        top_n: int,
+        run_id: str | None = None,
+    ) -> RerankResult:
+        self.calls.append({"query": query, "top_n": top_n, "n_candidates": len(chunks)})
+        kept = chunks[:top_n]
+        reranked = [replace(c, score=0.95 - 0.01 * i) for i, c in enumerate(kept)]
+        return RerankResult(chunks=reranked, cost_usd=self.cost_usd, latency_ms=4.2)
 
 
 @dataclass
@@ -560,3 +587,106 @@ class TestMainSkipRecovery:
         assert manifest["totals"]["n_skipped"] == 2
         # accuracy_overall is None (no successfully scored records).
         assert manifest["metrics"]["accuracy_overall"] is None
+
+
+# ── P4: rerank path end-to-end ────────────────────────────────────────
+
+
+class TestMainWithReranker:
+    """Pipeline configured with a reranker (P4-shape): CohereReranker is
+    constructed, called per Q&A, and its cost + model land in manifest + summary."""
+
+    def test_rerank_wired_through_eval_loop(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
+    ) -> None:
+        # Swap the eval-loop's PipelineConfig for one WITH a reranker.
+        # Mirrors how P4 is registered in src/pipeline/pipeline_config.py.
+        rerank_cfg = replace(
+            TEST_PIPELINE_CFG,
+            reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=3),
+        )
+        monkeypatch.setattr(run_module, "get_pipeline", lambda _key: rerank_cfg)
+
+        fake_reranker = _FakeReranker(cost_usd=0.002)
+        monkeypatch.setattr(run_module, "CohereReranker", lambda **_k: fake_reranker)
+
+        qa_path = tmp_path / "evals" / "golden" / "qa.jsonl"
+        _write_qa_jsonl(qa_path, _valid_records()[:3])  # 3 in-corpus records
+        monkeypatch.setattr(sys, "argv", ["evals.run", "--qa-path", str(qa_path)])
+
+        exit_code = run_module.main()
+        assert exit_code == 0
+
+        settings = run_module.get_settings()
+        run_dir = next((settings.evals_dir).glob("eval_*"))
+
+        # Reranker was called once per record.
+        assert len(fake_reranker.calls) == 3
+        assert all(call["top_n"] == 3 for call in fake_reranker.calls)
+
+        # Per-Q&A rerank_cost_usd lands on each results.jsonl row.
+        results = [json.loads(li) for li in (run_dir / "results.jsonl").read_text().splitlines()]
+        assert all(r["rerank_cost_usd"] == 0.002 for r in results)
+
+        # Manifest exposes reranker config + aggregate rerank totals.
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        reranker_cfg = manifest["config"]["pipeline"]["reranker"]
+        assert reranker_cfg == {
+            "provider": "cohere",
+            "model": "rerank-english-v3.0",
+            "top_n": 3,
+        }
+        # 3 Q&As × $0.002 = $0.006.
+        assert manifest["totals"]["cost_usd_rerank"] == pytest.approx(0.006)
+        # All-LLM total includes rerank.
+        assert manifest["totals"]["cost_usd_generate_judge_rerank"] == pytest.approx(
+            manifest["totals"]["cost_usd_generate_judge"] + 0.006
+        )
+
+        # summary.md surfaces the rerank cost row and the reranker metadata line.
+        summary = (run_dir / "summary.md").read_text()
+        assert "cost — rerank" in summary
+        assert "reranker:" in summary
+        assert "rerank-english-v3.0" in summary
+
+    def test_no_reranker_constructor_called_when_cfg_lacks_one(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
+    ) -> None:
+        """TEST_PIPELINE_CFG has reranker=None → CohereReranker never constructed.
+
+        Verifies the "only build when needed" branch — a P1-P3 eval run
+        should not instantiate a Cohere client at all. Important for the
+        "optional reranker" claim in the eval loop's docstring.
+        """
+        constructed: list[dict] = []
+
+        def _fail_if_called(**kwargs):
+            constructed.append(kwargs)
+            raise AssertionError("CohereReranker should not be constructed for non-P4 configs")
+
+        monkeypatch.setattr(run_module, "CohereReranker", _fail_if_called)
+
+        qa_path = tmp_path / "evals" / "golden" / "qa.jsonl"
+        _write_qa_jsonl(qa_path, _valid_records()[:1])
+        monkeypatch.setattr(sys, "argv", ["evals.run", "--qa-path", str(qa_path)])
+
+        exit_code = run_module.main()
+        assert exit_code == 0
+        assert constructed == []
+
+        # Also: results.jsonl rerank_cost_usd field is 0.0 for the P1-P3 path.
+        settings = run_module.get_settings()
+        run_dir = next((settings.evals_dir).glob("eval_*"))
+        results = [json.loads(li) for li in (run_dir / "results.jsonl").read_text().splitlines()]
+        assert all(r["rerank_cost_usd"] == 0.0 for r in results)
+
+        # And summary.md does NOT show the "reranker:" metadata line.
+        summary = (run_dir / "summary.md").read_text()
+        assert "reranker:" not in summary

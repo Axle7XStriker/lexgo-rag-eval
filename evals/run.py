@@ -63,12 +63,14 @@ from src.pipeline.judge import PROMPT_VERSION as JUDGE_PROMPT_VERSION
 from src.pipeline.judge import ClaudeJudge
 from src.pipeline.pipeline_config import (
     PIPELINES,
+    RerankerConfig,
     RetrieverConfig,
     get_pipeline,
     pipeline_to_manifest_dict,
 )
 from src.pipeline.query import PROMPT_VERSION as ANSWER_PROMPT_VERSION
 from src.pipeline.query import answer_question
+from src.pipeline.rerank import CohereReranker
 from src.pipeline.store import VectorStore
 from src.qa_schema import GOLDEN_TOTAL, QARecord, QAType, counts_by_type, load_jsonl
 
@@ -109,6 +111,8 @@ def _run_one(
     judge: ClaudeJudge,
     pipeline_tag: str,
     retriever: RetrieverConfig,
+    reranker: CohereReranker | None,
+    reranker_config: RerankerConfig | None,
     run_id: str,
 ) -> QAResult:
     """Evaluate one record end-to-end. Never raises — catches → error field.
@@ -116,6 +120,9 @@ def _run_one(
     Returns a `QAResult` with `error` set to a short string when any step
     raises after its own retries have been exhausted. The caller decides
     what to do with that (log + continue is the current policy).
+
+    `reranker` + `reranker_config` are both-or-neither (invariant enforced
+    in `answer_question`). For P1-P3 both are None; for P4 both are set.
     """
     gold_doc_paths = [c.doc_path for c in record.gold_citations]
     started = time.perf_counter()
@@ -128,11 +135,13 @@ def _run_one(
             generator=generator,
             pipeline_tag=pipeline_tag,
             retriever=retriever,
+            reranker=reranker,
+            reranker_config=reranker_config,
             run_id=run_id,
         )
     except Exception as e:
-        # Everything from `answer_question` (embed, retrieve, generate) is
-        # already retried at the provider client level. A raised exception
+        # Everything from `answer_question` (embed, retrieve, rerank, generate)
+        # is already retried at the provider client level. A raised exception
         # here is a terminal failure for this Q&A — record it and move on.
         elapsed_ms = (time.perf_counter() - started) * 1000
         return QAResult(
@@ -156,6 +165,7 @@ def _run_one(
             judge_input_tokens=0,
             judge_output_tokens=0,
             judge_cost_usd=0.0,
+            rerank_cost_usd=0.0,
             error=f"pipeline_failed: {type(e).__name__}: {e}",
         )
 
@@ -200,6 +210,7 @@ def _run_one(
             judge_input_tokens=0,
             judge_output_tokens=0,
             judge_cost_usd=0.0,
+            rerank_cost_usd=query_result.rerank_cost_usd,
             error=f"judge_failed: {type(e).__name__}: {e}",
         )
 
@@ -224,6 +235,7 @@ def _run_one(
         judge_input_tokens=verdict.input_tokens,
         judge_output_tokens=verdict.output_tokens,
         judge_cost_usd=verdict.cost_usd,
+        rerank_cost_usd=query_result.rerank_cost_usd,
         error=None,
     )
 
@@ -328,6 +340,7 @@ def _write_summary_md(
     models = manifest["config"]["models"]
     chunker_cfg = pipeline_cfg["chunker"]
     retriever_cfg = pipeline_cfg["retriever"]
+    reranker_cfg = pipeline_cfg.get("reranker")
 
     lines: list[str] = []
     lines.append(f"# Eval run — {manifest['run_id']}")
@@ -343,6 +356,13 @@ def _write_summary_md(
     lines.append(f"- embedding model: `{models['embedding_model']}`")
     lines.append(f"- chunker: `{chunker_cfg['algorithm']}` ({_chunker_summary(chunker_cfg)})")
     lines.append(f"- retriever: `{retriever_cfg['kind']}`, top_k={retriever_cfg['top_k']}")
+    # Rerank line only when a reranker is configured — keeps P1-P3 summaries
+    # from carrying a confusing "rerank: n/a" row that implies they could.
+    if reranker_cfg is not None:
+        lines.append(
+            f"- reranker: `{reranker_cfg['provider']}`/`{reranker_cfg['model']}`, "
+            f"top_n={reranker_cfg['top_n']}"
+        )
     lines.append(f"- golden path: `{manifest['golden_set']['path']}`")
     lines.append(f"- golden loaded: {manifest['golden_set']['n_records_loaded']} / {GOLDEN_TOTAL}")
     lines.append(f"- wall_clock: {manifest['totals']['wall_clock_seconds']:.1f}s")
@@ -368,6 +388,14 @@ def _write_summary_md(
     lines.append(f"| cost — generate | ${metrics.total_generate_cost_usd:.4f} |")
     lines.append(f"| cost — judge | ${metrics.total_judge_cost_usd:.4f} |")
     lines.append(f"| cost — generate + judge | ${metrics.total_generate_judge_cost_usd:.4f} |")
+    # Rerank cost always rendered — 0.0 for P1-P3 is useful signal (an eval
+    # against a pipeline that unexpectedly turned on a reranker would show
+    # here immediately). The "all LLM" row below is the headline total.
+    lines.append(f"| cost — rerank | ${metrics.total_rerank_cost_usd:.4f} |")
+    lines.append(
+        f"| cost — generate + judge + rerank | "
+        f"${metrics.total_generate_judge_rerank_cost_usd:.4f} |"
+    )
     lines.append("")
     lines.append("## Accuracy by QA type")
     lines.append("")
@@ -404,8 +432,7 @@ def main() -> int:
         choices=SUPPORTED_PIPELINES,
         default="p1",
         help="Retrieval pipeline to evaluate. Choices are the registered keys "
-        "in src.pipeline.pipeline_config.PIPELINES (currently p1..p3; "
-        "p4 joins this switch when it lands).",
+        "in src.pipeline.pipeline_config.PIPELINES (p1..p4).",
     )
     parser.add_argument(
         "--qa-path",
@@ -482,6 +509,17 @@ def main() -> int:
         model=settings.judge_model,
         log_path=settings.llm_call_log,
     )
+    # Reranker: only build when the active pipeline needs one (P4). Keeping
+    # construction conditional means a P1-P3 eval run doesn't instantiate
+    # a Cohere client at all — not strictly needed today (Settings already
+    # requires COHERE_API_KEY), but it's one fewer dependency on the hot path.
+    reranker: CohereReranker | None = None
+    if cfg.reranker is not None:
+        reranker = CohereReranker(
+            api_key=settings.cohere_api_key,
+            model=cfg.reranker.model,
+            log_path=settings.llm_call_log,
+        )
 
     results: list[QAResult] = []
     wall_started = time.perf_counter()
@@ -500,6 +538,8 @@ def main() -> int:
                 judge=judge,
                 pipeline_tag=cfg.tag,
                 retriever=cfg.retriever,
+                reranker=reranker,
+                reranker_config=cfg.reranker,
                 run_id=run_id,
             )
             results.append(qa_result)
@@ -524,7 +564,9 @@ def main() -> int:
             recall_str = (
                 f"{qa_result.recall_at_5:.2f}" if qa_result.recall_at_5 is not None else "n/a"
             )
-            total_cost = qa_result.generate_cost_usd + qa_result.judge_cost_usd
+            total_cost = (
+                qa_result.generate_cost_usd + qa_result.judge_cost_usd + qa_result.rerank_cost_usd
+            )
             print(
                 f"  {marker} [{qa_result.qa_id}] {verdict_str}, "
                 f"cite_prec={cite_prec_str}, recall@5={recall_str}, "
@@ -574,6 +616,10 @@ def main() -> int:
             "cost_usd_generate": round(metrics.total_generate_cost_usd, 6),
             "cost_usd_judge": round(metrics.total_judge_cost_usd, 6),
             "cost_usd_generate_judge": round(metrics.total_generate_judge_cost_usd, 6),
+            "cost_usd_rerank": round(metrics.total_rerank_cost_usd, 6),
+            "cost_usd_generate_judge_rerank": round(
+                metrics.total_generate_judge_rerank_cost_usd, 6
+            ),
         },
         "metrics": runmetrics_to_dict(metrics),
     }
@@ -610,7 +656,8 @@ def main() -> int:
     print(
         f"  cost     generate: ${metrics.total_generate_cost_usd:.4f}    "
         f"judge: ${metrics.total_judge_cost_usd:.4f}    "
-        f"generate+judge: ${metrics.total_generate_judge_cost_usd:.4f}"
+        f"rerank: ${metrics.total_rerank_cost_usd:.4f}    "
+        f"all: ${metrics.total_generate_judge_rerank_cost_usd:.4f}"
     )
     artifacts_display = (
         run_dir.relative_to(REPO_ROOT) if run_dir.is_relative_to(REPO_ROOT) else run_dir

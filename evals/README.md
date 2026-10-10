@@ -32,8 +32,13 @@ make validate       # golden-set integrity check (exit 0 on OK)
 Then:
 
 ```
-make eval           # runs `uv run python -m evals.run --pipeline p1`
+make eval                       # defaults to --pipeline p1
+make eval PIPELINE=p4           # P4: hybrid + Cohere rerank
 ```
+
+Four pipelines are registered (`p1`..`p4` — see `src/pipeline/pipeline_config.py`).
+Each has its own derived DB tag, so re-ingesting under a different pipeline
+coexists with existing chunks instead of overwriting them.
 
 Artifacts land under `evals/runs/eval_<UTC-timestamp>/`. Each run captures
 the git SHA, prompt versions, config, totals, and metrics into
@@ -67,9 +72,12 @@ Every eval run captures:
 
 - `git_sha` — the commit the pipeline ran at
 - `prompt_versions` — `{answer: "v1", judge: "v1", ...}`
-- `pipeline` — one of `p1_baseline`, `p2_semantic`, `p3_hybrid`, `p4_rerank`
-- `config` — chunk size, top-k, rerank-k, model IDs
-- `cost_usd` — sum from llm_calls.jsonl
+- `pipeline` — a `PipelineConfig` (key `p1`..`p4`) + derived DB `tag`
+  (e.g. `p1_fixed_500_50_<8hex>`, `p4_fixed_500_50_<8hex>`)
+- `config` — chunker knobs, retriever kind + top-k, reranker (null for P1-P3,
+  `{provider, model, top_n}` for P4), model IDs
+- `cost_usd` — generate + judge + rerank, each tracked separately in the
+  manifest `totals` block; headline is `cost_usd_generate_judge_rerank`
 - `metrics` — accuracy, citation precision, retrieval recall@5, p95 latency
 
 Numbers without provenance don't count.

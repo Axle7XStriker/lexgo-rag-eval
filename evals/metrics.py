@@ -25,6 +25,11 @@ Design notes worth remembering:
     generate + judge spend. Voyage embed spend is logged per-call in
     `logs/llm_calls.jsonl` but not aggregated here — the field name is
     honest about that scope so external reports don't misquote it.
+  - `total_rerank_cost_usd` is Cohere Rerank spend only (0.0 for P1-P3,
+    non-zero for P4). `total_generate_judge_rerank_cost_usd` sums all three
+    LLM-ish spend categories — the headline cost number for the blog post's
+    cross-pipeline comparison. Voyage embed cost still lives per-call in
+    `logs/llm_calls.jsonl` and is not aggregated.
 """
 
 from __future__ import annotations
@@ -84,6 +89,10 @@ class QAResult:
     judge_input_tokens: int
     judge_output_tokens: int
     judge_cost_usd: float
+    # P4 only — Cohere Rerank per-call spend. 0.0 for P1-P3 and for skipped
+    # records whose rerank call never ran. Defaulted so pre-P4 constructions
+    # (and legacy results.jsonl rows) parse without rewrite.
+    rerank_cost_usd: float = 0.0
     error: str | None = None
 
 
@@ -117,6 +126,12 @@ class RunMetrics:
     total_generate_cost_usd: float = 0.0
     total_judge_cost_usd: float = 0.0
     total_generate_judge_cost_usd: float = 0.0
+    # Cohere Rerank spend summed across all records (including skipped —
+    # we paid for whatever partial calls happened). 0.0 for P1-P3.
+    total_rerank_cost_usd: float = 0.0
+    # All-LLM headline total: generate + judge + rerank. This is the number
+    # the blog post's cross-pipeline cost table should quote.
+    total_generate_judge_rerank_cost_usd: float = 0.0
 
 
 # ── Per-Q&A metrics ───────────────────────────────────────────────────
@@ -269,6 +284,7 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
     # whether the Q&A was scored.
     total_gen = sum(r.generate_cost_usd for r in results)
     total_judge = sum(r.judge_cost_usd for r in results)
+    total_rerank = sum(r.rerank_cost_usd for r in results)
 
     return RunMetrics(
         n_records=n_records,
@@ -285,6 +301,8 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
         total_generate_cost_usd=total_gen,
         total_judge_cost_usd=total_judge,
         total_generate_judge_cost_usd=total_gen + total_judge,
+        total_rerank_cost_usd=total_rerank,
+        total_generate_judge_rerank_cost_usd=total_gen + total_judge + total_rerank,
     )
 
 
@@ -314,6 +332,7 @@ def qaresult_to_dict(r: QAResult) -> dict[str, Any]:
         "judge_input_tokens": r.judge_input_tokens,
         "judge_output_tokens": r.judge_output_tokens,
         "judge_cost_usd": round(r.judge_cost_usd, 6),
+        "rerank_cost_usd": round(r.rerank_cost_usd, 6),
         "error": r.error,
     }
 
@@ -335,4 +354,6 @@ def runmetrics_to_dict(m: RunMetrics) -> dict[str, Any]:
         "total_generate_cost_usd": round(m.total_generate_cost_usd, 6),
         "total_judge_cost_usd": round(m.total_judge_cost_usd, 6),
         "total_generate_judge_cost_usd": round(m.total_generate_judge_cost_usd, 6),
+        "total_rerank_cost_usd": round(m.total_rerank_cost_usd, 6),
+        "total_generate_judge_rerank_cost_usd": round(m.total_generate_judge_rerank_cost_usd, 6),
     }
