@@ -708,8 +708,7 @@ class TestMainWithReranker:
         def _fail_if_called(**kwargs):
             constructed.append(kwargs)
             raise AssertionError(
-                "CohereReranker should not be constructed when "
-                "reranker=None in the pipeline config"
+                "CohereReranker should not be constructed when reranker=None in the pipeline config"
             )
 
         monkeypatch.setattr(run_module, "CohereReranker", _fail_if_called)
@@ -728,6 +727,8 @@ class TestMainWithReranker:
         results = [json.loads(li) for li in (run_dir / "results.jsonl").read_text().splitlines()]
         assert all(r["rerank_cost_usd"] == 0.0 for r in results)
 
-        # And summary.md does NOT show the "reranker:" metadata line.
+        # And summary.md renders the reranker metadata line as "n/a" — every
+        # pipeline could configure a reranker; absence is a choice, not a
+        # missing field. Keeps side-by-side summary diffs legible.
         summary = (run_dir / "summary.md").read_text()
-        assert "reranker:" not in summary
+        assert "- reranker: n/a" in summary

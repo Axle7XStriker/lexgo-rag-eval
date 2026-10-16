@@ -358,13 +358,17 @@ def _write_summary_md(
     lines.append(f"- embedding model: `{models['embedding_model']}`")
     lines.append(f"- chunker: `{chunker_cfg['algorithm']}` ({_chunker_summary(chunker_cfg)})")
     lines.append(f"- retriever: `{retriever_cfg['kind']}`, top_k={retriever_cfg['top_k']}")
-    # Rerank line only when a reranker is configured — keeps P1-P3 summaries
-    # from carrying a confusing "rerank: n/a" row that implies they could.
+    # Rerank line always rendered — every pipeline could configure a reranker;
+    # P1-P3 explicitly don't. `n/a` makes that choice legible when scanning
+    # two summaries side-by-side, rather than making the reader wonder whether
+    # the row was omitted or the field never existed.
     if reranker_cfg is not None:
         lines.append(
             f"- reranker: `{reranker_cfg['provider']}`/`{reranker_cfg['model']}`, "
             f"top_n={reranker_cfg['top_n']}"
         )
+    else:
+        lines.append("- reranker: n/a")
     lines.append(f"- golden path: `{manifest['golden_set']['path']}`")
     lines.append(f"- golden loaded: {manifest['golden_set']['n_records_loaded']} / {GOLDEN_TOTAL}")
     lines.append(f"- wall_clock: {manifest['totals']['wall_clock_seconds']:.1f}s")

@@ -202,13 +202,16 @@ PIPELINES: dict[str, PipelineConfig] = {
         # knob identical to P3 so a P3→P4 delta attributes cleanly to the
         # rerank stage, not fusion.
         retriever=RetrieverConfig(kind="hybrid", top_k=20, rrf_k=60),
-        # Cohere Rerank 3 (English). top_n=5 is the matrix spec. The LLM
-        # therefore sees 5 chunks for P4 vs 10 for P1-P3 — expected to
-        # trade a little recall for a lot of citation precision.
+        # Cohere Rerank 3 (English). top_n=10 matches P1-P3's retriever
+        # top_k=10 so the LLM sees the same number of chunks across all
+        # pipelines — the P3→P4 accuracy delta then reflects reorder-and-
+        # prune quality (best 10 of 20, in Cohere's order), not a smaller
+        # context window. The matrix originally spec'd top_n=5 but that
+        # confounded the measurement with context size.
         reranker=RerankerConfig(
             provider="cohere",
             model="rerank-english-v3.0",
-            top_n=5,
+            top_n=10,
         ),
     ),
 }
