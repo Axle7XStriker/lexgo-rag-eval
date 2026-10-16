@@ -186,7 +186,34 @@ PIPELINES: dict[str, PipelineConfig] = {
         retriever=RetrieverConfig(kind="hybrid", top_k=10, rrf_k=60),
         reranker=None,
     ),
-    # P4 slots in here in a subsequent PR.
+    "p4": PipelineConfig(
+        key="p4",
+        # Same chunker as P1/P3 — P4 isolates the rerank effect on top of
+        # hybrid retrieval, so the chunk set must be byte-identical. The DB
+        # tag still differs because the retriever + reranker configs differ
+        # and the tag hashes the full config.
+        chunker=ChunkerConfig(
+            algorithm="fixed",
+            target_tokens=500,
+            overlap_tokens=50,
+        ),
+        # Hybrid top-20 pre-rerank: a wider pool than P3's top-10 so the
+        # reranker has more candidates to re-order. rrf_k=60 keeps the fusion
+        # knob identical to P3 so a P3→P4 delta attributes cleanly to the
+        # rerank stage, not fusion.
+        retriever=RetrieverConfig(kind="hybrid", top_k=20, rrf_k=60),
+        # Cohere Rerank 3 (English). top_n=10 matches P1-P3's retriever
+        # top_k=10 so the LLM sees the same number of chunks across all
+        # pipelines — the P3→P4 accuracy delta then reflects reorder-and-
+        # prune quality (best 10 of 20, in Cohere's order), not a smaller
+        # context window. The matrix originally spec'd top_n=5 but that
+        # confounded the measurement with context size.
+        reranker=RerankerConfig(
+            provider="cohere",
+            model="rerank-english-v3.0",
+            top_n=10,
+        ),
+    ),
 }
 
 

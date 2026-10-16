@@ -18,14 +18,16 @@ import pytest
 
 from src.pipeline import prompts as prompts_module
 from src.pipeline.generate import GenerateResult
-from src.pipeline.pipeline_config import RetrieverConfig
+from src.pipeline.pipeline_config import RerankerConfig, RetrieverConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import (
     PROMPT_VERSION,
+    QueryExecutionError,
     _format_context,
     _parse_citations,
     answer_question,
 )
+from src.pipeline.rerank import RerankExecutionError, RerankResult
 from src.pipeline.store import RetrievedChunk
 from tests.test_pipeline_config import TEST_PIPELINE_CFG
 
@@ -114,6 +116,51 @@ class _FakeStore:
             }
         )
         return list(self.to_return)
+
+
+@dataclass
+class _FakeReranker:
+    """Duck-types CohereReranker — only .rerank is called.
+
+    `reorder` is a 0-indexed permutation of the input chunks saying what
+    the fake "reranks" them to. If None (default), reverses the input —
+    enough to prove ordering was changed.
+    """
+
+    reorder: list[int] | None = None
+    cost_usd: float = 0.0042
+    calls: list[dict] = field(default_factory=list)
+
+    def rerank(
+        self,
+        *,
+        query: str,
+        chunks: list[RetrievedChunk],
+        top_n: int,
+        run_id: str | None = None,
+    ) -> RerankResult:
+        self.calls.append(
+            {"query": query, "top_n": top_n, "run_id": run_id, "n_candidates": len(chunks)}
+        )
+        order = self.reorder if self.reorder is not None else list(reversed(range(len(chunks))))
+        # Clamp to top_n and to len(chunks), same semantics as the real class.
+        order = order[: min(top_n, len(chunks))]
+        reranked = [
+            RetrievedChunk(
+                chunk_id=chunks[i].chunk_id,
+                document_id=chunks[i].document_id,
+                doc_path=chunks[i].doc_path,
+                source_id=chunks[i].source_id,
+                pipeline=chunks[i].pipeline,
+                chunk_index=chunks[i].chunk_index,
+                text=chunks[i].text,
+                page_start=chunks[i].page_start,
+                page_end=chunks[i].page_end,
+                score=0.99 - 0.01 * rank,  # synthetic rerank relevance
+            )
+            for rank, i in enumerate(order)
+        ]
+        return RerankResult(chunks=reranked, cost_usd=self.cost_usd, latency_ms=5.0)
 
 
 @dataclass
@@ -525,4 +572,252 @@ class TestRetrieverDispatch:
         assert embedder.calls == []
         assert store.dense_calls == []
         assert store.hybrid_calls == []
+        assert generator.calls == []
+
+
+# ── Rerank branch (P4) ────────────────────────────────────────────────
+
+
+_RERANK_CFG = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=2)
+
+
+class TestRerankBranch:
+    """`answer_question` optionally reranks between retrieval and generation.
+
+    `reranker` and `reranker_config` are either both None and the branch
+    is skipped. Or, the retrieved chunks are reordered to the top-N returned
+    by the reranker before the generator sees them.
+    """
+
+    def test_rerank_applied_when_configured(self) -> None:
+        """Generator receives reranked order; retrieved_chunks reflects post-rerank set."""
+        chunks = [
+            _chunk(1, "fixture/A1_doc01.pdf", "A1"),
+            _chunk(2, "fixture/A2_doc02.pdf", "A2"),
+            _chunk(3, "fixture/A3_doc03.pdf", "A3"),
+        ]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        reranker = _FakeReranker(reorder=[2, 0], cost_usd=0.001)  # keep chunk 3 then 1
+        # Generator cites [1] then [2] — those map to the RERANKED order, not
+        # the retrieval order. Proves the LLM saw the reranked list.
+        generator = _FakeGenerator(reply_text="Answer uses [1] and [2].")
+
+        result = answer_question(
+            query="what is quicksort?",
+            embedder=embedder,
+            store=store,
+            generator=generator,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            retriever=TEST_PIPELINE_CFG.retriever,
+            reranker=reranker,
+            reranker_config=_RERANK_CFG,
+            run_id="eval_test_run",
+        )
+
+        # Reranker was called with the full retrieval set + top_n from config.
+        assert len(reranker.calls) == 1
+        assert reranker.calls[0]["top_n"] == 2
+        assert reranker.calls[0]["run_id"] == "eval_test_run"
+        assert reranker.calls[0]["n_candidates"] == 3
+
+        # QueryResult.retrieved_chunks is the POST-rerank set, size top_n.
+        assert len(result.retrieved_chunks) == 2
+        assert [c.doc_path for c in result.retrieved_chunks] == [
+            "fixture/A3_doc03.pdf",
+            "fixture/A1_doc01.pdf",
+        ]
+        # Citations map through to the reranked chunks' doc_paths.
+        assert [c.doc_path for c in result.citations] == [
+            "fixture/A3_doc03.pdf",
+            "fixture/A1_doc01.pdf",
+        ]
+        # Rerank cost threaded through to the result.
+        assert result.rerank_cost_usd == 0.001
+
+    def test_rerank_omitted_when_none(self) -> None:
+        """No reranker + no config → reranker never called."""
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        reranker = _FakeReranker()
+        generator = _FakeGenerator(reply_text="ok [1]")
+
+        result = answer_question(
+            query="q",
+            embedder=embedder,
+            store=store,
+            generator=generator,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            retriever=TEST_PIPELINE_CFG.retriever,
+            reranker=None,
+            reranker_config=None,
+        )
+
+        # Reranker never called; retrieval order preserved; cost 0.0.
+        assert reranker.calls == []
+        assert [c.doc_path for c in result.retrieved_chunks] == ["fixture/A1_doc01.pdf"]
+        assert result.rerank_cost_usd == 0.0
+
+    def test_reranker_without_config_raises(self) -> None:
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=[])
+        generator = _FakeGenerator()
+        reranker = _FakeReranker()
+        with pytest.raises(ValueError, match=r"reranker and reranker_config"):
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag="tag",
+                retriever=TEST_PIPELINE_CFG.retriever,
+                reranker=reranker,
+                reranker_config=None,
+            )
+        # Validation fires before any I/O — cheap-fail is the whole point.
+        assert embedder.calls == []
+        assert reranker.calls == []
+        assert generator.calls == []
+
+    def test_config_without_reranker_raises(self) -> None:
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=[])
+        generator = _FakeGenerator()
+        with pytest.raises(ValueError, match=r"reranker and reranker_config"):
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag="tag",
+                retriever=TEST_PIPELINE_CFG.retriever,
+                reranker=None,
+                reranker_config=_RERANK_CFG,
+            )
+        assert embedder.calls == []
+        assert generator.calls == []
+
+    def test_empty_retrieval_skips_rerank(self) -> None:
+        """Empty retrieval short-circuits BEFORE the rerank step runs."""
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=[])
+        reranker = _FakeReranker()
+        generator = _FakeGenerator(reply_text="should not be called")
+
+        result = answer_question(
+            query="q",
+            embedder=embedder,
+            store=store,
+            generator=generator,
+            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            retriever=TEST_PIPELINE_CFG.retriever,
+            reranker=reranker,
+            reranker_config=_RERANK_CFG,
+        )
+
+        assert result.answer == OUT_OF_CORPUS_SENTINEL
+        assert result.rerank_cost_usd == 0.0
+        # Reranker and generator both skipped — no spend on a doomed query.
+        assert reranker.calls == []
+        assert generator.calls == []
+
+    def test_rerank_parse_error_preserves_paid_cost(self) -> None:
+        """Rerank API billed but response-parse raised → QueryExecutionError
+        carries the paid cost, generator is never called."""
+
+        @dataclass
+        class _BillingRaiseReranker:
+            cost_usd: float
+            calls: list[dict] = field(default_factory=list)
+
+            def rerank(
+                self,
+                *,
+                query: str,
+                chunks: list[RetrievedChunk],
+                top_n: int,
+                run_id: str | None = None,
+            ) -> RerankResult:
+                self.calls.append({"query": query, "top_n": top_n, "run_id": run_id})
+                raise RerankExecutionError(
+                    IndexError("bad index from Cohere"),
+                    cost_usd=self.cost_usd,
+                )
+
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf", "A1")]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        reranker = _BillingRaiseReranker(cost_usd=0.002)
+        generator = _FakeGenerator(reply_text="should not be called")
+
+        with pytest.raises(QueryExecutionError) as exc_info:
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag=TEST_PIPELINE_CFG.tag,
+                retriever=TEST_PIPELINE_CFG.retriever,
+                reranker=reranker,
+                reranker_config=_RERANK_CFG,
+            )
+
+        err = exc_info.value
+        # Paid cost from the RerankExecutionError flows through to the
+        # outer QueryExecutionError so _run_one lands it on the QAResult.
+        assert err.rerank_cost_usd == pytest.approx(0.002)
+        # Underlying cause is unwrapped from the internal RerankExecutionError
+        # wrapper — caller sees the real failure class.
+        assert isinstance(err.cause, IndexError)
+        # Generator was never called — rerank raised before context formatting.
+        assert generator.calls == []
+        assert len(reranker.calls) == 1
+
+    def test_rerank_prebilling_raise_leaves_cost_zero(self) -> None:
+        """Rerank raised BEFORE Cohere billed (retries exhausted / httpx) →
+        QueryExecutionError carries cost_usd=0.0, generator never called.
+
+        Distinct from the parse-error path: here the reranker raises a plain
+        exception (not RerankExecutionError), so no cost was committed.
+        """
+
+        @dataclass
+        class _PreBillingRaiseReranker:
+            calls: list[dict] = field(default_factory=list)
+
+            def rerank(
+                self,
+                *,
+                query: str,
+                chunks: list[RetrievedChunk],
+                top_n: int,
+                run_id: str | None = None,
+            ) -> RerankResult:
+                self.calls.append({"query": query, "top_n": top_n})
+                raise RuntimeError("transport failed after retries")
+
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf", "A1")]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        reranker = _PreBillingRaiseReranker()
+        generator = _FakeGenerator(reply_text="should not be called")
+
+        with pytest.raises(QueryExecutionError) as exc_info:
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag=TEST_PIPELINE_CFG.tag,
+                retriever=TEST_PIPELINE_CFG.retriever,
+                reranker=reranker,
+                reranker_config=_RERANK_CFG,
+            )
+
+        err = exc_info.value
+        # Nothing was billed — accumulator stays at 0.0.
+        assert err.rerank_cost_usd == 0.0
+        # Raw cause is the real exception from the reranker.
+        assert isinstance(err.cause, RuntimeError)
         assert generator.calls == []

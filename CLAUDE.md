@@ -2,7 +2,7 @@
 
 **What this file is:** project-level context for Claude Code sessions in this repo. Auto-loaded when Claude works here.
 
-**Last updated:** 2026-08-21
+**Last updated:** 2026-10-15
 
 ---
 
@@ -86,7 +86,7 @@ All 4 pipelines use the **same 100 Q&As** and the **same generation prompt**. On
 | **P1 baseline** | Fixed 500 tokens, 50 overlap | Dense (Voyage) top-10 | — | Establish floor |
 | **P2 semantic chunks** | Semantic split | Dense top-10 | — | Isolate chunking effect |
 | **P3 hybrid** | Fixed 500/50 | BM25 (Postgres FTS) + dense (RRF fusion), top-10 | — | Isolate retrieval fusion effect |
-| **P4 hybrid + rerank** | Fixed 500/50 | Hybrid top-20 | Cohere Rerank 3 → top-5 | Best case |
+| **P4 hybrid + rerank** | Fixed 500/50 | Hybrid top-20 | Cohere Rerank 3 → top-10 | Best case |
 
 ---
 
