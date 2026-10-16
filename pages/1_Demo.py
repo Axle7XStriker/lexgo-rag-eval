@@ -113,16 +113,22 @@ with st.sidebar:
     )
     selected_key = _PIPELINE_OPTIONS[selected_label]
     active_cfg = get_pipeline(selected_key)
+    # Rerank chip always shown — matches `evals/run.py`'s summary.md: every
+    # pipeline could configure a reranker; P1-P3 explicitly don't, and the
+    # `n/a` chip makes that choice legible when switching variants in the UI.
+    if active_cfg.reranker is not None:
+        rerank_chip = (
+            f"rerank: `{active_cfg.reranker.provider}/{active_cfg.reranker.model}`, "
+            f"top_n={active_cfg.reranker.top_n}"
+        )
+    else:
+        rerank_chip = "rerank: n/a"
     caption_parts = [
         f"tag: `{active_cfg.tag}`",
         f"kind: `{active_cfg.retriever.kind}`",
         f"top_k: {active_cfg.retriever.top_k}",
+        rerank_chip,
     ]
-    if active_cfg.reranker is not None:
-        caption_parts.append(
-            f"rerank: `{active_cfg.reranker.provider}/{active_cfg.reranker.model}`, "
-            f"top_n={active_cfg.reranker.top_n}"
-        )
     st.caption("  ·  ".join(caption_parts))
 
 with st.form("query_form", clear_on_submit=False):
