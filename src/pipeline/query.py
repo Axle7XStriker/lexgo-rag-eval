@@ -65,13 +65,7 @@ class RetrievedCitation:
 
 @dataclass(frozen=True)
 class QueryResult:
-    """Full return shape of `answer_question`. Consumed by Streamlit + eval loop.
-
-    Cost fields are per-stage so the eval + UI can attribute spend
-    separately: `cost_usd` is generation-only (Claude), `rerank_cost_usd`
-    is Cohere Rerank (0.0 when the pipeline has no reranker). Voyage embed
-    cost lives per-call in `logs/llm_calls.jsonl` and is not duplicated here.
-    """
+    """Full return shape of `answer_question`. Consumed by Streamlit + eval loop."""
 
     query: str
     answer: str
@@ -85,6 +79,15 @@ class QueryResult:
     rerank_cost_usd: float = 0.0  # Cohere rerank only; 0.0 when no reranker
 
 
+class QueryExecutionError(RuntimeError):
+    """A query failure that retains costs incurred by completed stages."""
+
+    def __init__(self, cause: Exception, *, rerank_cost_usd: float) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.rerank_cost_usd = rerank_cost_usd
+
+
 def _format_context(chunks: list[RetrievedChunk]) -> str:
     """Enumerate chunks as `[N] source_id doc_path (pages P-Q)\\nTEXT`.
 
@@ -95,7 +98,7 @@ def _format_context(chunks: list[RetrievedChunk]) -> str:
 
     Score is intentionally omitted — it's not useful signal to the model,
     and it carries different semantics across pipelines (cosine for dense,
-    small RRF value for hybrid, Cohere relevance for rerank-active P4), so
+    small RRF value for hybrid, Cohere relevance where reranking is involved), so
     surfacing it to Claude would at best be ignored and at worst be misread
     as a confidence hint. UI consumers still see the score via
     `RetrievedChunk.score` directly.
@@ -200,8 +203,7 @@ def _validate_reranker_pair(
 
     Having one without the other is a caller bug — a reranker with no
     `top_n` has no way to know how many results to return, and a config
-    with no client has no way to actually rerank. Catching this at the
-    boundary beats a confusing AttributeError five frames deep.
+    with no client has no way to actually rerank.
     """
     if (reranker is None) != (reranker_config is None):
         raise ValueError(
@@ -241,8 +243,10 @@ def answer_question(
       9. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
 
     `reranker` and `reranker_config` must both be provided or both omitted
-    (invariant enforced in `_validate_reranker_pair`). For P1-P3 both stay
-    None; P4 passes both.
+    (invariant enforced in `_validate_reranker_pair`).
+
+    If a stage after reranking fails, `QueryExecutionError` retains the paid
+    rerank cost while preserving the original exception as its cause.
 
     Wall-clock `latency_ms` covers the whole run (steps 1-9, whichever ran);
     individual provider tokens/cost land in `logs/llm_calls.jsonl` per each
@@ -272,7 +276,7 @@ def answer_question(
         # sentinel anyway; skipping the call saves the token spend and keeps
         # cost accounting clean for the degenerate case (wrong pipeline_tag,
         # empty DB, over-filtering). Reranker is also skipped — no candidates
-        # to re-order means no reason to spend $0.002.
+        # to re-order means no reason to spend.
         _logger.info(
             "empty_retrieval",
             query=query,
@@ -296,9 +300,6 @@ def answer_question(
 
     rerank_cost_usd = 0.0
     if reranker is not None:
-        # `_validate_reranker_pair` already enforced that reranker_config
-        # is non-None when reranker is non-None; assert for the type checker.
-        assert reranker_config is not None
         rr = reranker.rerank(
             query=query,
             chunks=retrieved,
@@ -308,29 +309,34 @@ def answer_question(
         retrieved = rr.chunks
         rerank_cost_usd = rr.cost_usd
 
-    context_block = _format_context(retrieved)
-    user_text = render_user_template(
-        user_template,
-        {"question": query, "context": context_block},
-    )
-    gen = generator.generate(
-        system=system_body,
-        user=user_text,
-        prompt_version=PROMPT_VERSION,
-        run_id=run_id,
-    )
+    try:
+        context_block = _format_context(retrieved)
+        user_text = render_user_template(
+            user_template,
+            {"question": query, "context": context_block},
+        )
+        gen = generator.generate(
+            system=system_body,
+            user=user_text,
+            prompt_version=PROMPT_VERSION,
+            run_id=run_id,
+        )
 
-    citations = _parse_citations(gen.text, retrieved)
-    elapsed_ms = (time.perf_counter() - started) * 1000
-    return QueryResult(
-        query=query,
-        answer=gen.text,
-        citations=citations,
-        retrieved_chunks=retrieved,
-        prompt_version=PROMPT_VERSION,
-        latency_ms=elapsed_ms,
-        tokens_input=gen.input_tokens,
-        tokens_output=gen.output_tokens,
-        cost_usd=gen.cost_usd,
-        rerank_cost_usd=rerank_cost_usd,
-    )
+        citations = _parse_citations(gen.text, retrieved)
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        return QueryResult(
+            query=query,
+            answer=gen.text,
+            citations=citations,
+            retrieved_chunks=retrieved,
+            prompt_version=PROMPT_VERSION,
+            latency_ms=elapsed_ms,
+            tokens_input=gen.input_tokens,
+            tokens_output=gen.output_tokens,
+            cost_usd=gen.cost_usd,
+            rerank_cost_usd=rerank_cost_usd,
+        )
+    except Exception as exc:
+        if reranker is None:
+            raise
+        raise QueryExecutionError(exc, rerank_cost_usd=rerank_cost_usd) from exc

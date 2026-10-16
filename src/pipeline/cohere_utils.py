@@ -69,7 +69,7 @@ def is_retryable(exc: BaseException) -> bool:
     return isinstance(exc, httpx.ConnectError | httpx.ReadTimeout | httpx.RemoteProtocolError)
 
 
-def cost_for(model: str, num_searches: int = 1) -> float:
+def cost_for(model: str, num_searches: int) -> float:
     """Cost in USD for `num_searches` Cohere rerank calls. Missing model → 0.0."""
     cost = cohere_cost(model, num_searches)
     if cost is None:

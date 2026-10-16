@@ -82,7 +82,7 @@ def _get_generator(_settings: Settings) -> ClaudeGenerator:
 
 @st.cache_resource
 def _get_reranker(_settings: Settings) -> CohereReranker:
-    # Built eagerly on first P4 selection; cached for the process lifetime.
+    # Built eagerly whenever its first needed; cached for the process lifetime.
     # Settings already requires COHERE_API_KEY, so no "missing key" branch here.
     return CohereReranker(
         api_key=_settings.cohere_api_key,
@@ -109,7 +109,7 @@ with st.sidebar:
         "Variant",
         list(_PIPELINE_OPTIONS.keys()),
         index=0,
-        help="Select a retrieval pipeline. Each uses the same answer prompt + judge.",
+        help="Select a retrieval pipeline.",
     )
     selected_key = _PIPELINE_OPTIONS[selected_label]
     active_cfg = get_pipeline(selected_key)
@@ -146,7 +146,7 @@ if submitted:
             embedder = _get_embedder(settings)
             generator = _get_generator(settings)
             store = _get_store(settings.database_url)
-            # Reranker only built for pipelines that configure one (P4).
+            # Reranker only built for pipelines that configure one.
             # answer_question's both-or-neither invariant means we pass
             # BOTH reranker + reranker_config here, or NEITHER.
             reranker = _get_reranker(settings) if active_cfg.reranker is not None else None
@@ -190,11 +190,7 @@ def _render_run_details(r: QueryResult) -> None:
         # Generation cost only — Voyage embed cost is logged per-call to
         # logs/llm_calls.jsonl, not summed here.
         st.write(f"**Generation cost:** ${r.cost_usd:.4f}")
-        # Rerank cost only shown when it ran (P4). Hiding the $0.0000 row
-        # for P1-P3 keeps the panel compact and signals "this pipeline
-        # didn't do a rerank step" by its absence.
-        if r.rerank_cost_usd > 0:
-            st.write(f"**Rerank cost:** ${r.rerank_cost_usd:.4f}")
+        st.write(f"**Rerank cost:** ${r.rerank_cost_usd:.4f}")
         st.write(f"**Prompt version:** {r.prompt_version}")
 
 

@@ -123,9 +123,7 @@ class _FakeReranker:
 
     `reorder` is a 0-indexed permutation of the input chunks saying what
     the fake "reranks" them to. If None (default), reverses the input —
-    enough to prove ordering was changed. `cost_usd` is defaulted to a
-    sentinel 0.0042 so an eval-loop assertion that doesn't care about the
-    exact number can still verify the field was threaded through.
+    enough to prove ordering was changed.
     """
 
     reorder: list[int] | None = None
@@ -585,9 +583,9 @@ _RERANK_CFG = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top
 class TestRerankBranch:
     """`answer_question` optionally reranks between retrieval and generation.
 
-    For P1-P3 both `reranker` and `reranker_config` are None and the branch
-    is skipped. For P4 both are set; the retrieved chunks are reordered to
-    the top-N returned by the reranker before the generator sees them.
+    `reranker` and `reranker_config` are either both None and the branch
+    is skipped. Or, the retrieved chunks are reordered to the top-N returned
+    by the reranker before the generator sees them.
     """
 
     def test_rerank_applied_when_configured(self) -> None:
@@ -599,7 +597,7 @@ class TestRerankBranch:
         ]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
-        reranker = _FakeReranker(reorder=[2, 0], cost_usd=0.002)  # keep chunk 3 then 1
+        reranker = _FakeReranker(reorder=[2, 0], cost_usd=0.001)  # keep chunk 3 then 1
         # Generator cites [1] then [2] — those map to the RERANKED order, not
         # the retrieval order. Proves the LLM saw the reranked list.
         generator = _FakeGenerator(reply_text="Answer uses [1] and [2].")
@@ -613,11 +611,13 @@ class TestRerankBranch:
             retriever=TEST_PIPELINE_CFG.retriever,
             reranker=reranker,
             reranker_config=_RERANK_CFG,
+            run_id="eval_test_run",
         )
 
         # Reranker was called with the full retrieval set + top_n from config.
         assert len(reranker.calls) == 1
         assert reranker.calls[0]["top_n"] == 2
+        assert reranker.calls[0]["run_id"] == "eval_test_run"
         assert reranker.calls[0]["n_candidates"] == 3
 
         # QueryResult.retrieved_chunks is the POST-rerank set, size top_n.
@@ -632,10 +632,10 @@ class TestRerankBranch:
             "fixture/A1_doc01.pdf",
         ]
         # Rerank cost threaded through to the result.
-        assert result.rerank_cost_usd == 0.002
+        assert result.rerank_cost_usd == 0.001
 
     def test_rerank_omitted_when_none(self) -> None:
-        """No reranker + no config → behaves like plain P3; reranker never called."""
+        """No reranker + no config → reranker never called."""
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)

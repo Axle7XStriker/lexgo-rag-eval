@@ -52,7 +52,6 @@ class TestAnthropicPricing:
 class TestCoherePricing:
     def test_known_model_single_search(self) -> None:
         # rerank-english-v3.0: $2 / 1000 searches = $0.002 / search
-        assert cohere_cost("rerank-english-v3.0") == pytest.approx(0.002)
         assert cohere_cost("rerank-english-v3.0", 1) == pytest.approx(0.002)
 
     def test_known_model_multi_search_scales_linearly(self) -> None:
@@ -66,7 +65,6 @@ class TestCoherePricing:
         assert cohere_cost("rerank-english-v3.0", 0) == pytest.approx(0.0)
 
     def test_unknown_model_is_none(self) -> None:
-        assert cohere_cost("rerank-made-up") is None
         assert cohere_cost("rerank-made-up", 100) is None
 
     def test_dict_entry_present(self) -> None:

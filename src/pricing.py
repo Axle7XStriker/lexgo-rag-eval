@@ -54,7 +54,7 @@ def anthropic_cost(model: str, input_tokens: int, output_tokens: int) -> float |
     ]
 
 
-def cohere_cost(model: str, num_searches: int = 1) -> float | None:
+def cohere_cost(model: str, num_searches: int) -> float | None:
     """Return USD cost for `num_searches` Cohere Rerank calls, or None if the model is unknown.
 
     `num_searches` is almost always 1 — one rerank call per query. Kept as

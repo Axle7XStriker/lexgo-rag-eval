@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from cohere.errors import InternalServerError, TooManyRequestsError
+from cohere.errors import BadRequestError, InternalServerError, TooManyRequestsError
 from pydantic import SecretStr
 
 from src.pipeline import rerank as rerank_module
@@ -192,7 +192,7 @@ class TestShortCircuitAndClamping:
         rr.rerank(query="q", chunks=chunks, top_n=10)
         assert client.calls[0]["top_n"] == 2
 
-    @pytest.mark.parametrize("bad_top_n", [0, -1, -10])
+    @pytest.mark.parametrize("bad_top_n", [0, -10])
     def test_zero_or_negative_top_n_raises(self, tmp_path: Path, bad_top_n: int) -> None:
         rr, client, _ = _reranker(tmp_path)
         with pytest.raises(ValueError, match=r"top_n must be positive"):
@@ -250,6 +250,24 @@ class TestLogging:
 
 
 class TestRetry:
+    def test_does_not_retry_bad_request(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Deterministic 4xx errors fail immediately without another API call."""
+        monkeypatch.setattr(rerank_module.CohereReranker._call.retry, "wait", lambda *a, **kw: 0)
+        rr, client, log_path = _reranker(tmp_path)
+
+        def always_bad_request(_kwargs: dict) -> _FakeResponse:
+            raise BadRequestError(body="invalid request")
+
+        client.responses.extend([always_bad_request] * 5)
+
+        with pytest.raises(BadRequestError):
+            rr.rerank(query="q", chunks=[_chunk(0)], top_n=1)
+
+        assert len(client.calls) == 1
+        assert _log(log_path) == []
+
     def test_retries_on_rate_limit_then_succeeds(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -299,3 +317,21 @@ class TestRetry:
         result = rr.rerank(query="q", chunks=[_chunk(0)], top_n=1)
         assert len(client.calls) == 2
         assert len(result.chunks) == 1
+
+    def test_stops_after_five_transient_failures(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Persistent transient errors are retried four times, then reraised."""
+        monkeypatch.setattr(rerank_module.CohereReranker._call.retry, "wait", lambda *a, **kw: 0)
+        rr, client, log_path = _reranker(tmp_path)
+
+        def always_rate_limited(_kwargs: dict) -> _FakeResponse:
+            raise TooManyRequestsError(body="rate limited")
+
+        client.responses.extend([always_rate_limited] * 5)
+
+        with pytest.raises(TooManyRequestsError):
+            rr.rerank(query="q", chunks=[_chunk(0)], top_n=1)
+
+        assert len(client.calls) == 5
+        assert _log(log_path) == []

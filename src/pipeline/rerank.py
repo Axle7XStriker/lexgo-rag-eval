@@ -63,7 +63,7 @@ class RerankResult:
     Cohere relevance score (in [0, 1], higher = more relevant), not the
     original retriever score. `cost_usd` + `latency_ms` are per-call —
     `answer_question` surfaces them separately from generator cost so the
-    blog's cost story can attribute spend to the rerank stage specifically.
+    rerank stage cost can be attributed separately.
     """
 
     chunks: list[RetrievedChunk]
@@ -86,9 +86,8 @@ class CohereReranker:
         log_path: Path,
         client: cohere.ClientV2 | None = None,
     ) -> None:
-        # Fail fast on unknown models: a silent $0 per-call cost would poison
-        # the blog's cost story with no visible signal. If a new Cohere model
-        # is being trialed, add it to PRICING first.
+        # Fail fast on unknown models. If a new Cohere model is being trialed,
+        # add it to PRICING first.
         if model not in PRICING:
             raise ValueError(
                 f"unknown Cohere model {model!r}; add its price to "

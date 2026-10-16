@@ -146,13 +146,9 @@ class _FakeGenerator:
 
 @dataclass
 class _FakeReranker:
-    """Duck-types CohereReranker — reorder is identity-reverse by default.
+    """Test reranker that records calls and returns a fixed cost."""
 
-    Lets us prove the eval loop constructed one and passed it through, and
-    that `QAResult.rerank_cost_usd` lands at the configured per-call price.
-    """
-
-    cost_usd: float = 0.002
+    cost_usd: float = 0.001
     calls: list[dict] = field(default_factory=list)
 
     def rerank(
@@ -163,7 +159,14 @@ class _FakeReranker:
         top_n: int,
         run_id: str | None = None,
     ) -> RerankResult:
-        self.calls.append({"query": query, "top_n": top_n, "n_candidates": len(chunks)})
+        self.calls.append(
+            {
+                "query": query,
+                "top_n": top_n,
+                "run_id": run_id,
+                "n_candidates": len(chunks),
+            }
+        )
         kept = chunks[:top_n]
         reranked = [replace(c, score=0.95 - 0.01 * i) for i, c in enumerate(kept)]
         return RerankResult(chunks=reranked, cost_usd=self.cost_usd, latency_ms=4.2)
@@ -589,12 +592,9 @@ class TestMainSkipRecovery:
         assert manifest["metrics"]["accuracy_overall"] is None
 
 
-# ── P4: rerank path end-to-end ────────────────────────────────────────
-
-
 class TestMainWithReranker:
-    """Pipeline configured with a reranker (P4-shape): CohereReranker is
-    constructed, called per Q&A, and its cost + model land in manifest + summary."""
+    """Pipeline configured with a reranker: CohereReranker is constructed,
+    called per Q&A, and its cost + model land in manifest + summary."""
 
     def test_rerank_wired_through_eval_loop(
         self,
@@ -604,14 +604,13 @@ class TestMainWithReranker:
         _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
     ) -> None:
         # Swap the eval-loop's PipelineConfig for one WITH a reranker.
-        # Mirrors how P4 is registered in src/pipeline/pipeline_config.py.
         rerank_cfg = replace(
             TEST_PIPELINE_CFG,
             reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=3),
         )
         monkeypatch.setattr(run_module, "get_pipeline", lambda _key: rerank_cfg)
 
-        fake_reranker = _FakeReranker(cost_usd=0.002)
+        fake_reranker = _FakeReranker(cost_usd=0.001)
         monkeypatch.setattr(run_module, "CohereReranker", lambda **_k: fake_reranker)
 
         qa_path = tmp_path / "evals" / "golden" / "qa.jsonl"
@@ -630,21 +629,22 @@ class TestMainWithReranker:
 
         # Per-Q&A rerank_cost_usd lands on each results.jsonl row.
         results = [json.loads(li) for li in (run_dir / "results.jsonl").read_text().splitlines()]
-        assert all(r["rerank_cost_usd"] == 0.002 for r in results)
+        assert all(r["rerank_cost_usd"] == 0.001 for r in results)
 
         # Manifest exposes reranker config + aggregate rerank totals.
         manifest = json.loads((run_dir / "manifest.json").read_text())
+        assert all(call["run_id"] == manifest["run_id"] for call in fake_reranker.calls)
         reranker_cfg = manifest["config"]["pipeline"]["reranker"]
         assert reranker_cfg == {
             "provider": "cohere",
             "model": "rerank-english-v3.0",
             "top_n": 3,
         }
-        # 3 Q&As × $0.002 = $0.006.
-        assert manifest["totals"]["cost_usd_rerank"] == pytest.approx(0.006)
+        # 3 Q&As × $0.001 = $0.003.
+        assert manifest["totals"]["cost_usd_rerank"] == pytest.approx(0.003)
         # All-LLM total includes rerank.
         assert manifest["totals"]["cost_usd_generate_judge_rerank"] == pytest.approx(
-            manifest["totals"]["cost_usd_generate_judge"] + 0.006
+            manifest["totals"]["cost_usd_generate_judge"] + 0.003
         )
 
         # summary.md surfaces the rerank cost row and the reranker metadata line.
@@ -652,6 +652,45 @@ class TestMainWithReranker:
         assert "cost — rerank" in summary
         assert "reranker:" in summary
         assert "rerank-english-v3.0" in summary
+
+    def test_generator_failure_preserves_paid_rerank_cost(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
+    ) -> None:
+        class _BoomGenerator:
+            def generate(self, **_kwargs):
+                raise RuntimeError("generation failed after rerank")
+
+        rerank_cfg = replace(
+            TEST_PIPELINE_CFG,
+            reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=3),
+        )
+        monkeypatch.setattr(run_module, "get_pipeline", lambda _key: rerank_cfg)
+
+        fake_reranker = _FakeReranker(cost_usd=0.001)
+        monkeypatch.setattr(run_module, "CohereReranker", lambda **_k: fake_reranker)
+        monkeypatch.setattr(run_module, "ClaudeGenerator", lambda **_k: _BoomGenerator())
+
+        qa_path = tmp_path / "evals" / "golden" / "qa.jsonl"
+        _write_qa_jsonl(qa_path, _valid_records()[:1])
+        monkeypatch.setattr(sys, "argv", ["evals.run", "--qa-path", str(qa_path)])
+
+        assert run_module.main() == 0
+        assert len(fake_reranker.calls) == 1
+
+        settings = run_module.get_settings()
+        run_dir = next(settings.evals_dir.glob("eval_*"))
+        result = json.loads((run_dir / "results.jsonl").read_text().strip())
+        assert "pipeline_failed" in result["error"]
+        assert result["generate_cost_usd"] == 0.0
+        assert result["rerank_cost_usd"] == 0.001
+
+        manifest = json.loads((run_dir / "manifest.json").read_text())
+        assert manifest["totals"]["n_skipped"] == 1
+        assert manifest["totals"]["cost_usd_rerank"] == pytest.approx(0.001)
+        assert manifest["totals"]["cost_usd_generate_judge_rerank"] == pytest.approx(0.001)
 
     def test_no_reranker_constructor_called_when_cfg_lacks_one(
         self,
@@ -661,15 +700,17 @@ class TestMainWithReranker:
     ) -> None:
         """TEST_PIPELINE_CFG has reranker=None → CohereReranker never constructed.
 
-        Verifies the "only build when needed" branch — a P1-P3 eval run
-        should not instantiate a Cohere client at all. Important for the
+        Verifies the "only build when needed" branch. Important for the
         "optional reranker" claim in the eval loop's docstring.
         """
         constructed: list[dict] = []
 
         def _fail_if_called(**kwargs):
             constructed.append(kwargs)
-            raise AssertionError("CohereReranker should not be constructed for non-P4 configs")
+            raise AssertionError(
+                "CohereReranker should not be constructed when "
+                "reranker=None in the pipeline config"
+            )
 
         monkeypatch.setattr(run_module, "CohereReranker", _fail_if_called)
 

@@ -198,9 +198,9 @@ PIPELINES: dict[str, PipelineConfig] = {
             overlap_tokens=50,
         ),
         # Hybrid top-20 pre-rerank: a wider pool than P3's top-10 so the
-        # reranker has more candidates to re-order. 20 is the matrix spec
-        # per CLAUDE.md. rrf_k=60 keeps the fusion knob identical to P3 so
-        # a P3→P4 delta attributes cleanly to the rerank stage, not fusion.
+        # reranker has more candidates to re-order. rrf_k=60 keeps the fusion
+        # knob identical to P3 so a P3→P4 delta attributes cleanly to the
+        # rerank stage, not fusion.
         retriever=RetrieverConfig(kind="hybrid", top_k=20, rrf_k=60),
         # Cohere Rerank 3 (English). top_n=5 is the matrix spec. The LLM
         # therefore sees 5 chunks for P4 vs 10 for P1-P3 — expected to

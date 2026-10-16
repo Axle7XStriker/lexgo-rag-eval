@@ -27,8 +27,7 @@ Design notes worth remembering:
     honest about that scope so external reports don't misquote it.
   - `total_rerank_cost_usd` is Cohere Rerank spend only (0.0 for P1-P3,
     non-zero for P4). `total_generate_judge_rerank_cost_usd` sums all three
-    LLM-ish spend categories — the headline cost number for the blog post's
-    cross-pipeline comparison. Voyage embed cost still lives per-call in
+    LLM-ish spend categories. Voyage embed cost still lives per-call in
     `logs/llm_calls.jsonl` and is not aggregated.
 """
 
@@ -89,8 +88,8 @@ class QAResult:
     judge_input_tokens: int
     judge_output_tokens: int
     judge_cost_usd: float
-    # P4 only — Cohere Rerank per-call spend. 0.0 for P1-P3 and for skipped
-    # records whose rerank call never ran. Defaulted so pre-P4 constructions
+    # Cohere Rerank per-call spend. 0.0 for skipped records whose rerank call never
+    # ran or those that don't use reranking. Defaulted so pre-P4 constructions
     # (and legacy results.jsonl rows) parse without rewrite.
     rerank_cost_usd: float = 0.0
     error: str | None = None
@@ -127,10 +126,9 @@ class RunMetrics:
     total_judge_cost_usd: float = 0.0
     total_generate_judge_cost_usd: float = 0.0
     # Cohere Rerank spend summed across all records (including skipped —
-    # we paid for whatever partial calls happened). 0.0 for P1-P3.
+    # we paid for whatever partial calls happened).
     total_rerank_cost_usd: float = 0.0
-    # All-LLM headline total: generate + judge + rerank. This is the number
-    # the blog post's cross-pipeline cost table should quote.
+    # All-LLM headline total: generate + judge + rerank.
     total_generate_judge_rerank_cost_usd: float = 0.0
 
 

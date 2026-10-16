@@ -69,7 +69,7 @@ from src.pipeline.pipeline_config import (
     pipeline_to_manifest_dict,
 )
 from src.pipeline.query import PROMPT_VERSION as ANSWER_PROMPT_VERSION
-from src.pipeline.query import answer_question
+from src.pipeline.query import QueryExecutionError, answer_question
 from src.pipeline.rerank import CohereReranker
 from src.pipeline.store import VectorStore
 from src.qa_schema import GOLDEN_TOTAL, QARecord, QAType, counts_by_type, load_jsonl
@@ -122,7 +122,7 @@ def _run_one(
     what to do with that (log + continue is the current policy).
 
     `reranker` + `reranker_config` are both-or-neither (invariant enforced
-    in `answer_question`). For P1-P3 both are None; for P4 both are set.
+    in `answer_question`).
     """
     gold_doc_paths = [c.doc_path for c in record.gold_citations]
     started = time.perf_counter()
@@ -144,6 +144,8 @@ def _run_one(
         # is already retried at the provider client level. A raised exception
         # here is a terminal failure for this Q&A — record it and move on.
         elapsed_ms = (time.perf_counter() - started) * 1000
+        cause = e.cause if isinstance(e, QueryExecutionError) else e
+        rerank_cost_usd = e.rerank_cost_usd if isinstance(e, QueryExecutionError) else 0.0
         return QAResult(
             qa_id=record.id,
             qa_type=record.type,
@@ -165,8 +167,8 @@ def _run_one(
             judge_input_tokens=0,
             judge_output_tokens=0,
             judge_cost_usd=0.0,
-            rerank_cost_usd=0.0,
-            error=f"pipeline_failed: {type(e).__name__}: {e}",
+            rerank_cost_usd=rerank_cost_usd,
+            error=f"pipeline_failed: {type(cause).__name__}: {cause}",
         )
 
     model_doc_paths = [c.doc_path for c in query_result.citations]
@@ -510,7 +512,7 @@ def main() -> int:
         log_path=settings.llm_call_log,
     )
     # Reranker: only build when the active pipeline needs one (P4). Keeping
-    # construction conditional means a P1-P3 eval run doesn't instantiate
+    # construction conditional so that pipelines that don't need it don't instantiate
     # a Cohere client at all — not strictly needed today (Settings already
     # requires COHERE_API_KEY), but it's one fewer dependency on the hot path.
     reranker: CohereReranker | None = None
