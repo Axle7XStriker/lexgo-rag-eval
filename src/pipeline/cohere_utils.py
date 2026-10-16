@@ -45,14 +45,18 @@ def is_retryable(exc: BaseException) -> bool:
     """True for transient failures; False for deterministic ones.
 
     Retryable: Cohere's rate-limit + 5xx typed exceptions, and httpx
-    transport failures (DNS, connection reset, read timeout). The typed
-    check comes first because it's cheaper and doesn't require the SDK
-    to have populated `status_code` on the exception.
+    transport failures (DNS, connection reset, timeouts on connect/read/
+    write/pool, read/write/close on an established socket, remote protocol
+    errors). The typed check comes first because it's cheaper and doesn't
+    require the SDK to have populated `status_code` on the exception.
 
     Not retryable: 4xx author errors (`BadRequestError`, `UnauthorizedError`,
     `ForbiddenError`, `NotFoundError`, `UnprocessableEntityError`,
-    `ClientClosedRequestError`, `InvalidTokenError`, `NotImplementedError`).
-    Retrying these would just burn budget on the same deterministic failure.
+    `ClientClosedRequestError`, `InvalidTokenError`, `NotImplementedError`),
+    and httpx errors that signal a programming/config bug rather than a
+    transient condition (`LocalProtocolError`, `ProxyError`,
+    `UnsupportedProtocol`). Retrying any of these would just burn budget on
+    the same deterministic failure.
     """
     if isinstance(
         exc,
@@ -64,9 +68,17 @@ def is_retryable(exc: BaseException) -> bool:
         # code change here. 4xx stays non-retryable.
         code = exc.status_code
         return isinstance(code, int) and code >= 500
-    # httpx errors surface when Cohere's SDK fails before getting a response
-    # (DNS, TCP reset, read timeout). All transient by definition.
-    return isinstance(exc, httpx.ConnectError | httpx.ReadTimeout | httpx.RemoteProtocolError)
+    # httpx transport failures: cover every timeout flavor (ConnectTimeout,
+    # ReadTimeout, WriteTimeout, PoolTimeout — all siblings under
+    # TimeoutException, not subclasses of each other) and every network-
+    # layer error (ConnectError/ReadError/WriteError/CloseError under
+    # NetworkError), plus RemoteProtocolError. Narrower than TransportError
+    # because LocalProtocolError / ProxyError / UnsupportedProtocol are
+    # author-side bugs, not transient conditions.
+    return isinstance(
+        exc,
+        httpx.TimeoutException | httpx.NetworkError | httpx.RemoteProtocolError,
+    )
 
 
 def cost_for(model: str, num_searches: int) -> float:

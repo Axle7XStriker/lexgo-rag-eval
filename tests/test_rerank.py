@@ -18,7 +18,7 @@ from cohere.errors import BadRequestError, InternalServerError, TooManyRequestsE
 from pydantic import SecretStr
 
 from src.pipeline import rerank as rerank_module
-from src.pipeline.rerank import CohereReranker, RerankResult
+from src.pipeline.rerank import CohereReranker, RerankExecutionError, RerankResult
 from src.pipeline.store import RetrievedChunk
 
 # ── Fake Cohere client ────────────────────────────────────────────────
@@ -335,3 +335,42 @@ class TestRetry:
 
         assert len(client.calls) == 5
         assert _log(log_path) == []
+
+
+# ── Response-parse errors (API billed, parse raised) ──────────────────
+
+
+class TestParseErrorPreservesCost:
+    """Cohere returned a response (we WILL be billed), but parsing raised.
+
+    Must log the call with its honest cost + raise RerankExecutionError
+    carrying `cost_usd` so callers can preserve the paid charge
+    instead of silently losing it.
+    """
+
+    @pytest.mark.parametrize("bad_index", [5, -1])
+    def test_bad_index_logs_cost_and_raises(self, tmp_path: Path, bad_index: int) -> None:
+        rr, client, log_path = _reranker(tmp_path)
+        chunks = [_chunk(0), _chunk(1)]
+        client.responses.append(
+            _FakeResponse(results=[_FakeResult(index=bad_index, relevance_score=0.9)])
+        )
+
+        with pytest.raises(RerankExecutionError) as exc_info:
+            rr.rerank(query="q", chunks=chunks, top_n=2)
+
+        err = exc_info.value
+        assert isinstance(err.cause, IndexError)
+        # Cost reflects the per-search charge even though parse failed.
+        assert err.cost_usd == pytest.approx(0.002)
+
+        # The API call is logged with the paid cost — logs/llm_calls.jsonl
+        # must match the actual invoice regardless of parse outcome.
+        records = _log(log_path)
+        assert len(records) == 1
+        rec = records[0]
+        assert rec["cost_usd"] == pytest.approx(0.002)
+        # Extra field flags the parse failure for post-hoc triage.
+        assert rec["parse_error"] == "IndexError"
+        # One API call was made.
+        assert len(client.calls) == 1

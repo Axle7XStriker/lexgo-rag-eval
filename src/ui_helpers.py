@@ -37,7 +37,6 @@ def render_sidebar(settings: Settings) -> None:
         st.subheader("Config")
         st.write(f"**Chat:** `{settings.chat_model}`")
         st.write(f"**Embed:** `{settings.embedding_model}`")
-        st.write(f"**Rerank:** `{settings.rerank_model}`")
         st.subheader("Health")
         st.success("Config loaded — all required keys present.")
 

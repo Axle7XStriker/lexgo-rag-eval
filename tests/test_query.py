@@ -22,11 +22,12 @@ from src.pipeline.pipeline_config import RerankerConfig, RetrieverConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL
 from src.pipeline.query import (
     PROMPT_VERSION,
+    QueryExecutionError,
     _format_context,
     _parse_citations,
     answer_question,
 )
-from src.pipeline.rerank import RerankResult
+from src.pipeline.rerank import RerankExecutionError, RerankResult
 from src.pipeline.store import RetrievedChunk
 from tests.test_pipeline_config import TEST_PIPELINE_CFG
 
@@ -719,4 +720,104 @@ class TestRerankBranch:
         assert result.rerank_cost_usd == 0.0
         # Reranker and generator both skipped — no spend on a doomed query.
         assert reranker.calls == []
+        assert generator.calls == []
+
+    def test_rerank_parse_error_preserves_paid_cost(self) -> None:
+        """Rerank API billed but response-parse raised → QueryExecutionError
+        carries the paid cost, generator is never called."""
+
+        @dataclass
+        class _BillingRaiseReranker:
+            cost_usd: float
+            calls: list[dict] = field(default_factory=list)
+
+            def rerank(
+                self,
+                *,
+                query: str,
+                chunks: list[RetrievedChunk],
+                top_n: int,
+                run_id: str | None = None,
+            ) -> RerankResult:
+                self.calls.append({"query": query, "top_n": top_n, "run_id": run_id})
+                raise RerankExecutionError(
+                    IndexError("bad index from Cohere"),
+                    cost_usd=self.cost_usd,
+                )
+
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf", "A1")]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        reranker = _BillingRaiseReranker(cost_usd=0.002)
+        generator = _FakeGenerator(reply_text="should not be called")
+
+        with pytest.raises(QueryExecutionError) as exc_info:
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag=TEST_PIPELINE_CFG.tag,
+                retriever=TEST_PIPELINE_CFG.retriever,
+                reranker=reranker,
+                reranker_config=_RERANK_CFG,
+            )
+
+        err = exc_info.value
+        # Paid cost from the RerankExecutionError flows through to the
+        # outer QueryExecutionError so _run_one lands it on the QAResult.
+        assert err.rerank_cost_usd == pytest.approx(0.002)
+        # Underlying cause is unwrapped from the internal RerankExecutionError
+        # wrapper — caller sees the real failure class.
+        assert isinstance(err.cause, IndexError)
+        # Generator was never called — rerank raised before context formatting.
+        assert generator.calls == []
+        assert len(reranker.calls) == 1
+
+    def test_rerank_prebilling_raise_leaves_cost_zero(self) -> None:
+        """Rerank raised BEFORE Cohere billed (retries exhausted / httpx) →
+        QueryExecutionError carries cost_usd=0.0, generator never called.
+
+        Distinct from the parse-error path: here the reranker raises a plain
+        exception (not RerankExecutionError), so no cost was committed.
+        """
+
+        @dataclass
+        class _PreBillingRaiseReranker:
+            calls: list[dict] = field(default_factory=list)
+
+            def rerank(
+                self,
+                *,
+                query: str,
+                chunks: list[RetrievedChunk],
+                top_n: int,
+                run_id: str | None = None,
+            ) -> RerankResult:
+                self.calls.append({"query": query, "top_n": top_n})
+                raise RuntimeError("transport failed after retries")
+
+        chunks = [_chunk(1, "fixture/A1_doc01.pdf", "A1")]
+        embedder = _FakeEmbedder()
+        store = _FakeStore(to_return=chunks)
+        reranker = _PreBillingRaiseReranker()
+        generator = _FakeGenerator(reply_text="should not be called")
+
+        with pytest.raises(QueryExecutionError) as exc_info:
+            answer_question(
+                query="q",
+                embedder=embedder,
+                store=store,
+                generator=generator,
+                pipeline_tag=TEST_PIPELINE_CFG.tag,
+                retriever=TEST_PIPELINE_CFG.retriever,
+                reranker=reranker,
+                reranker_config=_RERANK_CFG,
+            )
+
+        err = exc_info.value
+        # Nothing was billed — accumulator stays at 0.0.
+        assert err.rerank_cost_usd == 0.0
+        # Raw cause is the real exception from the reranker.
+        assert isinstance(err.cause, RuntimeError)
         assert generator.calls == []

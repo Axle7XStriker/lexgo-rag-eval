@@ -26,7 +26,7 @@ from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.generate import ClaudeGenerator
 from src.pipeline.pipeline_config import RerankerConfig, RetrieverConfig
 from src.pipeline.prompts import OUT_OF_CORPUS_SENTINEL, load_prompt, render_user_template
-from src.pipeline.rerank import CohereReranker
+from src.pipeline.rerank import CohereReranker, RerankExecutionError
 from src.pipeline.store import RetrievedChunk, VectorStore
 
 _logger = get_logger("query")
@@ -298,18 +298,23 @@ def answer_question(
             rerank_cost_usd=0.0,
         )
 
+    # Rerank + generate live inside the same try so a billed-but-failed
+    # rerank (RerankExecutionError carries its own cost_usd) or any later
+    # failure both preserve the paid rerank cost via QueryExecutionError.
+    # A pre-API rerank failure (retries exhausted, httpx raise) leaves the
+    # local accumulator at 0.0 — no billing happened, nothing to preserve.
     rerank_cost_usd = 0.0
-    if reranker is not None:
-        rr = reranker.rerank(
-            query=query,
-            chunks=retrieved,
-            top_n=reranker_config.top_n,
-            run_id=run_id,
-        )
-        retrieved = rr.chunks
-        rerank_cost_usd = rr.cost_usd
-
     try:
+        if reranker is not None:
+            rr = reranker.rerank(
+                query=query,
+                chunks=retrieved,
+                top_n=reranker_config.top_n,
+                run_id=run_id,
+            )
+            retrieved = rr.chunks
+            rerank_cost_usd = rr.cost_usd
+
         context_block = _format_context(retrieved)
         user_text = render_user_template(
             user_template,
@@ -337,6 +342,16 @@ def answer_question(
             rerank_cost_usd=rerank_cost_usd,
         )
     except Exception as exc:
+        # RerankExecutionError carries the paid cost on itself (parse error
+        # after Cohere returned); unwrap to the underlying cause so the
+        # caller sees the real failure class, not an internal wrapper.
+        if isinstance(exc, RerankExecutionError):
+            rerank_cost_usd = exc.cost_usd
+            cause: Exception = exc.cause
+        else:
+            cause = exc
         if reranker is None:
+            # No reranker configured → no paid cost to smuggle, no reason
+            # to wrap. Preserve the original raise.
             raise
-        raise QueryExecutionError(exc, rerank_cost_usd=rerank_cost_usd) from exc
+        raise QueryExecutionError(cause, rerank_cost_usd=rerank_cost_usd) from exc

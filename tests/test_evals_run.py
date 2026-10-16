@@ -295,7 +295,6 @@ def _make_settings_stub(tmp_path: Path):
         chat_model: str = "claude-sonnet-4-6"
         judge_model: str = "claude-sonnet-4-6"
         embedding_model: str = "voyage-3-large"
-        rerank_model: str = "rerank-english-v3.0"
         log_level: str = "INFO"
         log_dir: Path = tmp_path / "logs"
         llm_call_log: Path = tmp_path / "logs" / "llm_calls.jsonl"

@@ -6,10 +6,16 @@ Design notes worth remembering:
   - Mirrors `VoyageEmbedder` / `ClaudeGenerator` line-for-line: sync client,
     `SecretStr` key, `tenacity` retries on transient exceptions only,
     fail-fast on unknown model in `__init__`, exactly one `log_llm_call` per
-    API call, dependency-injection seam via `client=` for tests.
+    successful API return (including the case where response-parsing then
+    raises — we were billed, we log), dependency-injection seam via
+    `client=` for tests.
   - Shared retry / cost / provider helpers live in
     `src.pipeline.cohere_utils` so a future second Cohere callsite picks up
     changes without duplication.
+  - Tenacity is the single retry layer. The SDK's own `max_retries` is
+    disabled (`max_retries=0`) at client construction — otherwise a
+    transient 429 would be retried 2x by the SDK + 4x by tenacity = up to
+    15 compounded attempts per rerank call, each with its own backoff.
   - Cohere's SDK is sync. One rerank call per query, no batching — the eval
     loop reranks 100 queries sequentially; parallelism is complexity without
     payoff at this scale.
@@ -28,6 +34,11 @@ Design notes worth remembering:
   - `top_n` is clamped to `len(chunks)` before the API call — Cohere errors
     `BadRequestError` if `top_n > len(documents)`, which would waste a
     retry cycle on a deterministic client bug.
+  - If the API call succeeds but response-parsing raises (malformed
+    `index` or missing field — rare SDK regression), the call is logged
+    with its honest per-search cost, then the caller sees a
+    `RerankExecutionError` carrying both the underlying cause and
+    `cost_usd` so the paid charge isn't silently lost from accounting.
 """
 
 from __future__ import annotations
@@ -71,6 +82,27 @@ class RerankResult:
     latency_ms: float
 
 
+class RerankExecutionError(RuntimeError):
+    """A rerank API call that was BILLED but whose response couldn't be parsed.
+
+    Raised only after Cohere returned successfully (HTTP 2xx + a response
+    object) but subsequent parsing raised — e.g. a `results[i].index`
+    outside `[0, len(chunks))` from an SDK regression. The underlying
+    exception is preserved on `.cause` and the per-call charge on
+    `.cost_usd` so the callers can preserve the paid cost rather than
+    silently losing it.
+
+    Transient API-level failures (429, 5xx, httpx transport errors) go
+    through tenacity and reraise unchanged — they're not billed and
+    don't need this wrapper.
+    """
+
+    def __init__(self, cause: Exception, *, cost_usd: float) -> None:
+        super().__init__(str(cause))
+        self.cause = cause
+        self.cost_usd = cost_usd
+
+
 class CohereReranker:
     """Sync Cohere Rerank client wrapper with retry, cost accounting, and per-call logging.
 
@@ -97,7 +129,12 @@ class CohereReranker:
         self._model = model
         self._log_path = log_path
         # `client` injection is the seam tests use — no HTTP mock required.
-        self._client = client or cohere.ClientV2(api_key=api_key.get_secret_value())
+        # `max_retries=0` disables the SDK's own retry layer: tenacity owns
+        # retries here. One retry layer, not two.
+        self._client = client or cohere.ClientV2(
+            api_key=api_key.get_secret_value(),
+            max_retries=0,
+        )
 
     @property
     def model(self) -> str:
@@ -152,30 +189,59 @@ class CohereReranker:
             top_n=effective_top_n,
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
-
-        # Cohere's V2RerankResponse.results is already sorted by relevance
-        # descending; each entry has `index` (into our `chunks` list) and
-        # `relevance_score` (float in [0, 1]). Build the reranked list by
-        # mapping back through `chunks` and overwriting score.
-        reranked: list[RetrievedChunk] = []
-        for r in response.results:
-            source = chunks[r.index]
-            reranked.append(
-                RetrievedChunk(
-                    chunk_id=source.chunk_id,
-                    document_id=source.document_id,
-                    doc_path=source.doc_path,
-                    source_id=source.source_id,
-                    pipeline=source.pipeline,
-                    chunk_index=source.chunk_index,
-                    text=source.text,
-                    page_start=source.page_start,
-                    page_end=source.page_end,
-                    score=r.relevance_score,
-                )
-            )
-
         cost_usd = cost_for(self._model, num_searches=1)
+
+        reranked: list[RetrievedChunk] = []
+        try:
+            # V2RerankResponse.results is sorted by relevance descending;
+            # each entry has `index` (into `chunks`) and `relevance_score`
+            # (in [0, 1]). Build the reranked list by mapping back through
+            # `chunks` and overwriting score.
+            for r in response.results:
+                if not 0 <= r.index < len(chunks):
+                    raise IndexError(
+                        f"Cohere rerank result index {r.index} outside [0, {len(chunks)})"
+                    )
+                source = chunks[r.index]
+                reranked.append(
+                    RetrievedChunk(
+                        chunk_id=source.chunk_id,
+                        document_id=source.document_id,
+                        doc_path=source.doc_path,
+                        source_id=source.source_id,
+                        pipeline=source.pipeline,
+                        chunk_index=source.chunk_index,
+                        text=source.text,
+                        page_start=source.page_start,
+                        page_end=source.page_end,
+                        score=r.relevance_score,
+                    )
+                )
+        except Exception as parse_exc:
+            # Response-parse errors (bad index, unexpected shape from an SDK
+            # regression). Log the call before raising so logs/llm_calls.jsonl
+            # matches the actual invoice, and wrap the exception so callers
+            # see the paid cost (if any).
+            log_llm_call(
+                self._log_path,
+                provider=PROVIDER,
+                model=self._model,
+                operation="rerank_chunks",
+                input_tokens=0,
+                output_tokens=0,
+                cost_usd=cost_usd,
+                latency_ms=elapsed_ms,
+                run_id=run_id,
+                prompt_version=None,
+                extra={
+                    "num_candidates": len(chunks),
+                    "top_n": effective_top_n,
+                    "returned": len(reranked),
+                    "parse_error": type(parse_exc).__name__,
+                },
+            )
+            raise RerankExecutionError(parse_exc, cost_usd=cost_usd) from parse_exc
+
         log_llm_call(
             self._log_path,
             provider=PROVIDER,

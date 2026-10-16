@@ -1,11 +1,8 @@
 """Streamlit demo page — query → answer + citations + retrieved chunks.
 
 All four pipelines are wired end-to-end via the pipeline_config registry:
-pick one from the sidebar and the same `answer_question` code path runs,
-dispatching on the pipeline's `RetrieverConfig.kind` and (for P4) its
-`RerankerConfig`. The Demo UI only ever shows the FINAL chunk set the LLM
-saw — for P4 that's the post-rerank 5, not the pre-rerank 20 (consistent
-with how recall@5 is measured in the eval loop).
+pick one from the sidebar and the same `answer_question` code path runs.
+The Demo UI only ever shows the FINAL chunk set the LLM saw.
 """
 
 from __future__ import annotations
@@ -81,12 +78,16 @@ def _get_generator(_settings: Settings) -> ClaudeGenerator:
 
 
 @st.cache_resource
-def _get_reranker(_settings: Settings) -> CohereReranker:
-    # Built eagerly whenever its first needed; cached for the process lifetime.
+def _get_reranker(_settings: Settings, model: str) -> CohereReranker:
+    # Built lazily when first needed; cached per `model` so multiple
+    # pipelines pinning different Cohere models would each get their own
+    # instance. Model identity comes from the active PipelineConfig —
+    # Settings doesn't own a `rerank_model` (single source of truth lives
+    # in `pipeline_config.PIPELINES[...].reranker.model`).
     # Settings already requires COHERE_API_KEY, so no "missing key" branch here.
     return CohereReranker(
         api_key=_settings.cohere_api_key,
-        model=_settings.rerank_model,
+        model=model,
         log_path=_settings.llm_call_log,
     )
 
@@ -155,7 +156,11 @@ if submitted:
             # Reranker only built for pipelines that configure one.
             # answer_question's both-or-neither invariant means we pass
             # BOTH reranker + reranker_config here, or NEITHER.
-            reranker = _get_reranker(settings) if active_cfg.reranker is not None else None
+            reranker = (
+                _get_reranker(settings, active_cfg.reranker.model)
+                if active_cfg.reranker is not None
+                else None
+            )
             with st.spinner("Retrieving and generating…"), _query_lock:
                 result = answer_question(
                     query=question,
