@@ -62,5 +62,8 @@ uv.lock.bak
 evals/runs/*
 !evals/runs/.gitkeep
 
+# Golden-set backup files (written by save_jsonl_atomic — ephemeral)
+evals/golden/*.bak
+
 # Corpus PDFs (downloaded via scripts/fetch_corpus.py — reproducible, not source)
 corpus/
