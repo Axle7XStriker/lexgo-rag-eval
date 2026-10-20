@@ -296,6 +296,93 @@ class TestTagMutationCoverage:
         self._assert_covered(PipelineConfig, self._COVERED_PIPELINE_FIELDS)
 
 
+class TestChunkSetId:
+    """`chunk_set_id` is the DB identifier for a chunk set.
+
+    Load-bearing properties:
+      - Prefix drops the `p<n>_` key — chunk sets are shared across pipelines
+        so the id must not name a single pipeline.
+      - Pipelines with equal `ChunkerConfig` derive the SAME id (that's how
+        P1/P3/P4 share chunks + embeddings in the DB).
+      - Pipelines with different `ChunkerConfig` derive DIFFERENT ids.
+      - Retriever / reranker mutations leave the id unchanged — the chunk
+        set is independent of retrieval choice.
+      - Any `ChunkerConfig` field mutation rotates the id — a change to
+        chunking must force a fresh ingest.
+    """
+
+    def test_prefix_omits_pipeline_key(self) -> None:
+        cfg = PipelineConfig(
+            key="p9",
+            chunker=ChunkerConfig(algorithm="fixed", target_tokens=500, overlap_tokens=50),
+            retriever=RetrieverConfig(kind="dense", top_k=10),
+            reranker=None,
+        )
+        assert cfg.chunk_set_id.startswith("fixed_500_50_")
+        assert not cfg.chunk_set_id.startswith("p9_")
+
+    def test_hash_suffix_is_short_hex(self) -> None:
+        suffix = TEST_PIPELINE_CFG.chunk_set_id.rsplit("_", 1)[-1]
+        assert re.fullmatch(r"[0-9a-f]{8}", suffix) is not None
+
+    def test_semantic_prefix(self) -> None:
+        cfg = replace(
+            TEST_PIPELINE_CFG,
+            chunker=replace(TEST_PIPELINE_CFG.chunker, algorithm="semantic"),
+        )
+        assert cfg.chunk_set_id.startswith("semantic_p95_")
+
+    def test_shared_across_pipelines_with_equal_chunker(self) -> None:
+        # The whole point of the split: P1, P3, P4 share one chunk set.
+        assert (
+            PIPELINES["p1"].chunk_set_id
+            == PIPELINES["p3"].chunk_set_id
+            == PIPELINES["p4"].chunk_set_id
+        )
+
+    def test_distinct_for_different_chunker(self) -> None:
+        assert PIPELINES["p1"].chunk_set_id != PIPELINES["p2"].chunk_set_id
+
+    def test_unaffected_by_retriever_mutation(self) -> None:
+        base = TEST_PIPELINE_CFG
+        swapped = replace(base, retriever=replace(base.retriever, top_k=42))
+        assert base.chunk_set_id == swapped.chunk_set_id
+        # And `tag` SHOULD change — kept as a sanity check that the two
+        # identifiers really do have different scopes.
+        assert base.tag != swapped.tag
+
+    def test_unaffected_by_reranker_addition(self) -> None:
+        base = TEST_PIPELINE_CFG
+        with_reranker = replace(
+            base,
+            reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5),
+        )
+        assert base.chunk_set_id == with_reranker.chunk_set_id
+        assert base.tag != with_reranker.tag
+
+    def test_unaffected_by_key_mutation(self) -> None:
+        # Two pipelines with the same chunker but different keys share a
+        # chunk set — e.g. P1 ("p1") and P3 ("p3"). Guards the derivation
+        # against accidentally including the key.
+        base = TEST_PIPELINE_CFG
+        forked = replace(base, key="renamed")
+        assert base.chunk_set_id == forked.chunk_set_id
+
+    def test_rotates_on_chunker_target_tokens(self) -> None:
+        base = TEST_PIPELINE_CFG
+        mutated = replace(base, chunker=replace(base.chunker, target_tokens=501))
+        assert base.chunk_set_id != mutated.chunk_set_id
+
+    def test_rotates_on_chunker_percentile_threshold(self) -> None:
+        # Representative check for the semantic-chunker branch. The
+        # exhaustive per-field grid stays on `tag` (TestTagMutationCoverage);
+        # chunk_set_id and tag share the hashing helper, so field coverage
+        # on `tag` transfers.
+        base = TEST_PIPELINE_CFG
+        mutated = replace(base, chunker=replace(base.chunker, percentile_threshold=90.0))
+        assert base.chunk_set_id != mutated.chunk_set_id
+
+
 class TestManifestSerialization:
     def test_round_trips_through_json(self) -> None:
         # Manifest is written with `json.dumps`, so every field must be

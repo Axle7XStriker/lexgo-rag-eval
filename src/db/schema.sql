@@ -22,15 +22,19 @@ CREATE TABLE IF NOT EXISTS documents (
 
 CREATE INDEX IF NOT EXISTS documents_source_id_idx ON documents (source_id);
 
--- All 4 pipelines (P1..P4) coexist in one table, tagged by `pipeline`.
--- An A/B eval across pipelines is a WHERE filter change, not DDL.
+-- Chunks are tagged by `chunk_set_id` — an identifier derived from a
+-- pipeline's `ChunkerConfig` only (see `PipelineConfig.chunk_set_id`
+-- in src/pipeline/pipeline_config.py). Pipelines whose chunker configs
+-- are equal share one physical copy of chunks + embeddings. An A/B eval
+-- across pipelines filters on the chunk set each pipeline resolves to,
+-- not on a per-pipeline tag — a WHERE filter change, not DDL.
 -- Embedding dim is 1024 to match Voyage voyage-3-large.
 --
 -- Guarded with IF NOT EXISTS + UNIQUE constraint so re-apply is a no-op.
 CREATE TABLE IF NOT EXISTS chunks (
     id            BIGSERIAL    PRIMARY KEY,
     document_id   BIGINT       NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
-    pipeline      TEXT         NOT NULL,
+    chunk_set_id  TEXT         NOT NULL,
     chunk_index   INT          NOT NULL,
     text          TEXT         NOT NULL,
     -- Full-text search column for the P3/P4 hybrid retrievers.
@@ -45,16 +49,16 @@ CREATE TABLE IF NOT EXISTS chunks (
     content_hash  TEXT         NOT NULL,
     embedding     vector(1024) NOT NULL,
     created_at    TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-    UNIQUE (document_id, pipeline, chunk_index)
+    UNIQUE (document_id, chunk_set_id, chunk_index)
 );
 
-CREATE INDEX IF NOT EXISTS chunks_pipeline_idx    ON chunks (pipeline);
-CREATE INDEX IF NOT EXISTS chunks_document_id_idx ON chunks (document_id);
+CREATE INDEX IF NOT EXISTS chunks_chunk_set_id_idx ON chunks (chunk_set_id);
+CREATE INDEX IF NOT EXISTS chunks_document_id_idx  ON chunks (document_id);
 
 -- One global HNSW index for cosine similarity. Queries compose the
--- WHERE pipeline = $1 filter with the index scan — cheaper than one
--- HNSW index per pipeline given the modest per-pipeline cardinality
--- (a few thousand chunks in the P1..P4 evals).
+-- WHERE chunk_set_id = $1 filter with the index scan — cheaper than
+-- one HNSW index per chunk set given the modest per-set cardinality
+-- (a few thousand chunks per set in the P1..P4 evals).
 --
 -- Guarded with IF NOT EXISTS so re-apply is a no-op.
 CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
@@ -62,7 +66,7 @@ CREATE INDEX IF NOT EXISTS chunks_embedding_hnsw
 
 -- GIN is the standard index type for tsvector: fast lookups by lexeme,
 -- slower writes than GiST but our write path is a batch ingest, not
--- online serving. Composes with WHERE pipeline = $1 via bitmap-scan,
+-- online serving. Composes with WHERE chunk_set_id = $1 via bitmap-scan,
 -- same shape as the HNSW index above.
 CREATE INDEX IF NOT EXISTS chunks_text_tsv_gin
     ON chunks USING gin (text_tsv);

@@ -91,16 +91,16 @@ class _FakeStore:
     hybrid_calls: list[dict] = field(default_factory=list)
 
     def dense_search(
-        self, pipeline: str, query_embedding: list[float], k: int
+        self, chunk_set_id: str, query_embedding: list[float], k: int
     ) -> list[RetrievedChunk]:
         self.dense_calls.append(
-            {"pipeline": pipeline, "k": k, "embedding_len": len(query_embedding)}
+            {"chunk_set_id": chunk_set_id, "k": k, "embedding_len": len(query_embedding)}
         )
         return list(self.to_return)
 
     def hybrid_search(
         self,
-        pipeline: str,
+        chunk_set_id: str,
         query_embedding: list[float],
         query_text: str,
         k: int,
@@ -108,7 +108,7 @@ class _FakeStore:
     ) -> list[RetrievedChunk]:
         self.hybrid_calls.append(
             {
-                "pipeline": pipeline,
+                "chunk_set_id": chunk_set_id,
                 "k": k,
                 "rrf_k": rrf_k,
                 "query_text": query_text,
@@ -151,7 +151,7 @@ class _FakeReranker:
                 document_id=chunks[i].document_id,
                 doc_path=chunks[i].doc_path,
                 source_id=chunks[i].source_id,
-                pipeline=chunks[i].pipeline,
+                chunk_set_id=chunks[i].chunk_set_id,
                 chunk_index=chunks[i].chunk_index,
                 text=chunks[i].text,
                 page_start=chunks[i].page_start,
@@ -212,7 +212,7 @@ def _chunk(marker: int, doc_path: str, source_id: str = "A1") -> RetrievedChunk:
         document_id=1,
         doc_path=doc_path,
         source_id=source_id,
-        pipeline=TEST_PIPELINE_CFG.tag,
+        chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
         chunk_index=marker - 1,
         text=f"chunk-{marker}-body",
         page_start=marker,
@@ -248,7 +248,7 @@ class TestEndToEnd:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
             run_id="run_test",
         )
@@ -273,7 +273,7 @@ class TestEndToEnd:
         # Dependencies invoked with the query + run_id threaded through.
         assert embedder.calls == ["what is merge sort?"]
         assert len(store.dense_calls) == 1
-        assert store.dense_calls[0]["pipeline"] == TEST_PIPELINE_CFG.tag
+        assert store.dense_calls[0]["chunk_set_id"] == TEST_PIPELINE_CFG.chunk_set_id
         assert len(generator.calls) == 1
         assert generator.calls[0]["prompt_version"] == PROMPT_VERSION
         assert generator.calls[0]["run_id"] == "run_test"
@@ -293,7 +293,7 @@ class TestEndToEnd:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
         )
 
@@ -352,7 +352,7 @@ class TestCitationParsing:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
         )
         assert result.answer == "Something [9] and [42]."
@@ -374,7 +374,7 @@ class TestOutOfCorpus:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
         )
         assert result.answer == OUT_OF_CORPUS_SENTINEL
@@ -392,7 +392,7 @@ class TestOutOfCorpus:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
         )
         assert result.answer == OUT_OF_CORPUS_SENTINEL
@@ -464,13 +464,13 @@ class TestRetrieverDispatch:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag="test_dense_tag",
+            chunk_set_id="test_dense_tag",
             retriever=RetrieverConfig(kind="dense", top_k=5),
         )
 
         assert len(store.dense_calls) == 1
         assert store.dense_calls[0] == {
-            "pipeline": "test_dense_tag",
+            "chunk_set_id": "test_dense_tag",
             "k": 5,
             "embedding_len": len(embedder.vector),
         }
@@ -487,14 +487,14 @@ class TestRetrieverDispatch:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag="test_hybrid_tag",
+            chunk_set_id="test_hybrid_tag",
             retriever=RetrieverConfig(kind="hybrid", top_k=7, rrf_k=60),
         )
 
         assert store.dense_calls == []
         assert len(store.hybrid_calls) == 1
         assert store.hybrid_calls[0] == {
-            "pipeline": "test_hybrid_tag",
+            "chunk_set_id": "test_hybrid_tag",
             "k": 7,
             "rrf_k": 60,
             "query_text": "what is quicksort?",
@@ -513,7 +513,7 @@ class TestRetrieverDispatch:
                 embedder=embedder,
                 store=store,
                 generator=generator,
-                pipeline_tag="test_broken_hybrid",
+                chunk_set_id="test_broken_hybrid",
                 retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=None),
             )
         # Validation happens before any injected dependency performs I/O.
@@ -540,7 +540,7 @@ class TestRetrieverDispatch:
                 embedder=embedder,
                 store=store,
                 generator=generator,
-                pipeline_tag="test_bad_rrf_k",
+                chunk_set_id="test_bad_rrf_k",
                 retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=bad_rrf_k),
             )
         # The cost-protection assertion: embed MUST NOT have been called.
@@ -566,7 +566,7 @@ class TestRetrieverDispatch:
                 embedder=embedder,
                 store=store,
                 generator=generator,
-                pipeline_tag="test_broken",
+                chunk_set_id="test_broken",
                 retriever=broken,
             )
         assert embedder.calls == []
@@ -608,7 +608,7 @@ class TestRerankBranch:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
             reranker=reranker,
             reranker_config=_RERANK_CFG,
@@ -648,7 +648,7 @@ class TestRerankBranch:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
             reranker=None,
             reranker_config=None,
@@ -670,7 +670,7 @@ class TestRerankBranch:
                 embedder=embedder,
                 store=store,
                 generator=generator,
-                pipeline_tag="tag",
+                chunk_set_id="tag",
                 retriever=TEST_PIPELINE_CFG.retriever,
                 reranker=reranker,
                 reranker_config=None,
@@ -690,7 +690,7 @@ class TestRerankBranch:
                 embedder=embedder,
                 store=store,
                 generator=generator,
-                pipeline_tag="tag",
+                chunk_set_id="tag",
                 retriever=TEST_PIPELINE_CFG.retriever,
                 reranker=None,
                 reranker_config=_RERANK_CFG,
@@ -710,7 +710,7 @@ class TestRerankBranch:
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=TEST_PIPELINE_CFG.tag,
+            chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
             retriever=TEST_PIPELINE_CFG.retriever,
             reranker=reranker,
             reranker_config=_RERANK_CFG,
@@ -757,7 +757,7 @@ class TestRerankBranch:
                 embedder=embedder,
                 store=store,
                 generator=generator,
-                pipeline_tag=TEST_PIPELINE_CFG.tag,
+                chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
                 retriever=TEST_PIPELINE_CFG.retriever,
                 reranker=reranker,
                 reranker_config=_RERANK_CFG,
@@ -809,7 +809,7 @@ class TestRerankBranch:
                 embedder=embedder,
                 store=store,
                 generator=generator,
-                pipeline_tag=TEST_PIPELINE_CFG.tag,
+                chunk_set_id=TEST_PIPELINE_CFG.chunk_set_id,
                 retriever=TEST_PIPELINE_CFG.retriever,
                 reranker=reranker,
                 reranker_config=_RERANK_CFG,

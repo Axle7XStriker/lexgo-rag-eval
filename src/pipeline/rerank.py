@@ -209,7 +209,7 @@ class CohereReranker:
                         document_id=source.document_id,
                         doc_path=source.doc_path,
                         source_id=source.source_id,
-                        pipeline=source.pipeline,
+                        chunk_set_id=source.chunk_set_id,
                         chunk_index=source.chunk_index,
                         text=source.text,
                         page_start=source.page_start,

@@ -2,27 +2,39 @@
 
 Every knob that defines a retrieval pipeline (chunker choice + parameters,
 retriever choice + top-k, optional reranker) lives here as typed dataclasses.
-The DB tag under which a pipeline's chunks are stored is DERIVED from the
-config, not hand-authored — any config change automatically produces a new
-tag, so tuning a knob and re-ingesting yields fresh rows for side-by-side
-comparison rather than silently overwriting the previous run's rows.
 
-Adding a new pipeline (P2/P3/P4) is one dict entry — no changes to any
-callsite except the dispatch table in `scripts.ingest` (a new
-`elif algorithm == "..."` branch).
+Two distinct derived identifiers hang off a `PipelineConfig`:
+
+  - `tag` — PIPELINE identity. Hashes the full nested config (chunker +
+    retriever + reranker). Used in eval artifacts (`manifest.json`,
+    `summary.md`) and structured logs so operators can see which pipeline
+    a given run was. Any config change rotates `tag`.
+  - `chunk_set_id` — CHUNK-SET identity. Hashes `ChunkerConfig` only. The
+    DB filter column (`chunks.chunk_set_id`) stores this; ingest + retrieval
+    key off it exclusively. Two pipelines with equal `ChunkerConfig` values
+    derive the SAME `chunk_set_id` and share one physical copy of chunks +
+    embeddings. P1/P3/P4 (all `fixed(500, 50)`) share one chunk set;
+    changing a retriever knob does NOT force a re-ingest.
+
+Adding a new pipeline is one dict entry — no changes to any callsite
+except the dispatch table in `scripts.ingest` (a new `elif algorithm ==
+"..."` branch).
 
 Design notes worth remembering:
-  - `PipelineConfig.tag` is a hybrid: readable prefix (e.g.
-    `p1_fixed_500_50`) + short sha256 suffix. The prefix reads cleanly in
-    `SELECT DISTINCT pipeline FROM chunks;` output; the hash suffix catches
-    fields not covered by `_readable_prefix` so no config change can silently
-    reuse an existing tag. Adding a field to `ChunkerConfig` therefore never
-    creates a stealth data-mixing bug.
-  - `_config_hash` uses the full `asdict(self)`, so every field participates.
-  - Configs are frozen dataclasses so accidental mutation raises rather than
-    corrupts the registry.
-  - `key` is the CLI-facing short name (`"p1"`); `tag` is the DB-facing
-    unique identifier. Two different concepts, don't conflate.
+  - Both `tag` and `chunk_set_id` are hybrid: readable prefix (e.g.
+    `p1_fixed_500_50` for `tag`, `fixed_500_50` for `chunk_set_id`) +
+    short sha256 suffix. Prefixes read cleanly in `SELECT DISTINCT ...
+    FROM chunks;` output; the hash suffix catches fields not covered by
+    the prefix so no config change can silently reuse an existing id.
+  - Hashes run over the full `asdict(...)` of their scope, so every field
+    participates. Adding a field to `ChunkerConfig` therefore never
+    creates a stealth data-mixing bug — it rotates `chunk_set_id` and
+    forces a fresh ingest for every pipeline that references it.
+  - Configs are frozen dataclasses so accidental mutation raises rather
+    than corrupts the registry.
+  - `key` is the CLI-facing short name (`"p1"`); `tag` is the pipeline-
+    identity string; `chunk_set_id` is the DB chunk-set identifier.
+    Three distinct concepts, don't conflate.
 """
 
 from __future__ import annotations
@@ -89,9 +101,12 @@ class RerankerConfig:
 class PipelineConfig:
     """One retrieval pipeline's full config. Registered in `PIPELINES`.
 
-    `tag` is a computed property, not a stored field — see the module
-    docstring for why. `key` is the CLI-facing short name (`"p1"`);
-    `tag` is the DB-facing unique identifier (`"p1_fixed_500_50_a3f2b1c8"`).
+    `tag` and `chunk_set_id` are computed properties — see module docstring
+    for the semantic split. Short form:
+      - `key` → CLI short name (`"p1"`)
+      - `tag` → pipeline identity (`"p1_fixed_500_50_a3f2b1c8"`); eval only
+      - `chunk_set_id` → DB chunk-set identity (`"fixed_500_50_1b2c3d4e"`);
+        ingest + retrieval key off this
     """
 
     key: str
@@ -101,7 +116,7 @@ class PipelineConfig:
 
     @property
     def tag(self) -> str:
-        """Hybrid DB tag: `<readable_prefix>_<sha256(config)[:8]>`.
+        """Hybrid pipeline tag: `<key>_<chunker_prefix>_<sha256(config)[:8]>`.
 
         Examples::
 
@@ -109,33 +124,59 @@ class PipelineConfig:
             p2_semantic_p95_9e4d7f2a
 
         Any change to any field on this config (or its nested configs)
-        changes the hash suffix, which changes the tag, which lands new
-        rows under a new key in the `chunks` table. Old rows sit inert.
+        changes the hash suffix, which changes the tag. Used in eval
+        artifacts and logs; NOT used as a DB filter.
         """
-        return f"{self._readable_prefix()}_{self._config_hash()}"
+        return f"{self.key}_{_chunker_readable_prefix(self.chunker)}_{_short_hash(asdict(self))}"
 
-    def _readable_prefix(self) -> str:
-        """Human-legible prefix. Covers the fields most operators care about
-        at `psql` inspection time; the hash suffix covers everything else."""
-        c = self.chunker
-        if c.algorithm == "fixed":
-            return f"{self.key}_fixed_{c.target_tokens}_{c.overlap_tokens}"
-        if c.algorithm == "semantic":
-            # `int(percentile_threshold)` keeps the prefix short — 95.0 → "p95".
-            # The full float still lands in the hash, so 95.0 vs 95.5 still
-            # produce distinct tags via the suffix.
-            return f"{self.key}_semantic_p{int(c.percentile_threshold or 0)}"
-        raise ValueError(f"unknown chunker.algorithm: {c.algorithm!r}")
+    @property
+    def chunk_set_id(self) -> str:
+        """Chunk-set identifier: `<chunker_prefix>_<sha256(chunker)[:8]>`.
 
-    def _config_hash(self) -> str:
-        """Short sha256 over the full config. Every field participates."""
-        # `default=str` keeps the hash deterministic even if a future field
-        # holds something JSON doesn't natively serialize (Path, Enum, etc.).
-        payload = json.dumps(asdict(self), sort_keys=True, default=str)
-        # 8 hex chars — long enough that collisions across O(dozens) of
-        # configs are astronomically unlikely, short enough to keep the
-        # tag human-manageable.
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:8]
+        Examples::
+
+            fixed_500_50_1b2c3d4e
+            semantic_p95_3f4a5b6c
+
+        Hashes `ChunkerConfig` ONLY. Two pipelines whose `ChunkerConfig`
+        values are equal derive the same `chunk_set_id` and share chunks
+        in the DB — P1/P3/P4 all land here. Changing a retriever or
+        reranker knob does not rotate this; changing any chunker field
+        does. Stored in `chunks.chunk_set_id`; the ingest idempotency
+        check + the query-time retrieval filter both key off this.
+        """
+        return f"{_chunker_readable_prefix(self.chunker)}_{_short_hash(asdict(self.chunker))}"
+
+
+def _chunker_readable_prefix(c: ChunkerConfig) -> str:
+    """Human-legible prefix derived from a `ChunkerConfig`.
+
+    Covers the fields most operators care about at `psql` inspection
+    time; the hash suffix on `tag` and `chunk_set_id` covers everything else.
+    Shared by `PipelineConfig.tag` and `PipelineConfig.chunk_set_id` so
+    the prefix format never drifts between the two identifiers.
+    """
+    if c.algorithm == "fixed":
+        return f"fixed_{c.target_tokens}_{c.overlap_tokens}"
+    if c.algorithm == "semantic":
+        # `int(percentile_threshold)` keeps the prefix short — 95.0 → "p95".
+        # The full float still lands in the hash, so 95.0 vs 95.5 still
+        # produce distinct ids via the suffix.
+        return f"semantic_p{int(c.percentile_threshold or 0)}"
+    raise ValueError(f"unknown chunker.algorithm: {c.algorithm!r}")
+
+
+def _short_hash(payload: Any) -> str:
+    """Short sha256 over a JSON-serializable payload. Every field participates.
+
+    `default=str` keeps the hash deterministic even if a future field
+    holds something JSON doesn't natively serialize (Path, Enum, etc.).
+    8 hex chars — long enough that collisions across O(dozens) of
+    configs are astronomically unlikely, short enough to keep ids
+    human-manageable.
+    """
+    serialized = json.dumps(payload, sort_keys=True, default=str)
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()[:8]
 
 
 # ── Registry ──────────────────────────────────────────────────────────

@@ -8,14 +8,17 @@ Design notes:
 - Schema is applied idempotently by `ensure_schema()` reading schema.sql;
   callers can invoke on every ingest run without special-casing "first
   time" vs "subsequent" runs.
-- All chunks tagged with a `pipeline` column (P1..P4-derived, e.g.
-  "p1_fixed_500_50"). Pipelines coexist in one table — an A/B eval
-  across P2/P3/P4 is a WHERE-clause change, not DDL.
+- Chunks tagged by `chunk_set_id` — an identifier derived from a
+  pipeline's `ChunkerConfig` only (see `PipelineConfig.chunk_set_id`).
+  Pipelines whose chunker configs are equal share one physical chunk set;
+  P1/P3/P4 (all `fixed(500, 50)`) all key off the same id, so ingest for
+  the second/third pipeline no-ops. An A/B eval across pipelines filters
+  on the chunk set the active pipeline resolves to — a WHERE-clause
+  change, not DDL.
 - One global HNSW index over `chunks.embedding` for cosine similarity.
-  Queries compose `WHERE pipeline = $1` with the index scan; at our
-  scale (a few thousand chunks per pipeline) that's cheaper than
-  maintaining a separate HNSW index per pipeline and keeps the schema
-  simpler.
+  Queries compose `WHERE chunk_set_id = $1` with the index scan; at our
+  scale (a few thousand chunks per set) that's cheaper than maintaining
+  a separate HNSW index per set and keeps the schema simpler.
 """
 
 from __future__ import annotations
@@ -52,7 +55,7 @@ class DocumentRow:
 class ChunkRow:
     """A chunk destined for the `chunks` table (pre-insert form)."""
 
-    pipeline: str  # e.g. "p1_fixed_500_50"
+    chunk_set_id: str  # e.g. "fixed_500_50_1b2c3d4e"
     chunk_index: int
     text: str
     num_tokens: int
@@ -70,7 +73,7 @@ class RetrievedChunk:
     document_id: int
     doc_path: str
     source_id: str
-    pipeline: str
+    chunk_set_id: str
     chunk_index: int
     text: str
     page_start: int
@@ -89,7 +92,7 @@ def _row_to_retrieved(row: tuple) -> RetrievedChunk:
         document_id=row[1],
         doc_path=row[2],
         source_id=row[3],
-        pipeline=row[4],
+        chunk_set_id=row[4],
         chunk_index=row[5],
         text=row[6],
         page_start=row[7],
@@ -154,7 +157,7 @@ def _rrf_fuse(
                 document_id=base.document_id,
                 doc_path=base.doc_path,
                 source_id=base.source_id,
-                pipeline=base.pipeline,
+                chunk_set_id=base.chunk_set_id,
                 chunk_index=base.chunk_index,
                 text=base.text,
                 page_start=base.page_start,
@@ -266,7 +269,7 @@ class VectorStore:
     # ── Chunks ────────────────────────────────────────────────────────
 
     def upsert_chunks(self, document_id: int, chunks: list[ChunkRow]) -> None:
-        """Bulk-insert chunks; on `(document_id, pipeline, chunk_index)` conflict, replace.
+        """Bulk-insert chunks; on `(document_id, chunk_set_id, chunk_index)` conflict, replace.
 
         Does NOT commit — caller controls the transaction. Does NOT delete
         stale higher-index chunks left over from a previous ingest with more
@@ -287,10 +290,10 @@ class VectorStore:
             cur.executemany(
                 """
                 INSERT INTO chunks
-                    (document_id, pipeline, chunk_index, text, num_tokens,
+                    (document_id, chunk_set_id, chunk_index, text, num_tokens,
                      page_start, page_end, content_hash, embedding)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (document_id, pipeline, chunk_index) DO UPDATE
+                ON CONFLICT (document_id, chunk_set_id, chunk_index) DO UPDATE
                     SET text         = EXCLUDED.text,
                         num_tokens   = EXCLUDED.num_tokens,
                         page_start   = EXCLUDED.page_start,
@@ -301,7 +304,7 @@ class VectorStore:
                 [
                     (
                         document_id,
-                        c.pipeline,
+                        c.chunk_set_id,
                         c.chunk_index,
                         c.text,
                         c.num_tokens,
@@ -314,8 +317,8 @@ class VectorStore:
                 ],
             )
 
-    def delete_chunks(self, document_id: int, pipeline: str) -> int:
-        """Delete all chunks for `(document_id, pipeline)`; return the row count.
+    def delete_chunks(self, document_id: int, chunk_set_id: str) -> int:
+        """Delete all chunks for `(document_id, chunk_set_id)`; return the row count.
 
         Does NOT commit. Used by `replace_document_chunks` to purge stale
         chunks (including higher-index orphans a plain UPSERT would miss)
@@ -323,8 +326,8 @@ class VectorStore:
         """
         with self.conn.cursor() as cur:
             cur.execute(
-                "DELETE FROM chunks WHERE document_id = %s AND pipeline = %s",
-                (document_id, pipeline),
+                "DELETE FROM chunks WHERE document_id = %s AND chunk_set_id = %s",
+                (document_id, chunk_set_id),
             )
             return cur.rowcount
 
@@ -333,9 +336,9 @@ class VectorStore:
         doc: DocumentRow,
         chunks: list[ChunkRow],
         *,
-        pipeline: str,
+        chunk_set_id: str,
     ) -> int:
-        """Atomic: upsert `doc`, wipe existing chunks for `(doc, pipeline)`, insert `chunks`.
+        """Atomic: upsert `doc`, wipe existing chunks for `(doc, chunk_set_id)`, insert `chunks`.
 
         Returns the document_id. The document row's content_hash is only
         visible to other readers after all chunks land — a mid-flight failure
@@ -349,7 +352,7 @@ class VectorStore:
         """
         try:
             document_id = self.upsert_document(doc)
-            self.delete_chunks(document_id, pipeline)
+            self.delete_chunks(document_id, chunk_set_id)
             self.upsert_chunks(document_id, chunks)
             self.conn.commit()
             return document_id
@@ -364,16 +367,16 @@ class VectorStore:
     # one place. `{score_expr}` is the only per-caller substitution.
     _SELECT_COLUMNS = (
         "c.id, c.document_id, d.doc_path, d.source_id, "
-        "c.pipeline, c.chunk_index, c.text, c.page_start, c.page_end"
+        "c.chunk_set_id, c.chunk_index, c.text, c.page_start, c.page_end"
     )
 
     def dense_search(
         self,
-        pipeline: str,
+        chunk_set_id: str,
         query_embedding: list[float],
         k: int,
     ) -> list[RetrievedChunk]:
-        """Top-k cosine-similarity search over chunks of a given pipeline.
+        """Top-k cosine-similarity search over chunks of a given chunk set.
 
         Uses pgvector's `<=>` cosine-distance operator (0 = identical
         direction, 1 = orthogonal, 2 = opposite). Returned `score`
@@ -394,18 +397,18 @@ class VectorStore:
                 1 - (c.embedding <=> %s::vector) AS score
             FROM chunks c
             JOIN documents d ON d.id = c.document_id
-            WHERE c.pipeline = %s
+            WHERE c.chunk_set_id = %s
             ORDER BY c.embedding <=> %s::vector
             LIMIT %s
         """
         with self.conn.cursor() as cur:
-            cur.execute(sql, (query_embedding, pipeline, query_embedding, k))
+            cur.execute(sql, (query_embedding, chunk_set_id, query_embedding, k))
             rows = cur.fetchall()
         return [_row_to_retrieved(r) for r in rows]
 
     def lexical_search(
         self,
-        pipeline: str,
+        chunk_set_id: str,
         query_text: str,
         k: int,
     ) -> list[RetrievedChunk]:
@@ -438,19 +441,19 @@ class VectorStore:
             FROM chunks c
             JOIN documents d ON d.id = c.document_id,
                  websearch_to_tsquery('english', %s) AS query
-            WHERE c.pipeline = %s
+            WHERE c.chunk_set_id = %s
               AND c.text_tsv @@ query
             ORDER BY score DESC
             LIMIT %s
         """
         with self.conn.cursor() as cur:
-            cur.execute(sql, (query_text, pipeline, k))
+            cur.execute(sql, (query_text, chunk_set_id, k))
             rows = cur.fetchall()
         return [_row_to_retrieved(r) for r in rows]
 
     def hybrid_search(
         self,
-        pipeline: str,
+        chunk_set_id: str,
         query_embedding: list[float],
         query_text: str,
         k: int,
@@ -480,18 +483,21 @@ class VectorStore:
         # 2x–3x per source is standard practice; `max(k*2, 20)` floors it
         # so very small `k` still gets a meaningful candidate pool.
         pool = max(k * 2, 20)
-        dense = self.dense_search(pipeline, query_embedding, k=pool)
-        lexical = self.lexical_search(pipeline, query_text, k=pool)
+        dense = self.dense_search(chunk_set_id, query_embedding, k=pool)
+        lexical = self.lexical_search(chunk_set_id, query_text, k=pool)
         return _rrf_fuse(dense, lexical, rrf_k=rrf_k, top_k=k)
 
     # ── Smoke / observability helpers ─────────────────────────────────
 
-    def count_chunks(self, pipeline: str | None = None) -> int:
-        """Total chunks in the store, optionally filtered by pipeline."""
+    def count_chunks(self, chunk_set_id: str | None = None) -> int:
+        """Total chunks in the store, optionally filtered by chunk_set_id."""
         with self.conn.cursor() as cur:
-            if pipeline is None:
+            if chunk_set_id is None:
                 cur.execute("SELECT COUNT(*) FROM chunks")
             else:
-                cur.execute("SELECT COUNT(*) FROM chunks WHERE pipeline = %s", (pipeline,))
+                cur.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE chunk_set_id = %s",
+                    (chunk_set_id,),
+                )
             row = cur.fetchone()
             return row[0] if row else 0

@@ -76,7 +76,7 @@ def _chunk(i: int, doc_path: str = "6.006/lectures/A1_lec01.pdf") -> RetrievedCh
         document_id=1,
         doc_path=doc_path,
         source_id="A1",
-        pipeline="p4_fixed_500_50_test",
+        chunk_set_id="fixed_500_50_test",
         chunk_index=i,
         text=f"chunk-{i}-body",
         page_start=i + 1,
@@ -156,7 +156,7 @@ class TestHappyPath:
         assert [c.score for c in result.chunks] == [0.95, 0.72, 0.11]
         # Non-score fields preserved from the source chunks.
         assert [c.text for c in result.chunks] == ["chunk-2-body", "chunk-0-body", "chunk-1-body"]
-        assert all(c.pipeline == "p4_fixed_500_50_test" for c in result.chunks)
+        assert all(c.chunk_set_id == "fixed_500_50_test" for c in result.chunks)
 
     def test_passes_query_and_documents_to_cohere(self, tmp_path: Path) -> None:
         rr, client, _ = _reranker(tmp_path)

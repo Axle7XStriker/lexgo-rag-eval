@@ -32,7 +32,7 @@ def _chunk(chunk_id: int, *, score: float = 0.0, doc_path: str | None = None) ->
         document_id=chunk_id * 10,
         doc_path=doc_path or f"fixture/doc{chunk_id}.pdf",
         source_id="A1",
-        pipeline="test_p3_hybrid",
+        chunk_set_id="test_fixed_500_50",
         chunk_index=chunk_id - 1,
         text=f"chunk-{chunk_id}-body",
         page_start=chunk_id,
@@ -160,12 +160,12 @@ class TestHybridSearch:
         query_embedding = [0.1, 0.2]
         calls: list[tuple] = []
 
-        def dense_search(pipeline: str, embedding: list[float], k: int) -> list[RetrievedChunk]:
-            calls.append(("dense", pipeline, embedding, k))
+        def dense_search(chunk_set_id: str, embedding: list[float], k: int) -> list[RetrievedChunk]:
+            calls.append(("dense", chunk_set_id, embedding, k))
             return [_chunk(1), _chunk(2)]
 
-        def lexical_search(pipeline: str, query_text: str, k: int) -> list[RetrievedChunk]:
-            calls.append(("lexical", pipeline, query_text, k))
+        def lexical_search(chunk_set_id: str, query_text: str, k: int) -> list[RetrievedChunk]:
+            calls.append(("lexical", chunk_set_id, query_text, k))
             return [_chunk(2), _chunk(3)]
 
         monkeypatch.setattr(store, "dense_search", dense_search)
@@ -210,11 +210,11 @@ class TestHybridSearch:
         store = VectorStore("unused")
         pool_calls: list[int] = []
 
-        def dense_search(pipeline: str, embedding: list[float], k: int) -> list[RetrievedChunk]:
+        def dense_search(chunk_set_id: str, embedding: list[float], k: int) -> list[RetrievedChunk]:
             pool_calls.append(k)
             return []
 
-        def lexical_search(pipeline: str, query_text: str, k: int) -> list[RetrievedChunk]:
+        def lexical_search(chunk_set_id: str, query_text: str, k: int) -> list[RetrievedChunk]:
             pool_calls.append(k)
             return []
 
@@ -256,7 +256,7 @@ class TestHybridSearch:
 # a real `tsvector` + GIN index + `websearch_to_tsquery` round-trip.
 
 
-_PIPELINE_TAG = "test_p3_hybrid_real"
+_CHUNK_SET_ID = "test_fixed_500_50_real"
 
 
 def _seed_text_chunk(
@@ -279,7 +279,7 @@ def _seed_text_chunk(
         document_id,
         [
             ChunkRow(
-                pipeline=_PIPELINE_TAG,
+                chunk_set_id=_CHUNK_SET_ID,
                 chunk_index=chunk_index,
                 text=text,
                 num_tokens=max(1, len(text.split())),
@@ -342,7 +342,7 @@ def seeded_store(clean_store: VectorStore) -> VectorStore:
 class TestLexicalSearchReal:
     def test_single_term_match_returns_chunk(self, seeded_store: VectorStore) -> None:
         """A term that appears in exactly one chunk returns that chunk."""
-        hits = seeded_store.lexical_search(_PIPELINE_TAG, "collision", k=5)
+        hits = seeded_store.lexical_search(_CHUNK_SET_ID, "collision", k=5)
         assert len(hits) == 1
         assert "collision" in hits[0].text
         assert hits[0].source_id == "A1"
@@ -350,14 +350,14 @@ class TestLexicalSearchReal:
 
     def test_multi_term_match_ranks_chunks(self, seeded_store: VectorStore) -> None:
         """A shared term returns every matching chunk ranked with a positive score."""
-        hits = seeded_store.lexical_search(_PIPELINE_TAG, "quicksort", k=5)
+        hits = seeded_store.lexical_search(_CHUNK_SET_ID, "quicksort", k=5)
         chunk_indexes = sorted(h.chunk_index for h in hits)
         assert chunk_indexes == [0, 3]
         assert all(h.score > 0 for h in hits)
 
     def test_no_match_returns_empty_list(self, seeded_store: VectorStore) -> None:
         """A term absent from every chunk returns [], not an error."""
-        hits = seeded_store.lexical_search(_PIPELINE_TAG, "zebra", k=5)
+        hits = seeded_store.lexical_search(_CHUNK_SET_ID, "zebra", k=5)
         assert hits == []
 
     def test_operator_input_does_not_raise(self, seeded_store: VectorStore) -> None:
@@ -367,16 +367,16 @@ class TestLexicalSearchReal:
         the parser we picked and prove quoted-phrase + OR syntax reach FTS.
         """
         # Quoted phrase: matches chunk 1 as an exact-ish phrase lookup.
-        quoted = seeded_store.lexical_search(_PIPELINE_TAG, '"hash table"', k=5)
+        quoted = seeded_store.lexical_search(_CHUNK_SET_ID, '"hash table"', k=5)
         assert any("hash table" in h.text for h in quoted)
         # Explicit OR: broadens recall across two chunks.
-        or_query = seeded_store.lexical_search(_PIPELINE_TAG, "quicksort OR transaction", k=5)
+        or_query = seeded_store.lexical_search(_CHUNK_SET_ID, "quicksort OR transaction", k=5)
         or_indexes = {hit.chunk_index for hit in or_query}
         assert 2 in or_indexes
         assert or_indexes & {0, 3}
 
-    def test_pipeline_filter_isolates_rows(self, seeded_store: VectorStore) -> None:
-        """A query against an unknown pipeline tag returns nothing even when the
+    def test_chunk_set_id_filter_isolates_rows(self, seeded_store: VectorStore) -> None:
+        """A query against an unknown chunk_set_id returns nothing even when the
         lexeme matches rows under a different tag — the WHERE clause composes."""
         hits = seeded_store.lexical_search("nonexistent_pipeline_tag", "quicksort", k=5)
         assert hits == []
@@ -393,7 +393,7 @@ class TestHybridSearchReal:
         query_embedding[2] = 1.0
 
         fused = seeded_store.hybrid_search(
-            _PIPELINE_TAG,
+            _CHUNK_SET_ID,
             query_embedding,
             query_text="quicksort",
             k=5,
@@ -406,8 +406,8 @@ class TestHybridSearchReal:
         assert all(h.score > 0 for h in fused)
         assert all(h.score <= 2.0 / (60 + 1) + 1e-9 for h in fused)
 
-    def test_hybrid_filters_by_pipeline_tag(self, seeded_store: VectorStore) -> None:
-        """An unknown pipeline tag returns empty from both branches → empty fusion."""
+    def test_hybrid_filters_by_chunk_set_id(self, seeded_store: VectorStore) -> None:
+        """An unknown chunk_set_id returns empty from both branches → empty fusion."""
         fused = seeded_store.hybrid_search(
             "nonexistent_pipeline_tag",
             [0.1] * EMBEDDING_DIM,

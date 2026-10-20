@@ -30,11 +30,11 @@ from src.pipeline.store import EMBEDDING_DIM, VectorStore
 from src.qa_schema import SourceId
 from tests._pdf_fixtures import write_pdf
 
-# P1 config + derived tag + chunker are shared by every _process_entry call
-# below — resolved once at import time so tests read cleanly and any
-# accidental config change registers in one place.
+# P1 config + derived chunk_set_id + chunker are shared by every
+# _process_entry call below — resolved once at import time so tests read
+# cleanly and any accidental config change registers in one place.
 _P1_CFG = get_pipeline("p1")
-_P1_TAG = _P1_CFG.tag
+_P1_CHUNK_SET_ID = _P1_CFG.chunk_set_id
 
 
 def _p1_chunker(doc):
@@ -230,8 +230,8 @@ class TestProcessEntryIntegration:
         first_calls = embedder.calls
         assert first_calls > 0
 
-        # Sanity: chunks landed under the expected pipeline tag.
-        assert clean_store.count_chunks(_P1_TAG) == first.num_chunks
+        # Sanity: chunks landed under the expected chunk_set_id.
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == first.num_chunks
 
         # Second run — same file, unchanged → skipped, zero embed calls.
         second = ingest_mod._process_entry(
@@ -247,7 +247,75 @@ class TestProcessEntryIntegration:
         )
         assert second.status == "skipped_unchanged"
         assert embedder.calls == first_calls, "second run must not call embed"
-        assert clean_store.count_chunks(_P1_TAG) == first.num_chunks
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == first.num_chunks
+
+    def test_second_pipeline_sharing_chunk_set_is_noop(
+        self,
+        clean_store: VectorStore,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """P3 ingest after P1 is a no-op: same ChunkerConfig → same chunk_set_id.
+
+        This is the whole point of splitting pipeline identity from chunk-set
+        identity. P1/P3/P4 all declare `fixed(500, 50)`, so their
+        `PipelineConfig.chunk_set_id` values are byte-identical and the
+        idempotency check hits "chunks already present for this chunk set"
+        on the second pipeline's run.
+        """
+        p3_cfg = get_pipeline("p3")
+        # Precondition: the two pipelines really do share a chunk set. If this
+        # equality ever breaks (someone tunes P3's chunker in isolation),
+        # the test below becomes a false pass — fail loudly instead.
+        assert _P1_CFG.chunk_set_id == p3_cfg.chunk_set_id, (
+            "P1 and P3 are expected to share a chunk set — their ChunkerConfig "
+            "fields must be equal for the dedup refactor to behave as designed."
+        )
+
+        monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
+        dest = tmp_path / "corpus" / "test/A1_fake.pdf"
+        write_pdf(dest, ["Gamma " * 50, "Delta " * 50])
+        entry = _make_entry("test/A1_fake.pdf")
+
+        embedder = _FakeEmbedder()
+        # P1 ingests first — populates the shared chunk set.
+        first = ingest_mod._process_entry(
+            entry,
+            store=clean_store,
+            embedder=embedder,  # type: ignore[arg-type]
+            cfg=_P1_CFG,
+            chunker=_p1_chunker,
+            force=False,
+            dry_run=False,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert first.status == "ingested"
+        p1_calls = embedder.calls
+        assert p1_calls > 0
+
+        # P3 next — same chunker config → `_fetch_existing` sees chunks
+        # already present for the shared chunk_set_id → skip, zero embed cost.
+        # (`chunk_fixed(doc, p3_cfg.chunker)` yields byte-identical chunks
+        # to `_p1_chunker`, but we won't reach the chunker here at all.)
+        def _p3_chunker(doc):
+            return chunk_fixed(doc, p3_cfg.chunker)
+
+        second = ingest_mod._process_entry(
+            entry,
+            store=clean_store,
+            embedder=embedder,  # type: ignore[arg-type]
+            cfg=p3_cfg,
+            chunker=_p3_chunker,
+            force=False,
+            dry_run=False,
+            log_path=tmp_path / "llm_calls.jsonl",
+            logger=_QuietLogger(),
+        )
+        assert second.status == "skipped_unchanged"
+        assert embedder.calls == p1_calls, "P3 run must not call embed when P1 already ingested"
+        # Row count unchanged — no duplicate rows under a different tag.
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == first.num_chunks
 
     def test_force_reembeds(
         self,
@@ -316,7 +384,7 @@ class TestProcessEntryIntegration:
         assert result.tokens_embedded > 0  # reports the pre-flight estimate
         assert result.cost_usd == 0.0
         assert embedder.calls == 0
-        assert clean_store.count_chunks(_P1_TAG) == 0
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == 0
 
     def test_dry_run_semantic_pipeline_skips_chunker(
         self,
@@ -392,7 +460,7 @@ class TestProcessEntryIntegration:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         # Guards C3: a doc row whose content_hash matches but has ZERO chunks
-        # for _P1_TAG must NOT be skipped. This is the partial-failure
+        # for _P1_CHUNK_SET_ID must NOT be skipped. This is the partial-failure
         # recovery path AND the future P2/P3/P4-after-P1 path.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
         dest = tmp_path / "corpus" / "test/A1_fake.pdf"
@@ -415,7 +483,7 @@ class TestProcessEntryIntegration:
             )
         )
         clean_store.conn.commit()
-        assert clean_store.count_chunks(_P1_TAG) == 0
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == 0
 
         embedder = _FakeEmbedder()
         result = ingest_mod._process_entry(
@@ -431,7 +499,7 @@ class TestProcessEntryIntegration:
         )
         assert result.status == "ingested"  # NOT skipped_unchanged
         assert embedder.calls == 1
-        assert clean_store.count_chunks(_P1_TAG) == result.num_chunks
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == result.num_chunks
 
     def test_shrinking_chunkset_no_orphans(
         self,
@@ -461,7 +529,7 @@ class TestProcessEntryIntegration:
         )
         assert v1.status == "ingested"
         assert v1.num_chunks > 1
-        v1_count = clean_store.count_chunks(_P1_TAG)
+        v1_count = clean_store.count_chunks(_P1_CHUNK_SET_ID)
         assert v1_count == v1.num_chunks
 
         # v2: same path, much smaller content → fewer chunks.
@@ -480,7 +548,7 @@ class TestProcessEntryIntegration:
         assert v2.status == "ingested"
         assert v2.num_chunks < v1_count, "test setup should produce fewer v2 chunks"
         # The load-bearing assertion: total chunks == v2's chunks, not v1_count.
-        assert clean_store.count_chunks(_P1_TAG) == v2.num_chunks
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == v2.num_chunks
 
     def test_partial_failure_leaves_docrow_absent(
         self,
@@ -527,7 +595,7 @@ class TestProcessEntryIntegration:
             row = cur.fetchone()
             assert row is not None
             assert row[0] == 0, "partial-failure must not commit the doc row"
-        assert clean_store.count_chunks(_P1_TAG) == 0
+        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == 0
 
     def test_optional_missing_does_not_fail(
         self,

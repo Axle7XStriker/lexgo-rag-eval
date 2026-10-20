@@ -2,10 +2,13 @@
 
 For each present PDF in the manifest: extract text → chunk per the
 `--pipeline` selection → embed via Voyage → upsert into the `documents`
-and `chunks` tables. Chunks land tagged with the pipeline's derived DB
-tag (`PipelineConfig.tag`), so multiple pipelines coexist in the same
-table without collision. Idempotent: unchanged documents (for the
-selected pipeline) are skipped by content-hash short-circuit.
+and `chunks` tables. Chunks land tagged with the pipeline's derived
+`chunk_set_id` (`PipelineConfig.chunk_set_id`, hashes `ChunkerConfig`
+only), so pipelines with equal chunker configs share one physical copy
+of chunks + embeddings — P1/P3/P4 (all `fixed(500, 50)`) all key off
+the same id, and ingest for the second/third pipeline is a no-op by
+design. Idempotent: unchanged documents (for the resolved chunk set)
+are skipped by content-hash short-circuit.
 
 CLI::
 
@@ -13,16 +16,19 @@ CLI::
                            [--dry-run] [--batch-size N] [--log-level LEVEL]
 
 Design notes worth remembering:
-  - Idempotency key is `(documents.content_hash, chunks-exist-for-pipeline)`.
+  - Idempotency key is `(documents.content_hash, chunks-exist-for-chunk_set_id)`.
     Match on BOTH → skip embed + upsert; miss on either (or --force) →
-    re-embed all the doc's chunks. Requiring the chunks-exist half means a
-    prior partial-failure ingest recovers on the next run instead of being
-    permanently short-circuited by a stale hash — and P2..P4 don't silently
-    no-op on docs P1 already touched.
+    re-embed. Requiring the chunks-exist half means a prior partial-
+    failure ingest recovers on the next run instead of being permanently
+    short-circuited by a stale hash. Keying on `chunk_set_id` (not a
+    per-pipeline tag) means that once P1 has populated the fixed(500,50)
+    chunk set, subsequent `--pipeline p3` / `--pipeline p4` runs correctly
+    see "chunks already present for this chunk set" and skip — no
+    duplicate embedding spend.
   - Per-doc write is one transaction: upsert `documents` + DELETE stale
-    chunks for `(doc_id, pipeline)` + insert new chunks + commit. Chunk-
-    write failures roll back the document row's new hash too, so the
-    invariant above holds.
+    chunks for `(doc_id, chunk_set_id)` + insert new chunks + commit.
+    Chunk-write failures roll back the document row's new hash too, so
+    the invariant above holds.
   - One VectorStore, one VoyageEmbedder, one loop. No parallelism — the
     Voyage SDK is sync, the DB writes are cheap, and the total budget is
     a few hundred chunks. Parallelism would be complexity without payoff.
@@ -35,6 +41,12 @@ Design notes worth remembering:
     run_id so cost can be attributed to a specific ingest run.
   - --dry-run opens NO database connection — extract + chunk + estimate
     only. Useful for pre-flight cost checks on a laptop with no docker up.
+  - Schema migrations: `VectorStore.ensure_schema()` is additive-only
+    (`IF NOT EXISTS` guards). A column rename like `pipeline` →
+    `chunk_set_id` cannot be applied in-place. If you see
+    `column "chunk_set_id" does not exist` on first ingest after
+    pulling this change, your DB predates the rename — rebuild with
+    `docker compose down -v && docker compose up -d` and re-ingest.
 """
 
 from __future__ import annotations
@@ -130,13 +142,22 @@ def _write_run_log(path: Path, results: list[DocResult]) -> None:
             )
 
 
-def _fetch_existing(store: VectorStore, doc_path: str, pipeline: str) -> tuple[str, bool] | None:
-    """Read `(content_hash, has_chunks_for_pipeline)` for `doc_path`, or None if unseen.
+def _fetch_existing(
+    store: VectorStore, doc_path: str, chunk_set_id: str
+) -> tuple[str, bool] | None:
+    """Read `(content_hash, has_chunks_for_chunk_set_id)` for `doc_path`, or None if unseen.
 
     Combined into one call because both pieces are load-bearing for the
     idempotency short-circuit: same hash AND chunks present = safe skip.
-    Same hash but zero chunks means a prior ingest half-failed (or a
-    different pipeline populated the doc row), and we must re-embed.
+    Same hash but zero chunks means a prior ingest half-failed, and we
+    must re-embed.
+
+    Because the predicate is on `chunk_set_id` (not a per-pipeline tag),
+    a prior ingest from a different pipeline whose `ChunkerConfig` matches
+    the current pipeline's — e.g. P1 having populated the fixed(500,50)
+    chunk set before a `--pipeline p3` run — correctly returns True on
+    the `has_chunks_for_chunk_set_id` leg, and this run skips. That is
+    the entire point of the chunk-set split.
     """
     with store.conn.cursor() as cur:
         cur.execute(
@@ -145,12 +166,12 @@ def _fetch_existing(store: VectorStore, doc_path: str, pipeline: str) -> tuple[s
                 d.content_hash,
                 EXISTS(
                     SELECT 1 FROM chunks c
-                    WHERE c.document_id = d.id AND c.pipeline = %s
+                    WHERE c.document_id = d.id AND c.chunk_set_id = %s
                 )
             FROM documents d
             WHERE d.doc_path = %s
             """,
-            (pipeline, doc_path),
+            (chunk_set_id, doc_path),
         )
         row = cur.fetchone()
     if row is None:
@@ -196,11 +217,13 @@ def _process_entry(
 ) -> DocResult:
     """Extract + chunk + embed + upsert one manifest entry. Never raises.
 
-    `cfg` — the active PipelineConfig. Its `tag` goes into the `chunks.pipeline`
-    column and drives the idempotency short-circuit; its `chunker.algorithm`
-    decides whether dry-run can call `chunker(doc)` at all (semantic chunkers
-    embed sentences internally, so calling one in dry-run would violate the
-    documented "no Voyage calls" contract).
+    `cfg` — the active PipelineConfig. Its `chunk_set_id` goes into
+    the `chunks.chunk_set_id` column and drives the idempotency
+    short-circuit; its `tag` is logged alongside for pipeline-level
+    provenance. Its `chunker.algorithm` decides whether dry-run can
+    call `chunker(doc)` at all (semantic chunkers embed sentences
+    internally, so calling one in dry-run would violate the documented
+    "no Voyage calls" contract).
 
     `chunker` — a callable that turns an ExtractedDoc into a list of Chunks.
     Built once per run in `main()` from the active `cfg.chunker.algorithm`.
@@ -209,6 +232,7 @@ def _process_entry(
     must pass a live VectorStore.
     """
     pipeline_tag = cfg.tag
+    chunk_set_id = cfg.chunk_set_id
     dest = CORPUS_ROOT / entry.dest_path
     result = DocResult(source_id=entry.source_id, doc_path=entry.dest_path, status="error")
     started = time.perf_counter()
@@ -252,13 +276,15 @@ def _process_entry(
         return result
 
     # Idempotency short-circuit — same content hash AND chunks exist for
-    # THIS pipeline, and not forced → skip. The pipeline check is what
+    # THIS chunk set, and not forced → skip. The chunks-exist leg is what
     # keeps a partially-failed prior ingest (doc row committed, chunks
-    # empty) from being permanently skipped, and what keeps P2..P4 from
-    # silently no-op'ing on docs P1 already touched.
+    # empty) from being permanently skipped. Because the leg checks
+    # chunk_set_id (not pipeline tag), a `--pipeline p3` run after P1
+    # has populated the fixed(500,50) chunk set CORRECTLY no-ops on
+    # every doc — the two pipelines share one chunk set by design.
     if store is not None:
         try:
-            existing = _fetch_existing(store, entry.dest_path, pipeline_tag)
+            existing = _fetch_existing(store, entry.dest_path, chunk_set_id)
         except psycopg.Error as e:
             # A failed SELECT poisons the connection until rolled back —
             # otherwise every subsequent doc's SELECT fails with
@@ -279,6 +305,7 @@ def _process_entry(
                 doc_path=entry.dest_path,
                 content_hash=doc.content_hash,
                 pipeline=pipeline_tag,
+                chunk_set_id=chunk_set_id,
             )
             return result
 
@@ -364,7 +391,7 @@ def _process_entry(
     result.tokens_embedded = tokens_billed
     result.cost_usd = cost
 
-    # Atomic write: upsert doc + wipe stale chunks for this pipeline +
+    # Atomic write: upsert doc + wipe stale chunks for this chunk set +
     # insert new chunks, all in one transaction. If chunks fail, the doc
     # row rolls back too — so the next run's hash check won't skip a
     # half-ingested doc, and shrinking chunk sets don't leave orphans.
@@ -377,7 +404,7 @@ def _process_entry(
     )
     chunk_rows = [
         ChunkRow(
-            pipeline=pipeline_tag,
+            chunk_set_id=chunk_set_id,
             chunk_index=c.chunk_index,
             text=c.text,
             num_tokens=c.num_tokens,
@@ -389,7 +416,7 @@ def _process_entry(
         for c, e in zip(chunks, embeddings, strict=True)
     ]
     try:
-        store.replace_document_chunks(doc_row, chunk_rows, pipeline=pipeline_tag)
+        store.replace_document_chunks(doc_row, chunk_rows, chunk_set_id=chunk_set_id)
     except Exception as e:
         # DB errors surface into the summary rather than aborting the whole
         # run — the outer main() exits non-zero if any required entry failed.
@@ -503,7 +530,9 @@ def main() -> int:
         choices=tuple(PIPELINES.keys()),
         default="p1",
         help="Which retrieval pipeline's chunks to ingest. Selects a chunker "
-        "+ knobs from src.pipeline.pipeline_config and derives the DB tag.",
+        "+ knobs from src.pipeline.pipeline_config and derives the chunk_set_id. "
+        "Pipelines sharing a ChunkerConfig share one chunk set; subsequent "
+        "runs for a pipeline whose chunker already ingested are no-ops.",
     )
     parser.add_argument(
         "--only",
@@ -540,6 +569,7 @@ def main() -> int:
 
     cfg = get_pipeline(args.pipeline)
     pipeline_tag = cfg.tag
+    chunk_set_id = cfg.chunk_set_id
 
     entries = _select_manifest_entries(args.only)
     logger.info(
@@ -547,6 +577,7 @@ def main() -> int:
         n_entries=len(entries),
         pipeline=pipeline_tag,
         pipeline_key=cfg.key,
+        chunk_set_id=chunk_set_id,
         dry_run=args.dry_run,
         force=args.force,
     )

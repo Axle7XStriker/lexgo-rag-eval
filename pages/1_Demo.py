@@ -126,6 +126,7 @@ with st.sidebar:
         rerank_chip = "rerank: n/a"
     caption_parts = [
         f"tag: `{active_cfg.tag}`",
+        f"chunk_set: `{active_cfg.chunk_set_id}`",
         f"kind: `{active_cfg.retriever.kind}`",
         f"top_k: {active_cfg.retriever.top_k}",
         rerank_chip,
@@ -167,7 +168,7 @@ if submitted:
                     embedder=embedder,
                     store=store,
                     generator=generator,
-                    pipeline_tag=active_cfg.tag,
+                    chunk_set_id=active_cfg.chunk_set_id,
                     retriever=active_cfg.retriever,
                     reranker=reranker,
                     reranker_config=active_cfg.reranker,

@@ -95,9 +95,9 @@ class _FakeStore:
         pass
 
     def dense_search(
-        self, pipeline: str, query_embedding: list[float], k: int
+        self, chunk_set_id: str, query_embedding: list[float], k: int
     ) -> list[RetrievedChunk]:
-        self.calls.append({"pipeline": pipeline, "k": k})
+        self.calls.append({"chunk_set_id": chunk_set_id, "k": k})
         doc_paths = self.doc_paths_by_query.get("<default>", self.default_doc_paths)
         return [
             RetrievedChunk(
@@ -105,7 +105,7 @@ class _FakeStore:
                 document_id=1,
                 doc_path=dp,
                 source_id=dp.split("/")[-1][:2],
-                pipeline=pipeline,
+                chunk_set_id=chunk_set_id,
                 chunk_index=i,
                 text=f"chunk-{i}-body",
                 page_start=i + 1,
