@@ -37,8 +37,9 @@ make eval PIPELINE=p4           # P4: hybrid + Cohere rerank
 ```
 
 Four pipelines are registered (`p1`..`p4` — see `src/pipeline/pipeline_config.py`).
-Each has its own derived DB tag, so re-ingesting under a different pipeline
-coexists with existing chunks instead of overwriting them.
+Each has a distinct pipeline `tag` for eval provenance. Storage uses a separate
+`chunk_set_id`: P1/P3/P4 share their fixed 500/50 chunks, while P2's semantic
+chunks remain separate.
 
 Artifacts land under `evals/runs/eval_<UTC-timestamp>/`. Each run captures
 the git SHA, prompt versions, config, totals, and metrics into
@@ -72,8 +73,9 @@ Every eval run captures:
 
 - `git_sha` — the commit the pipeline ran at
 - `prompt_versions` — `{answer: "v1", judge: "v1", ...}`
-- `pipeline` — a `PipelineConfig` (key `p1`..`p4`) + derived DB `tag`
-  (e.g. `p1_fixed_500_50_<8hex>`, `p4_fixed_500_50_<8hex>`)
+- `pipeline` — a `PipelineConfig` (key `p1`..`p4`) + derived pipeline `tag`
+  (e.g. `p1_fixed_500_50_<8hex>`) and DB `chunk_set_id`
+  (e.g. `fixed_500_50_<8hex>`)
 - `config` — chunker knobs, retriever kind + top-k, reranker (null for P1-P3,
   `{provider, model, top_n}` for P4), model IDs
 - `cost_usd` — generate + judge + rerank, each tracked separately in the

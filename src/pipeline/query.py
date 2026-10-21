@@ -232,7 +232,7 @@ def answer_question(
       2. Load prompt v1 (cached).
       3. Embed `query` with Voyage.
       4. Retrieve top-k via `retriever.kind` (dense — pgvector cosine;
-         hybrid — dense + BM25 fused via RRF), filtered to `chunk_set_id`.
+         hybrid — dense + BM25 fused via RRF).
       5. If retrieval is empty: short-circuit with the out-of-corpus sentinel;
          no generator call, no rerank call, cost 0.
       6. If reranker set: call Cohere Rerank; replace `retrieved` with the
@@ -241,10 +241,6 @@ def answer_question(
       7. Format enumerated context block, substitute into the user template.
       8. Call Claude for the answer.
       9. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
-
-    `chunk_set_id` is a `PipelineConfig.chunk_set_id` value — the identifier
-    of the physical chunk set the pipeline retrieves against. Two pipelines
-    with equal `ChunkerConfig` resolve the same id and share chunks.
 
     `reranker` and `reranker_config` must both be provided or both omitted
     (invariant enforced in `_validate_reranker_pair`).

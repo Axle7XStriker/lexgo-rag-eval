@@ -13,8 +13,7 @@ Two distinct derived identifiers hang off a `PipelineConfig`:
     DB filter column (`chunks.chunk_set_id`) stores this; ingest + retrieval
     key off it exclusively. Two pipelines with equal `ChunkerConfig` values
     derive the SAME `chunk_set_id` and share one physical copy of chunks +
-    embeddings. P1/P3/P4 (all `fixed(500, 50)`) share one chunk set;
-    changing a retriever knob does NOT force a re-ingest.
+    embeddings.
 
 Adding a new pipeline is one dict entry — no changes to any callsite
 except the dispatch table in `scripts.ingest` (a new `elif algorithm ==
@@ -27,9 +26,7 @@ Design notes worth remembering:
     FROM chunks;` output; the hash suffix catches fields not covered by
     the prefix so no config change can silently reuse an existing id.
   - Hashes run over the full `asdict(...)` of their scope, so every field
-    participates. Adding a field to `ChunkerConfig` therefore never
-    creates a stealth data-mixing bug — it rotates `chunk_set_id` and
-    forces a fresh ingest for every pipeline that references it.
+    participates.
   - Configs are frozen dataclasses so accidental mutation raises rather
     than corrupts the registry.
   - `key` is the CLI-facing short name (`"p1"`); `tag` is the pipeline-
@@ -59,9 +56,9 @@ class ChunkerConfig:
     # Fixed-window knobs. `target_tokens` also documents the intended
     # band center for the semantic chunker even though it doesn't drive
     # its cut logic directly — NOTE: every field on this dataclass
-    # participates in `_config_hash` regardless of whether the current
+    # participates in the derived hashes regardless of whether the current
     # algorithm reads it, so tweaking `target_tokens` on a semantic
-    # config still regenerates the DB tag. This is intentional:
+    # config still regenerates `tag` and `chunk_set_id`. This is intentional:
     # "documentary" fields are still versioned so a future contributor
     # who reinterprets them as load-bearing gets fresh DB rows
     # automatically, not silent data-mixing under an old tag.
@@ -125,7 +122,7 @@ class PipelineConfig:
 
         Any change to any field on this config (or its nested configs)
         changes the hash suffix, which changes the tag. Used in eval
-        artifacts and logs; NOT used as a DB filter.
+        artifacts and logs.
         """
         return f"{self.key}_{_chunker_readable_prefix(self.chunker)}_{_short_hash(asdict(self))}"
 
@@ -140,10 +137,10 @@ class PipelineConfig:
 
         Hashes `ChunkerConfig` ONLY. Two pipelines whose `ChunkerConfig`
         values are equal derive the same `chunk_set_id` and share chunks
-        in the DB — P1/P3/P4 all land here. Changing a retriever or
-        reranker knob does not rotate this; changing any chunker field
-        does. Stored in `chunks.chunk_set_id`; the ingest idempotency
-        check + the query-time retrieval filter both key off this.
+        in the DB. Changing a retriever or reranker knob does not rotate
+        this; changing any chunker field does. Stored in `chunks.chunk_set_id`;
+        the ingest idempotency check + the query-time retrieval filter both
+        key off this.
         """
         return f"{_chunker_readable_prefix(self.chunker)}_{_short_hash(asdict(self.chunker))}"
 
@@ -152,9 +149,7 @@ def _chunker_readable_prefix(c: ChunkerConfig) -> str:
     """Human-legible prefix derived from a `ChunkerConfig`.
 
     Covers the fields most operators care about at `psql` inspection
-    time; the hash suffix on `tag` and `chunk_set_id` covers everything else.
-    Shared by `PipelineConfig.tag` and `PipelineConfig.chunk_set_id` so
-    the prefix format never drifts between the two identifiers.
+    time; the hash suffix covers everything else.
     """
     if c.algorithm == "fixed":
         return f"fixed_{c.target_tokens}_{c.overlap_tokens}"
@@ -214,8 +209,8 @@ PIPELINES: dict[str, PipelineConfig] = {
         key="p3",
         # Same chunker as P1 — the point of P3 is to isolate the retrieval
         # fusion effect, so the chunk set must be byte-identical to P1's.
-        # (It still lands under a fresh p3_... DB tag because the retriever
-        # config differs and the tag hashes the full config.)
+        # Its pipeline tag still differs because the retriever config changes,
+        # while its chunk_set_id matches P1 so both reuse the same DB rows.
         chunker=ChunkerConfig(
             algorithm="fixed",
             target_tokens=500,
@@ -230,9 +225,9 @@ PIPELINES: dict[str, PipelineConfig] = {
     "p4": PipelineConfig(
         key="p4",
         # Same chunker as P1/P3 — P4 isolates the rerank effect on top of
-        # hybrid retrieval, so the chunk set must be byte-identical. The DB
-        # tag still differs because the retriever + reranker configs differ
-        # and the tag hashes the full config.
+        # hybrid retrieval, so the chunk set must be byte-identical. Its
+        # pipeline tag differs because the retriever + reranker configs differ,
+        # while its chunk_set_id matches P1/P3 so all three share DB rows.
         chunker=ChunkerConfig(
             algorithm="fixed",
             target_tokens=500,
@@ -268,10 +263,9 @@ def get_pipeline(key: str) -> PipelineConfig:
 def pipeline_to_manifest_dict(cfg: PipelineConfig) -> dict[str, Any]:
     """Serialize `cfg` for the eval run manifest.
 
-    Stores the DERIVED tag explicitly at the top level alongside the full
-    config, so a run artifact self-describes both identity (`tag`) and
-    shape (nested `chunker` / `retriever` / `reranker` dicts). Downstream
-    consumers can dedupe runs by tag and reproduce a pipeline from the
-    config fields without re-running the derivation.
+    Stores both derived identifiers explicitly alongside the full config, so
+    a run artifact records its pipeline identity (`tag`), physical retrieval
+    set (`chunk_set_id`), and shape (nested config dicts). Downstream consumers
+    need not re-run either derivation.
     """
-    return {"tag": cfg.tag, **asdict(cfg)}
+    return {"tag": cfg.tag, "chunk_set_id": cfg.chunk_set_id, **asdict(cfg)}

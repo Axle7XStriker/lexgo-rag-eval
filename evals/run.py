@@ -592,14 +592,12 @@ def main() -> int:
             "judge": JUDGE_PROMPT_VERSION,
         },
         # `config.pipeline` = full PipelineConfig (chunker/retriever/reranker
-        # knobs + derived tag) so the artifact is self-describing. The tag
-        # is intentionally NOT duplicated at the top level — one source of
-        # truth (`config.pipeline.tag`) keeps a future refactor from
-        # silently letting the two copies disagree. Downstream consumers
-        # should read from `config.pipeline.tag`.
+        # knobs + derived tag and chunk_set_id) so the artifact records both
+        # pipeline identity and the physical retrieval set. These identifiers
+        # are intentionally NOT duplicated outside `config.pipeline`.
         # `config.models` = provider identities held constant across pipelines
         # (chat, judge, embedding) — kept separate because they're not part of
-        # the pipeline's identity (a change here doesn't warrant a new DB tag,
+        # the pipeline's identity (a change here doesn't warrant a new pipeline tag,
         # but it DOES belong in the manifest for reproducibility).
         "config": {
             "pipeline": pipeline_to_manifest_dict(cfg),

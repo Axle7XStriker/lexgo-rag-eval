@@ -26,8 +26,8 @@ CREATE INDEX IF NOT EXISTS documents_source_id_idx ON documents (source_id);
 -- pipeline's `ChunkerConfig` only (see `PipelineConfig.chunk_set_id`
 -- in src/pipeline/pipeline_config.py). Pipelines whose chunker configs
 -- are equal share one physical copy of chunks + embeddings. An A/B eval
--- across pipelines filters on the chunk set each pipeline resolves to,
--- not on a per-pipeline tag — a WHERE filter change, not DDL.
+-- across pipelines filters on the chunk set each pipeline resolves to —
+-- a WHERE filter change, not DDL.
 -- Embedding dim is 1024 to match Voyage voyage-3-large.
 --
 -- Guarded with IF NOT EXISTS + UNIQUE constraint so re-apply is a no-op.

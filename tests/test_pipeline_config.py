@@ -209,7 +209,7 @@ class TestTagChangesOnFieldMutation:
     def test_retriever_kind(self) -> None:
         # `kind` is a Literal["dense", "hybrid"]; both are valid runtime
         # values so no `type: ignore` is needed. P3 (hybrid) will lean on
-        # this — a `dense`↔`hybrid` swap MUST land under a fresh DB tag.
+        # this — a `dense`↔`hybrid` swap MUST produce a fresh pipeline tag.
         base = TEST_PIPELINE_CFG
         variants = [
             base,
@@ -300,10 +300,7 @@ class TestChunkSetId:
     """`chunk_set_id` is the DB identifier for a chunk set.
 
     Load-bearing properties:
-      - Prefix drops the `p<n>_` key — chunk sets are shared across pipelines
-        so the id must not name a single pipeline.
-      - Pipelines with equal `ChunkerConfig` derive the SAME id (that's how
-        P1/P3/P4 share chunks + embeddings in the DB).
+      - Pipelines with equal `ChunkerConfig` derive the SAME id.
       - Pipelines with different `ChunkerConfig` derive DIFFERENT ids.
       - Retriever / reranker mutations leave the id unchanged — the chunk
         set is independent of retrieval choice.
@@ -311,76 +308,50 @@ class TestChunkSetId:
         chunking must force a fresh ingest.
     """
 
-    def test_prefix_omits_pipeline_key(self) -> None:
-        cfg = PipelineConfig(
-            key="p9",
-            chunker=ChunkerConfig(algorithm="fixed", target_tokens=500, overlap_tokens=50),
-            retriever=RetrieverConfig(kind="dense", top_k=10),
-            reranker=None,
-        )
-        assert cfg.chunk_set_id.startswith("fixed_500_50_")
-        assert not cfg.chunk_set_id.startswith("p9_")
+    @pytest.mark.parametrize(
+        ("chunker", "expected_prefix"),
+        [
+            (TEST_PIPELINE_CFG.chunker, "fixed_400_40_"),
+            (replace(TEST_PIPELINE_CFG.chunker, algorithm="semantic"), "semantic_p95_"),
+        ],
+    )
+    def test_prefix_matches_chunker_algorithm(
+        self, chunker: ChunkerConfig, expected_prefix: str
+    ) -> None:
+        cfg = replace(TEST_PIPELINE_CFG, chunker=chunker)
+        assert cfg.chunk_set_id.startswith(expected_prefix)
 
     def test_hash_suffix_is_short_hex(self) -> None:
         suffix = TEST_PIPELINE_CFG.chunk_set_id.rsplit("_", 1)[-1]
         assert re.fullmatch(r"[0-9a-f]{8}", suffix) is not None
 
-    def test_semantic_prefix(self) -> None:
-        cfg = replace(
-            TEST_PIPELINE_CFG,
-            chunker=replace(TEST_PIPELINE_CFG.chunker, algorithm="semantic"),
-        )
-        assert cfg.chunk_set_id.startswith("semantic_p95_")
-
     def test_shared_across_pipelines_with_equal_chunker(self) -> None:
-        # The whole point of the split: P1, P3, P4 share one chunk set.
-        assert (
-            PIPELINES["p1"].chunk_set_id
-            == PIPELINES["p3"].chunk_set_id
-            == PIPELINES["p4"].chunk_set_id
-        )
+        pipelines = [
+            TEST_PIPELINE_CFG,
+            replace(
+                TEST_PIPELINE_CFG,
+                key="forked",
+                retriever=replace(TEST_PIPELINE_CFG.retriever, top_k=42),
+            ),
+            replace(
+                TEST_PIPELINE_CFG,
+                key="reranked",
+                reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5),
+            ),
+        ]
+        assert len({cfg.chunk_set_id for cfg in pipelines}) == 1
 
-    def test_distinct_for_different_chunker(self) -> None:
-        assert PIPELINES["p1"].chunk_set_id != PIPELINES["p2"].chunk_set_id
-
-    def test_unaffected_by_retriever_mutation(self) -> None:
-        base = TEST_PIPELINE_CFG
-        swapped = replace(base, retriever=replace(base.retriever, top_k=42))
-        assert base.chunk_set_id == swapped.chunk_set_id
-        # And `tag` SHOULD change — kept as a sanity check that the two
-        # identifiers really do have different scopes.
-        assert base.tag != swapped.tag
-
-    def test_unaffected_by_reranker_addition(self) -> None:
-        base = TEST_PIPELINE_CFG
-        with_reranker = replace(
-            base,
-            reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5),
-        )
-        assert base.chunk_set_id == with_reranker.chunk_set_id
-        assert base.tag != with_reranker.tag
-
-    def test_unaffected_by_key_mutation(self) -> None:
-        # Two pipelines with the same chunker but different keys share a
-        # chunk set — e.g. P1 ("p1") and P3 ("p3"). Guards the derivation
-        # against accidentally including the key.
-        base = TEST_PIPELINE_CFG
-        forked = replace(base, key="renamed")
-        assert base.chunk_set_id == forked.chunk_set_id
-
-    def test_rotates_on_chunker_target_tokens(self) -> None:
-        base = TEST_PIPELINE_CFG
-        mutated = replace(base, chunker=replace(base.chunker, target_tokens=501))
-        assert base.chunk_set_id != mutated.chunk_set_id
-
-    def test_rotates_on_chunker_percentile_threshold(self) -> None:
-        # Representative check for the semantic-chunker branch. The
-        # exhaustive per-field grid stays on `tag` (TestTagMutationCoverage);
-        # chunk_set_id and tag share the hashing helper, so field coverage
-        # on `tag` transfers.
-        base = TEST_PIPELINE_CFG
-        mutated = replace(base, chunker=replace(base.chunker, percentile_threshold=90.0))
-        assert base.chunk_set_id != mutated.chunk_set_id
+    @pytest.mark.parametrize(
+        "chunker",
+        [
+            replace(TEST_PIPELINE_CFG.chunker, algorithm="semantic"),
+            replace(TEST_PIPELINE_CFG.chunker, target_tokens=501),
+            replace(TEST_PIPELINE_CFG.chunker, percentile_threshold=90.0),
+        ],
+    )
+    def test_distinct_for_different_chunker(self, chunker: ChunkerConfig) -> None:
+        mutated = replace(TEST_PIPELINE_CFG, chunker=chunker)
+        assert TEST_PIPELINE_CFG.chunk_set_id != mutated.chunk_set_id
 
 
 class TestManifestSerialization:
@@ -393,14 +364,14 @@ class TestManifestSerialization:
         payload = json.dumps(raw, default=str)
         parsed = json.loads(payload)
         assert parsed["tag"] == TEST_PIPELINE_CFG.tag
+        assert parsed["chunk_set_id"] == TEST_PIPELINE_CFG.chunk_set_id
         assert parsed["key"] == "test"
         assert parsed["chunker"]["algorithm"] == "fixed"
         assert parsed["retriever"]["top_k"] == 8
         assert parsed["reranker"] is None
 
-    def test_stores_tag_at_top_level(self) -> None:
-        # The manifest reader shouldn't have to re-derive the tag from the
-        # config — it's stored explicitly so a downstream consumer can
-        # dedupe runs by tag without depending on this Python module.
+    def test_stores_derived_ids_at_top_level(self) -> None:
+        # Manifest readers should not have to reproduce either derivation.
         d = pipeline_to_manifest_dict(TEST_PIPELINE_CFG)
         assert d["tag"] == TEST_PIPELINE_CFG.tag
+        assert d["chunk_set_id"] == TEST_PIPELINE_CFG.chunk_set_id

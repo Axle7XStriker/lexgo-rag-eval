@@ -255,14 +255,7 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """P3 ingest after P1 is a no-op: same ChunkerConfig → same chunk_set_id.
-
-        This is the whole point of splitting pipeline identity from chunk-set
-        identity. P1/P3/P4 all declare `fixed(500, 50)`, so their
-        `PipelineConfig.chunk_set_id` values are byte-identical and the
-        idempotency check hits "chunks already present for this chunk set"
-        on the second pipeline's run.
-        """
+        """P3 ingest after P1 is a no-op: same ChunkerConfig → same chunk_set_id"""
         p3_cfg = get_pipeline("p3")
         # Precondition: the two pipelines really do share a chunk set. If this
         # equality ever breaks (someone tunes P3's chunker in isolation),
@@ -315,7 +308,7 @@ class TestProcessEntryIntegration:
         assert second.status == "skipped_unchanged"
         assert embedder.calls == p1_calls, "P3 run must not call embed when P1 already ingested"
         # Row count unchanged — no duplicate rows under a different tag.
-        assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == first.num_chunks
+        assert clean_store.count_chunks(p3_cfg.chunk_set_id) == first.num_chunks
 
     def test_force_reembeds(
         self,

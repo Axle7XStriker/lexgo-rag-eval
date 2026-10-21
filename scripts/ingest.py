@@ -5,10 +5,8 @@ For each present PDF in the manifest: extract text → chunk per the
 and `chunks` tables. Chunks land tagged with the pipeline's derived
 `chunk_set_id` (`PipelineConfig.chunk_set_id`, hashes `ChunkerConfig`
 only), so pipelines with equal chunker configs share one physical copy
-of chunks + embeddings — P1/P3/P4 (all `fixed(500, 50)`) all key off
-the same id, and ingest for the second/third pipeline is a no-op by
-design. Idempotent: unchanged documents (for the resolved chunk set)
-are skipped by content-hash short-circuit.
+of chunks + embeddings. Idempotent: unchanged documents (for the resolved
+chunk set) are skipped by content-hash short-circuit.
 
 CLI::
 
@@ -20,11 +18,10 @@ Design notes worth remembering:
     Match on BOTH → skip embed + upsert; miss on either (or --force) →
     re-embed. Requiring the chunks-exist half means a prior partial-
     failure ingest recovers on the next run instead of being permanently
-    short-circuited by a stale hash. Keying on `chunk_set_id` (not a
-    per-pipeline tag) means that once P1 has populated the fixed(500,50)
-    chunk set, subsequent `--pipeline p3` / `--pipeline p4` runs correctly
-    see "chunks already present for this chunk set" and skip — no
-    duplicate embedding spend.
+    short-circuited by a stale hash. Keying on `chunk_set_id` means that once
+    P1 has populated the fixed(500,50) chunk set, subsequent
+    `--pipeline p3` / `--pipeline p4` runs correctly see "chunks already
+    present for this chunk set" and skip — no duplicate embedding spend.
   - Per-doc write is one transaction: upsert `documents` + DELETE stale
     chunks for `(doc_id, chunk_set_id)` + insert new chunks + commit.
     Chunk-write failures roll back the document row's new hash too, so
@@ -41,12 +38,6 @@ Design notes worth remembering:
     run_id so cost can be attributed to a specific ingest run.
   - --dry-run opens NO database connection — extract + chunk + estimate
     only. Useful for pre-flight cost checks on a laptop with no docker up.
-  - Schema migrations: `VectorStore.ensure_schema()` is additive-only
-    (`IF NOT EXISTS` guards). A column rename like `pipeline` →
-    `chunk_set_id` cannot be applied in-place. If you see
-    `column "chunk_set_id" does not exist` on first ingest after
-    pulling this change, your DB predates the rename — rebuild with
-    `docker compose down -v && docker compose up -d` and re-ingest.
 """
 
 from __future__ import annotations
@@ -151,13 +142,6 @@ def _fetch_existing(
     idempotency short-circuit: same hash AND chunks present = safe skip.
     Same hash but zero chunks means a prior ingest half-failed, and we
     must re-embed.
-
-    Because the predicate is on `chunk_set_id` (not a per-pipeline tag),
-    a prior ingest from a different pipeline whose `ChunkerConfig` matches
-    the current pipeline's — e.g. P1 having populated the fixed(500,50)
-    chunk set before a `--pipeline p3` run — correctly returns True on
-    the `has_chunks_for_chunk_set_id` leg, and this run skips. That is
-    the entire point of the chunk-set split.
     """
     with store.conn.cursor() as cur:
         cur.execute(
