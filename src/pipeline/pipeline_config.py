@@ -32,6 +32,9 @@ Design notes worth remembering:
   - `key` is the CLI-facing short name (`"p1"`); `tag` is the pipeline-
     identity string; `chunk_set_id` is the DB chunk-set identifier.
     Three distinct concepts, don't conflate.
+  - The embedder is deliberately a global in `src/config.py`, not a
+    per-pipeline field — every pipeline uses the same Voyage model and
+    dim, so `chunk_set_id` can safely ignore it.
 """
 
 from __future__ import annotations
@@ -157,7 +160,8 @@ def _chunker_readable_prefix(c: ChunkerConfig) -> str:
         # `int(percentile_threshold)` keeps the prefix short — 95.0 → "p95".
         # The full float still lands in the hash, so 95.0 vs 95.5 still
         # produce distinct ids via the suffix.
-        return f"semantic_p{int(c.percentile_threshold or 0)}"
+        p = c.percentile_threshold if c.percentile_threshold is not None else 0
+        return f"semantic_p{int(p)}"
     raise ValueError(f"unknown chunker.algorithm: {c.algorithm!r}")
 
 
@@ -268,4 +272,4 @@ def pipeline_to_manifest_dict(cfg: PipelineConfig) -> dict[str, Any]:
     set (`chunk_set_id`), and shape (nested config dicts). Downstream consumers
     need not re-run either derivation.
     """
-    return {"tag": cfg.tag, "chunk_set_id": cfg.chunk_set_id, **asdict(cfg)}
+    return {**asdict(cfg), "tag": cfg.tag, "chunk_set_id": cfg.chunk_set_id}

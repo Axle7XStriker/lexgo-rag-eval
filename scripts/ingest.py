@@ -288,7 +288,7 @@ def _process_entry(
                 "skipped_unchanged",
                 doc_path=entry.dest_path,
                 content_hash=doc.content_hash,
-                pipeline=pipeline_tag,
+                pipeline_tag=pipeline_tag,
                 chunk_set_id=chunk_set_id,
             )
             return result
@@ -559,7 +559,7 @@ def main() -> int:
     logger.info(
         "ingest_start",
         n_entries=len(entries),
-        pipeline=pipeline_tag,
+        pipeline_tag=pipeline_tag,
         pipeline_key=cfg.key,
         chunk_set_id=chunk_set_id,
         dry_run=args.dry_run,

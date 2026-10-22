@@ -348,6 +348,7 @@ def _write_summary_md(
     lines.append(f"# Eval run — {manifest['run_id']}")
     lines.append("")
     lines.append(f"- pipeline: `{pipeline_cfg['tag']}` (key `{pipeline_cfg['key']}`)")
+    lines.append(f"- chunk_set_id: `{pipeline_cfg['chunk_set_id']}`")
     lines.append(f"- git_sha: `{manifest['git_sha']}`")
     lines.append(
         f"- prompt versions: answer=`{manifest['prompt_versions']['answer']}`, "

@@ -378,7 +378,7 @@ class TestLexicalSearchReal:
     def test_chunk_set_id_filter_isolates_rows(self, seeded_store: VectorStore) -> None:
         """A query against an unknown chunk_set_id returns nothing even when the
         lexeme matches rows under a different tag — the WHERE clause composes."""
-        hits = seeded_store.lexical_search("nonexistent_pipeline_tag", "quicksort", k=5)
+        hits = seeded_store.lexical_search("nonexistent_chunk_set_id", "quicksort", k=5)
         assert hits == []
 
 
@@ -409,7 +409,7 @@ class TestHybridSearchReal:
     def test_hybrid_filters_by_chunk_set_id(self, seeded_store: VectorStore) -> None:
         """An unknown chunk_set_id returns empty from both branches → empty fusion."""
         fused = seeded_store.hybrid_search(
-            "nonexistent_pipeline_tag",
+            "nonexistent_chunk_set_id",
             [0.1] * EMBEDDING_DIM,
             query_text="quicksort",
             k=5,

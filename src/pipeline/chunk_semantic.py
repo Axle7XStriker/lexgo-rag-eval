@@ -34,7 +34,8 @@ Design notes worth remembering:
     footnote glue) surface as short "sentences" that the min-token
     merge step absorbs.
   - Emits the same `Chunk` dataclass P1 emits — DB rows are shape-
-    compatible, only the `pipeline` tag differs.
+    compatible, only the `chunk_set_id` differs (P2's `ChunkerConfig`
+    differs from P1's).
   - Uses the same `cl100k_base` tokenizer as `chunk_fixed` for `num_tokens`
     accounting, so P1 vs P2 token counts are directly comparable.
   - Cost: one `embed_documents` batch per ~64 sentences at chunk time
