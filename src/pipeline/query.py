@@ -8,7 +8,7 @@ Design notes worth remembering:
   - No client construction here. All I/O flows through the injected
     dependencies, so this module is pure orchestration + parsing.
   - Empty retrieval short-circuits to the out-of-corpus sentinel — no
-    generator call, cost 0. Guards against wrong `pipeline_tag`, empty DB,
+    generator call, cost 0. Guards against wrong `chunk_set_id`, empty DB,
     or a degenerate filter and keeps the eval loop honest.
   - Citation parsing is a regex over `[N]` markers, deduped in first-mention
     order, with out-of-range markers dropped and logged. Claude occasionally
@@ -176,18 +176,18 @@ def _retrieve(
     *,
     store: VectorStore,
     retriever_config: RetrieverConfig,
-    pipeline_tag: str,
+    chunk_set_id: str,
     query: str,
     query_embedding: list[float],
 ) -> list[RetrievedChunk]:
     """Retrieve chunks closely related to the query."""
     _validate_retriever_config(retriever_config)
     if retriever_config.kind == "dense":
-        return store.dense_search(pipeline_tag, query_embedding, k=retriever_config.top_k)
+        return store.dense_search(chunk_set_id, query_embedding, k=retriever_config.top_k)
 
     assert retriever_config.rrf_k is not None
     return store.hybrid_search(
-        pipeline_tag,
+        chunk_set_id,
         query_embedding,
         query_text=query,
         k=retriever_config.top_k,
@@ -219,7 +219,7 @@ def answer_question(
     embedder: VoyageEmbedder,
     store: VectorStore,
     generator: ClaudeGenerator,
-    pipeline_tag: str,
+    chunk_set_id: str,
     retriever: RetrieverConfig,
     reranker: CohereReranker | None = None,
     reranker_config: RerankerConfig | None = None,
@@ -266,7 +266,7 @@ def answer_question(
     retrieved = _retrieve(
         store=store,
         retriever_config=retriever,
-        pipeline_tag=pipeline_tag,
+        chunk_set_id=chunk_set_id,
         query=query,
         query_embedding=query_embedding,
     )
@@ -274,13 +274,13 @@ def answer_question(
     if not retrieved:
         # Empty retrieval → the prompt would have Claude respond with the
         # sentinel anyway; skipping the call saves the token spend and keeps
-        # cost accounting clean for the degenerate case (wrong pipeline_tag,
+        # cost accounting clean for the degenerate case (wrong chunk_set_id,
         # empty DB, over-filtering). Reranker is also skipped — no candidates
         # to re-order means no reason to spend.
         _logger.info(
             "empty_retrieval",
             query=query,
-            pipeline_tag=pipeline_tag,
+            chunk_set_id=chunk_set_id,
             retriever_kind=retriever.kind,
             top_k=retriever.top_k,
         )

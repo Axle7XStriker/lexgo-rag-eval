@@ -109,7 +109,7 @@ def _run_one(
     store: VectorStore,
     generator: ClaudeGenerator,
     judge: ClaudeJudge,
-    pipeline_tag: str,
+    chunk_set_id: str,
     retriever: RetrieverConfig,
     reranker: CohereReranker | None,
     reranker_config: RerankerConfig | None,
@@ -133,7 +133,7 @@ def _run_one(
             embedder=embedder,
             store=store,
             generator=generator,
-            pipeline_tag=pipeline_tag,
+            chunk_set_id=chunk_set_id,
             retriever=retriever,
             reranker=reranker,
             reranker_config=reranker_config,
@@ -348,6 +348,7 @@ def _write_summary_md(
     lines.append(f"# Eval run — {manifest['run_id']}")
     lines.append("")
     lines.append(f"- pipeline: `{pipeline_cfg['tag']}` (key `{pipeline_cfg['key']}`)")
+    lines.append(f"- chunk_set_id: `{pipeline_cfg['chunk_set_id']}`")
     lines.append(f"- git_sha: `{manifest['git_sha']}`")
     lines.append(
         f"- prompt versions: answer=`{manifest['prompt_versions']['answer']}`, "
@@ -496,6 +497,7 @@ def main() -> int:
         run_id=run_id,
         pipeline=cfg.tag,
         pipeline_key=cfg.key,
+        chunk_set_id=cfg.chunk_set_id,
         n_records=len(records),
         qa_path=str(args.qa_path),
     )
@@ -542,7 +544,7 @@ def main() -> int:
                 store=store,
                 generator=generator,
                 judge=judge,
-                pipeline_tag=cfg.tag,
+                chunk_set_id=cfg.chunk_set_id,
                 retriever=cfg.retriever,
                 reranker=reranker,
                 reranker_config=cfg.reranker,
@@ -591,14 +593,12 @@ def main() -> int:
             "judge": JUDGE_PROMPT_VERSION,
         },
         # `config.pipeline` = full PipelineConfig (chunker/retriever/reranker
-        # knobs + derived tag) so the artifact is self-describing. The tag
-        # is intentionally NOT duplicated at the top level — one source of
-        # truth (`config.pipeline.tag`) keeps a future refactor from
-        # silently letting the two copies disagree. Downstream consumers
-        # should read from `config.pipeline.tag`.
+        # knobs + derived tag and chunk_set_id) so the artifact records both
+        # pipeline identity and the physical retrieval set. These identifiers
+        # are intentionally NOT duplicated outside `config.pipeline`.
         # `config.models` = provider identities held constant across pipelines
         # (chat, judge, embedding) — kept separate because they're not part of
-        # the pipeline's identity (a change here doesn't warrant a new DB tag,
+        # the pipeline's identity (a change here doesn't warrant a new pipeline tag,
         # but it DOES belong in the manifest for reproducibility).
         "config": {
             "pipeline": pipeline_to_manifest_dict(cfg),
