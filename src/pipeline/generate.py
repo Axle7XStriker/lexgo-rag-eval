@@ -7,18 +7,15 @@ Design notes worth remembering:
     client, `SecretStr` key, `tenacity` retries on transient exceptions only,
     fail-fast on unknown model in `__init__`, exactly one `log_llm_call` per
     API call, dependency-injection seam via `client=` for tests.
-  - Shared with `ClaudeJudge`: `is_retryable`, `cost_for`, `PRICING`,
-    `PROVIDER`, and `DEFAULT_TEMPERATURE` live in
-    `src.pipeline.anthropic_utils` so a change there (new retryable
-    exception, price adjustment) is a one-file edit.
-  - `temperature=0.0` by default: P1 baseline is a scientific eval — outputs
-    must be reproducible across runs so the accuracy delta between P1..P4 is
-    signal, not noise. Sonnet 4.6 still accepts `temperature` (removed on
-    Opus 5 / Sonnet 5 / 4.7+); we pass it explicitly.
-  - No `thinking` param: adaptive thinking is a P4 concern at best. The
-    baseline generator represents the minimal simple usage.
-  - Prompt prefill is NOT supported on Sonnet 4.6 (400 error); we never
-    prefill the assistant turn.
+  - Shared with `ClaudeJudge`: `is_retryable`, `cost_for`, `PRICING`, and
+    `PROVIDER` live in `src.pipeline.anthropic_utils` so a change there
+    (new retryable exception, price adjustment) is a one-file edit.
+  - Thinking is disabled. Haiku 5.5 turns adaptive thinking on by default
+    and those tokens count toward `max_tokens`; leaving it on can consume
+    the 1024-token answer budget before any text is returned.
+  - Sampling parameters are omitted. Haiku 5.5 returns 400 if `temperature`,
+    `top_p`, or `top_k` is sent.
+  - Prompt prefill is not used. Haiku 5.5 rejects a trailing assistant turn.
 """
 
 from __future__ import annotations
@@ -38,7 +35,6 @@ from tenacity import (
 
 from src.observability import log_llm_call
 from src.pipeline.anthropic_utils import (
-    DEFAULT_TEMPERATURE,
     PRICING,
     PROVIDER,
     cost_for,
@@ -97,7 +93,6 @@ class ClaudeGenerator:
         user: str,
         prompt_version: str,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        temperature: float = DEFAULT_TEMPERATURE,
         run_id: str | None = None,
     ) -> GenerateResult:
         """One Anthropic messages.create call. Wraps _call for tenacity retries."""
@@ -106,7 +101,6 @@ class ClaudeGenerator:
             user=user,
             prompt_version=prompt_version,
             max_tokens=max_tokens,
-            temperature=temperature,
             run_id=run_id,
         )
 
@@ -123,7 +117,6 @@ class ClaudeGenerator:
         user: str,
         prompt_version: str,
         max_tokens: int,
-        temperature: float,
         run_id: str | None,
     ) -> GenerateResult:
         """One API call. Wrapped in tenacity — do not call directly from tests."""
@@ -131,16 +124,15 @@ class ClaudeGenerator:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=max_tokens,
-            temperature=temperature,
+            thinking={"type": "disabled"},
             system=system,
             messages=[{"role": "user", "content": user}],
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
 
-        # Concatenate every text block. In practice Sonnet returns a single
-        # text block, but joining is safer than indexing content[0] — if a
-        # future model tier splits the answer into multiple blocks (or wraps
-        # a summarized `thinking` block first), we still capture the answer.
+        # Concatenate every text block. Joining is safer than indexing
+        # content[0]: a split answer, or a thinking block ahead of the text,
+        # still leaves us with the reply.
         text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
         text = "".join(text_parts)
 
@@ -161,7 +153,7 @@ class ClaudeGenerator:
             prompt_version=prompt_version,
             extra={
                 "max_tokens": max_tokens,
-                "temperature": temperature,
+                "thinking": "disabled",
                 # stop_reason is load-bearing for debugging refusal / max_tokens
                 # truncation — cheap to record, expensive to reconstruct later.
                 "stop_reason": getattr(response, "stop_reason", None),

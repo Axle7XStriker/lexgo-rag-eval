@@ -180,7 +180,6 @@ class _FakeGenerator:
         user: str,
         prompt_version: str,
         max_tokens: int = 1024,
-        temperature: float = 0.0,
         run_id: str | None = None,
     ) -> GenerateResult:
         self.calls.append(

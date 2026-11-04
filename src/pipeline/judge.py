@@ -16,8 +16,9 @@ Design notes worth remembering:
     JSON, missing key, wrong type). The eval loop catches this and skips
     the Q&A rather than silently marking it incorrect — a broken judge
     reply is a signal to iterate on the prompt, not an accuracy datapoint.
-  - `temperature=0.0` for the same reproducibility reason as the generator:
-    the accuracy delta P1 → P4 must be signal, not judge noise.
+  - Thinking is disabled and sampling parameters are omitted, same as the
+    generator: Haiku 5.5 rejects `temperature` and would otherwise spend
+    `max_tokens` on adaptive thinking before the JSON verdict.
 """
 
 from __future__ import annotations
@@ -39,7 +40,6 @@ from tenacity import (
 
 from src.observability import log_llm_call
 from src.pipeline.anthropic_utils import (
-    DEFAULT_TEMPERATURE,
     PRICING,
     PROVIDER,
     cost_for,
@@ -198,7 +198,6 @@ class ClaudeJudge:
         model_citation_doc_paths: list[str],
         prompt_version: str = PROMPT_VERSION,
         max_tokens: int = DEFAULT_MAX_TOKENS,
-        temperature: float = DEFAULT_TEMPERATURE,
         run_id: str | None = None,
     ) -> JudgeResult:
         """One Anthropic messages.create call → parsed verdict.
@@ -226,7 +225,6 @@ class ClaudeJudge:
             user=user_text,
             prompt_version=prompt_version,
             max_tokens=max_tokens,
-            temperature=temperature,
             run_id=run_id,
         )
 
@@ -243,7 +241,6 @@ class ClaudeJudge:
         user: str,
         prompt_version: str,
         max_tokens: int,
-        temperature: float,
         run_id: str | None,
     ) -> JudgeResult:
         """One API call. Wrapped in tenacity — do not call directly from tests."""
@@ -251,7 +248,7 @@ class ClaudeJudge:
         response = self._client.messages.create(
             model=self._model,
             max_tokens=max_tokens,
-            temperature=temperature,
+            thinking={"type": "disabled"},
             system=system,
             messages=[{"role": "user", "content": user}],
         )
@@ -278,7 +275,7 @@ class ClaudeJudge:
             prompt_version=prompt_version,
             extra={
                 "max_tokens": max_tokens,
-                "temperature": temperature,
+                "thinking": "disabled",
                 # stop_reason is load-bearing for debugging refusal / max_tokens
                 # truncation — cheap to record, expensive to reconstruct later.
                 "stop_reason": getattr(response, "stop_reason", None),

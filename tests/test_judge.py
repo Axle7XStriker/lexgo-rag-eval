@@ -80,7 +80,7 @@ def _make_judge(
     *,
     client: FakeClient,
     log_path: Path,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-haiku-5-5",
 ) -> ClaudeJudge:
     return ClaudeJudge(
         api_key=SecretStr("test-key"),
@@ -154,7 +154,7 @@ class TestHappyPath:
         assert r.rationale == "cited unrelated docs"
         assert r.input_tokens == 180
         assert r.output_tokens == 25
-        assert r.cost_usd == pytest.approx(cost_for("claude-sonnet-4-6", 180, 25))
+        assert r.cost_usd == pytest.approx(cost_for("claude-haiku-5-5", 180, 25))
 
     def test_handles_surrounding_whitespace(self, log_path: Path) -> None:
         """Leading/trailing whitespace in the reply is stripped before json.loads."""
@@ -199,11 +199,10 @@ class TestHappyPath:
         )
         assert len(client.messages.calls) == 1
         call = client.messages.calls[0]
-        assert call["model"] == "claude-sonnet-4-6"
-        # Reproducibility defaults: temperature 0.0 for deterministic verdicts;
-        # max_tokens 1024 (headroom for a verbose rationale + JSON envelope so
-        # a borderline Q&A doesn't truncate into a silent JudgeParseError).
-        assert call["temperature"] == 0.0
+        assert call["model"] == "claude-haiku-5-5"
+        # Max_tokens 1024 leaves headroom for a verbose rationale + JSON
+        # envelope so a borderline Q&A doesn't truncate into JudgeParseError.
+        assert call["thinking"] == {"type": "disabled"}
         assert call["max_tokens"] == 1024
         # Sentinel substituted from the code constant, not a raw literal.
         assert OUT_OF_CORPUS_SENTINEL in call["system"]
@@ -368,14 +367,15 @@ class TestLogging:
         assert len(recs) == 1
         r = recs[0]
         assert r["provider"] == "anthropic"
-        assert r["model"] == "claude-sonnet-4-6"
+        assert r["model"] == "claude-haiku-5-5"
         assert r["operation"] == "judge_answer"
         assert r["input_tokens"] == 222
         assert r["output_tokens"] == 44
         assert r["prompt_version"] == "v1"
         assert r["run_id"] == "run_test_xyz"
+        assert r["thinking"] == "disabled"
         assert r["stop_reason"] == "end_turn"
-        assert r["cost_usd"] == pytest.approx(cost_for("claude-sonnet-4-6", 222, 44), abs=1e-6)
+        assert r["cost_usd"] == pytest.approx(cost_for("claude-haiku-5-5", 222, 44), abs=1e-6)
 
     def test_exactly_one_log_per_call(self, log_path: Path) -> None:
         """Even after multiple judge() calls, count == calls (no double logging)."""

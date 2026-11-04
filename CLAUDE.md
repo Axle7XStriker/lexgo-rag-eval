@@ -121,7 +121,7 @@ Each Q&A: **question**, **gold answer** (2-4 sentences), **gold citation** (sour
 
 ## Definition of accuracy
 
-LLM-as-judge using Claude Sonnet. Given (question, gold answer, gold citations, model answer, model citations) → binary correct/incorrect per Q&A. Reported as % correct.
+LLM-as-judge using Claude Haiku. Given (question, gold answer, gold citations, model answer, model citations) → binary correct/incorrect per Q&A. Reported as % correct.
 
 ---
 
@@ -129,8 +129,8 @@ LLM-as-judge using Claude Sonnet. Given (question, gold answer, gold citations, 
 
 - **Python 3.12** — `uv` for env + package management
 - **Embeddings:** Voyage `voyage-3-large`
-- **Chat model:** Anthropic Claude Sonnet 4.6
-- **Judge model:** Claude Sonnet 4.6 (same model, different prompt)
+- **Chat model:** Anthropic Claude Haiku 5.5
+- **Judge model:** Claude Haiku 5.5 (same model, different prompt)
 - **Vector store:** Postgres + pgvector
 - **Full-text search:** Postgres FTS (for BM25-alike in hybrid)
 - **Reranker:** Cohere Rerank 3

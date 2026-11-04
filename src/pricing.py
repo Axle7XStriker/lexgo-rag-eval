@@ -24,6 +24,9 @@ VOYAGE_PRICING: dict[str, float] = {
 }
 
 ANTHROPIC_PRICING: dict[str, dict[str, float]] = {
+    # claude-haiku-5-5: $0.10 input / $0.50 output per 1M tokens.
+    "claude-haiku-5-5": {"input": 0.10, "output": 0.50},
+    # claude-sonnet-4-6: $3 input / $15 output per 1M tokens.
     "claude-sonnet-4-6": {"input": 3.0, "output": 15.0},
 }
 

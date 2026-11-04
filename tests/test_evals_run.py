@@ -130,7 +130,6 @@ class _FakeGenerator:
         user: str,
         prompt_version: str,
         max_tokens: int = 1024,
-        temperature: float = 0.0,
         run_id: str | None = None,
     ) -> GenerateResult:
         # Match on question substring embedded in the user body (Q: ...).
@@ -292,8 +291,8 @@ def _make_settings_stub(tmp_path: Path):
         voyage_api_key: object = None
         cohere_api_key: object = None
         database_url: str = "postgresql://unused"
-        chat_model: str = "claude-sonnet-4-6"
-        judge_model: str = "claude-sonnet-4-6"
+        chat_model: str = "claude-haiku-5-5"
+        judge_model: str = "claude-haiku-5-5"
         embedding_model: str = "voyage-3-large"
         log_level: str = "INFO"
         log_dir: Path = tmp_path / "logs"
@@ -420,7 +419,7 @@ class TestMainHappyPath:
         assert pipeline_cfg["retriever"]["top_k"] == TEST_PIPELINE_CFG.retriever.top_k
         assert pipeline_cfg["reranker"] is None
         # Provider identities kept separately — not part of pipeline identity.
-        assert manifest["config"]["models"]["chat_model"] == "claude-sonnet-4-6"
+        assert manifest["config"]["models"]["chat_model"] == "claude-haiku-5-5"
         assert manifest["golden_set"]["n_records_loaded"] == 5
         assert manifest["totals"]["n_evaluated"] == 5
         assert manifest["totals"]["n_skipped"] == 0

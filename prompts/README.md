@@ -26,7 +26,7 @@ Each prompt starts with YAML front-matter capturing intent + provenance:
 ---
 name: answer
 version: 1
-model: claude-sonnet-4-6
+model: claude-haiku-5-5
 purpose: >
   Given a question and retrieved chunks, produce a grounded answer with
   inline citations. Held constant across all 4 retrieval pipelines — the

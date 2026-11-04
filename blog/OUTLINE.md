@@ -83,7 +83,7 @@
 
 **Job:** close the "how do I know you're not cooking the numbers" loop.
 
-- LLM-as-judge with Claude Sonnet. Fixed prompt, versioned in the repo.
+- LLM-as-judge with Claude Haiku. Fixed prompt, versioned in the repo.
 - Judge gets: question, gold answer, gold citations, model answer, model citations → binary correct/incorrect.
 - Why binary (not 1–5): rubric drift is the enemy of run-to-run comparability.
 - What I did to check the judge: [spot-check N Q&As manually, report agreement rate].

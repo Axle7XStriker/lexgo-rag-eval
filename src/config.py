@@ -31,8 +31,8 @@ class Settings(BaseSettings):
     )
 
     # TODO(#2): verify these IDs against the provider SDKs at first API call.
-    chat_model: str = "claude-sonnet-4-6"
-    judge_model: str = "claude-sonnet-4-6"
+    chat_model: str = "claude-haiku-5-5"
+    judge_model: str = "claude-haiku-5-5"
     embedding_model: str = "voyage-3-large"
     # Rerank model is NOT in Settings — it varies per pipeline and is owned
     # by `src.pipeline.pipeline_config.PIPELINES[...].reranker.model`, so

@@ -37,6 +37,12 @@ class TestVoyagePricing:
 
 class TestAnthropicPricing:
     def test_known_model_input_and_output(self) -> None:
+        # claude-haiku-5-5: $0.10 input / $0.50 output per 1M tokens
+        assert anthropic_cost("claude-haiku-5-5", 1_000_000, 0) == pytest.approx(0.10)
+        assert anthropic_cost("claude-haiku-5-5", 0, 1_000_000) == pytest.approx(0.50)
+        assert anthropic_cost("claude-haiku-5-5", 1_000_000, 1_000_000) == pytest.approx(0.60)
+
+    def test_sonnet_input_and_output(self) -> None:
         # claude-sonnet-4-6: $3 input / $15 output per 1M tokens
         assert anthropic_cost("claude-sonnet-4-6", 1_000_000, 0) == pytest.approx(3.0)
         assert anthropic_cost("claude-sonnet-4-6", 0, 1_000_000) == pytest.approx(15.0)
@@ -46,6 +52,7 @@ class TestAnthropicPricing:
         assert anthropic_cost("claude-made-up", 100, 100) is None
 
     def test_dict_entry_present(self) -> None:
+        assert "claude-haiku-5-5" in ANTHROPIC_PRICING
         assert "claude-sonnet-4-6" in ANTHROPIC_PRICING
 
 

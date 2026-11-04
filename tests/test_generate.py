@@ -48,7 +48,7 @@ def _make_generator(
     *,
     client: FakeClient,
     log_path: Path,
-    model: str = "claude-sonnet-4-6",
+    model: str = "claude-haiku-5-5",
 ) -> ClaudeGenerator:
     return ClaudeGenerator(
         api_key=SecretStr("test-key"),
@@ -80,10 +80,10 @@ class TestHappyPath:
         assert result.output_tokens == 8
         # Cost derived from PRICING via cost_for so a price change here needs
         # no test update — the source of truth is src/pricing.py.
-        assert result.cost_usd == pytest.approx(cost_for("claude-sonnet-4-6", 120, 8))
+        assert result.cost_usd == pytest.approx(cost_for("claude-haiku-5-5", 120, 8))
 
     def test_forwards_request_shape(self, log_path: Path) -> None:
-        """generate() forwards model, system, max_tokens, temperature, and messages to the SDK."""
+        """generate() forwards model, system, max_tokens, thinking, and messages to the SDK."""
         client = FakeClient()
         g = _make_generator(client=client, log_path=log_path)
         g.generate(
@@ -91,14 +91,13 @@ class TestHappyPath:
             user="USER BODY",
             prompt_version="v1",
             max_tokens=512,
-            temperature=0.2,
         )
         assert len(client.messages.calls) == 1
         call = client.messages.calls[0]
-        assert call["model"] == "claude-sonnet-4-6"
+        assert call["model"] == "claude-haiku-5-5"
         assert call["system"] == "SYS BODY"
         assert call["max_tokens"] == 512
-        assert call["temperature"] == 0.2
+        assert call["thinking"] == {"type": "disabled"}
         assert call["messages"] == [{"role": "user", "content": "USER BODY"}]
 
     def test_multiple_text_blocks_are_joined(self, log_path: Path) -> None:
@@ -137,15 +136,16 @@ class TestLogging:
         assert len(recs) == 1
         r = recs[0]
         assert r["provider"] == "anthropic"
-        assert r["model"] == "claude-sonnet-4-6"
+        assert r["model"] == "claude-haiku-5-5"
         assert r["operation"] == "generate_answer"
         assert r["input_tokens"] == 200
         assert r["output_tokens"] == 50
         assert r["prompt_version"] == "v1"
         assert r["run_id"] == "run_test_xyz"
         assert r["max_tokens"] == 256
+        assert r["thinking"] == "disabled"
         assert r["stop_reason"] == "end_turn"
-        assert r["cost_usd"] == pytest.approx(cost_for("claude-sonnet-4-6", 200, 50), abs=1e-6)
+        assert r["cost_usd"] == pytest.approx(cost_for("claude-haiku-5-5", 200, 50), abs=1e-6)
 
     def test_no_log_on_failure(self, log_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         """Exceptions during .create() must NOT write a log line — else cost accounting corrupts."""
@@ -280,15 +280,16 @@ class TestValidation:
 class TestPricing:
     """Cost table stays honest; missing model degrades gracefully."""
 
-    def test_sonnet_present(self) -> None:
+    def test_haiku_present(self) -> None:
         """The currently-used chat model is in PRICING with non-zero input+output rates."""
-        assert "claude-sonnet-4-6" in PRICING
-        assert PRICING["claude-sonnet-4-6"]["input"] > 0
-        assert PRICING["claude-sonnet-4-6"]["output"] > 0
+        assert "claude-haiku-5-5" in PRICING
+        assert PRICING["claude-haiku-5-5"]["input"] > 0
+        assert PRICING["claude-haiku-5-5"]["output"] > 0
 
     def test_output_more_expensive_than_input(self) -> None:
         """Sanity: output rate > input rate for every Claude tier (catches an accidental swap)."""
-        assert PRICING["claude-sonnet-4-6"]["output"] > PRICING["claude-sonnet-4-6"]["input"]
+        for rates in PRICING.values():
+            assert rates["output"] > rates["input"]
 
     def test_unknown_model_zero_cost(self) -> None:
         """Unknown model returns 0.0 cost (and logs a warning), rather than raising."""
@@ -296,9 +297,9 @@ class TestPricing:
 
     def test_cost_calc(self) -> None:
         """1M input + 1M output = (input_rate + output_rate) USD; expected derived from PRICING."""
-        rates = PRICING["claude-sonnet-4-6"]
+        rates = PRICING["claude-haiku-5-5"]
         expected = rates["input"] + rates["output"]
-        assert cost_for("claude-sonnet-4-6", 1_000_000, 1_000_000) == pytest.approx(expected)
+        assert cost_for("claude-haiku-5-5", 1_000_000, 1_000_000) == pytest.approx(expected)
 
 
 class TestRetryablePredicate:
