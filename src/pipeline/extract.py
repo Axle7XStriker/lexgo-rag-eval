@@ -55,6 +55,13 @@ class ExtractedDoc:
     content_hash: str
 
 
+def _strip_null(text: str) -> str:
+    """Drop `0x00`. Postgres text and tsvector reject it; PyMuPDF sometimes emits it."""
+    if "\x00" not in text:
+        return text
+    return text.replace("\x00", "")
+
+
 def extract_pdf(path: Path) -> ExtractedDoc:
     """Extract text from `path` and return an `ExtractedDoc`.
 
@@ -87,7 +94,8 @@ def extract_pdf(path: Path) -> ExtractedDoc:
             # get_text("text") returns the layout-flow text — good enough for
             # OCW lecture PDFs and papers. Alternatives ("blocks", "words",
             # "dict") are richer but noisier for downstream chunking.
-            text = page.get_text("text")
+            # Strip NULL before the blank check.
+            text = _strip_null(page.get_text("text"))
             pages.append(PageText(page_number=i + 1, text=text))
 
         # Reject only when EVERY page is whitespace-only — a doc with a blank
@@ -98,7 +106,7 @@ def extract_pdf(path: Path) -> ExtractedDoc:
         # Metadata title falls back to None so downstream doesn't have to
         # sniff empty strings.
         raw_title = (doc.metadata or {}).get("title") or None
-        title = raw_title.strip() if raw_title else None
+        title = _strip_null(raw_title).strip() if raw_title else None
         title = title or None  # empty-after-strip → None
 
         content_hash = sha256_utf8(join_pages([p.text for p in pages]))

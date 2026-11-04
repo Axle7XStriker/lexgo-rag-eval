@@ -3,7 +3,7 @@
 Fully offline — every fixture PDF is synthesized in-memory via PyMuPDF (see
 `tests/_pdf_fixtures.py`) so the test suite carries no binary blobs. Covers:
 page count / order, whitespace-only pages preserved, content_hash stability +
-sensitivity, and the four failure modes `extract_pdf` must raise on.
+sensitivity, NULL stripping, and the failure modes `extract_pdf` must raise on.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ class TestExtractHappyPath:
 
     def test_three_page_extract(self, tmp_path: Path) -> None:
         path = tmp_path / "doc.pdf"
-        write_pdf(path, ["Page one text.", "Page two text.", "Page three text."])
+        write_pdf(path, ["Page one text\x00.", "Page two text.", "Page three text."])
         doc = extract_pdf(path)
         assert isinstance(doc, ExtractedDoc)
         assert doc.num_pages == 3
@@ -51,7 +51,7 @@ class TestExtractHappyPath:
     def test_whitespace_only_page_preserves_page_number(self, tmp_path: Path) -> None:
         # Middle page blank — page numbers must remain 1/2/3, not collapse to 1/2.
         path = tmp_path / "gap.pdf"
-        write_pdf(path, ["First.", "", "Third."])
+        write_pdf(path, ["First.", "\x00", "Third."])
         doc = extract_pdf(path)
         assert [p.page_number for p in doc.pages] == [1, 2, 3]
         assert doc.pages[1].text.strip() == ""
@@ -87,5 +87,11 @@ class TestExtractFailureModes:
     def test_all_blank_pages_raises_valueerror(self, tmp_path: Path) -> None:
         path = tmp_path / "blank.pdf"
         write_pdf(path, ["", "", ""])
+        with pytest.raises(ValueError):
+            extract_pdf(path)
+
+    def test_null_only_document_raises_valueerror(self, tmp_path: Path) -> None:
+        path = tmp_path / "nulls.pdf"
+        write_pdf(path, ["\x00\x00"])
         with pytest.raises(ValueError):
             extract_pdf(path)
