@@ -30,6 +30,7 @@ from typing import Self
 
 import psycopg
 from pgvector.psycopg import register_vector
+from psycopg.pq import TransactionStatus
 
 from src.db import __file__ as _db_pkg_file
 
@@ -187,6 +188,22 @@ class VectorStore:
         self._conn: psycopg.Connection | None = None
 
     def __enter__(self) -> Self:
+        self.connect()
+        return self
+
+    def connect(self) -> None:
+        """Open a connection and register pgvector on it.
+
+        No-op when the current connection can run a statement. A missing or
+        closed socket is replaced. Deadlock and statement cancel abort the
+        transaction and leave the socket open, so that transaction is rolled
+        back before the same connection is reused.
+        """
+        if self._conn is not None and not self._conn.closed:
+            if self._conn.info.transaction_status == TransactionStatus.INERROR:
+                self._rollback_if_alive()
+            if self._conn is not None and not self._conn.closed:
+                return
         # Short connect_timeout so a down DB fails fast — otherwise the eval
         # loop and the Streamlit worker thread sit on the socket forever.
         self._conn = psycopg.connect(self._dsn, autocommit=False, connect_timeout=5)
@@ -198,7 +215,14 @@ class VectorStore:
             cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
         self._conn.commit()
         register_vector(self._conn)
-        return self
+
+    def _rollback_if_alive(self) -> None:
+        if self._conn is None or self._conn.closed:
+            return
+        try:
+            self._conn.rollback()
+        except psycopg.OperationalError:
+            return
 
     def __exit__(
         self,
@@ -208,9 +232,9 @@ class VectorStore:
         _exc: BaseException | None,
         _tb: TracebackType | None,
     ) -> None:
-        if self._conn is not None:
+        if self._conn is not None and not self._conn.closed:
             self._conn.close()
-            self._conn = None
+        self._conn = None
 
     @property
     def conn(self) -> psycopg.Connection:
@@ -349,15 +373,33 @@ class VectorStore:
         Also purges any orphan chunks with `chunk_index` past the current
         batch's length — the ON CONFLICT UPDATE in `upsert_chunks` alone
         would leave those stranded when a re-ingest produces fewer chunks.
+
+        If the connection was dropped, open a new one and repeat the whole write.
+        The first attempt did not commit, so the retry is safe and does not re-embed.
         """
+        try:
+            return self._write_document_chunks(doc, chunks, chunk_set_id=chunk_set_id)
+        except psycopg.OperationalError:
+            self.connect()
+            return self._write_document_chunks(doc, chunks, chunk_set_id=chunk_set_id)
+
+    def _write_document_chunks(
+        self,
+        doc: DocumentRow,
+        chunks: list[ChunkRow],
+        *,
+        chunk_set_id: str,
+    ) -> int:
         try:
             document_id = self.upsert_document(doc)
             self.delete_chunks(document_id, chunk_set_id)
             self.upsert_chunks(document_id, chunks)
             self.conn.commit()
             return document_id
+        except psycopg.OperationalError:
+            raise
         except Exception:
-            self.conn.rollback()
+            self._rollback_if_alive()
             raise
 
     # ── Retrieval ─────────────────────────────────────────────────────

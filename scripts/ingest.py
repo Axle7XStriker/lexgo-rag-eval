@@ -133,6 +133,22 @@ def _write_run_log(path: Path, results: list[DocResult]) -> None:
             )
 
 
+def _fetch_existing_retrying(
+    store: VectorStore, doc_path: str, chunk_set_id: str
+) -> tuple[str, bool] | None:
+    """`_fetch_existing`, opening a new connection if Neon has dropped the socket.
+
+    The retry runs the same SELECT. A second `OperationalError` propagates
+    so the caller can record a doc-level error without calling `rollback()`
+    on a connection that is already gone.
+    """
+    try:
+        return _fetch_existing(store, doc_path, chunk_set_id)
+    except psycopg.OperationalError:
+        store.connect()
+        return _fetch_existing(store, doc_path, chunk_set_id)
+
+
 def _fetch_existing(
     store: VectorStore, doc_path: str, chunk_set_id: str
 ) -> tuple[str, bool] | None:
@@ -158,6 +174,7 @@ def _fetch_existing(
             (chunk_set_id, doc_path),
         )
         row = cur.fetchone()
+    store.conn.commit()
     if row is None:
         return None
     return row[0], bool(row[1])
@@ -268,13 +285,13 @@ def _process_entry(
     # every doc — the two pipelines share one chunk set by design.
     if store is not None:
         try:
-            existing = _fetch_existing(store, entry.dest_path, chunk_set_id)
+            existing = _fetch_existing_retrying(store, entry.dest_path, chunk_set_id)
         except psycopg.Error as e:
-            # A failed SELECT poisons the connection until rolled back —
-            # otherwise every subsequent doc's SELECT fails with
-            # `current transaction is aborted`. Rollback + surface as a
-            # doc-level error and continue.
-            store.conn.rollback()
+            # A failed SELECT on a live connection poisons the transaction
+            # until rolled back — otherwise every subsequent doc's SELECT
+            # fails with `current transaction is aborted`. A dropped socket
+            # cannot be rolled back; leave it and surface the doc error.
+            store._rollback_if_alive()
             result.status = "error"
             result.error = f"idempotency lookup failed: {type(e).__name__}: {e}"
             result.elapsed_ms = (time.perf_counter() - started) * 1000
