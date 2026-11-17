@@ -49,11 +49,19 @@ DEFAULT_K = 5
 
 _PAGE = re.compile(r"^\d+$")
 _RANGE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
+# Widest gold range in qa.jsonl is 22 pages (526-547). A wider token is kept
+# as text so a typo cannot allocate a huge page list.
+_MAX_RANGE_PAGES = 40
 
 
 @dataclass(frozen=True)
 class PageSpan:
-    """Inclusive page range on one document. A single page has equal ends."""
+    """Inclusive page range on one document.
+
+    `page_start` and `page_end` are 1-based PDF page indexes, the same numbers
+    as `PageText.page_number` and a PDF viewer. They are not the printed folio
+    in the page footer. A single page has equal ends.
+    """
 
     doc_path: str
     page_start: int
@@ -72,33 +80,54 @@ class GoldPage:
     spec: str = ""
 
 
-def parse_page_spec(spec: str) -> list[int]:
-    """Expand `4`, `4,5`, and `53-54` into page numbers. Other text yields []."""
+def parse_page_spec(spec: str) -> tuple[list[int], list[str]]:
+    """Split a page spec into PDF page numbers and unparsed tokens.
+
+    `4`, `4,5`, and `53-54` become page numbers. A comma piece that is not a
+    page stays in the second list, including `slide 12` inside `53, slide 12`.
+    Page 0, a reversed range, and a range wider than `_MAX_RANGE_PAGES` stay
+    unparsed too. The function does not raise on those tokens.
+    """
     pages: list[int] = []
+    unparsed: list[str] = []
     for part in spec.split(","):
         token = part.strip()
+        if not token:
+            continue
         if _PAGE.fullmatch(token):
-            pages.append(int(token))
+            number = int(token)
+            if number >= 1:
+                pages.append(number)
+            else:
+                unparsed.append(token)
             continue
         match = _RANGE.fullmatch(token)
         if match is None:
+            unparsed.append(token)
             continue
         start, end = int(match.group(1)), int(match.group(2))
-        if start > end:
-            start, end = end, start
+        width = end - start + 1
+        if start < 1 or start > end or width > _MAX_RANGE_PAGES:
+            unparsed.append(token)
+            continue
         pages.extend(range(start, end + 1))
-    return pages
+    return pages, unparsed
 
 
 def gold_pages(citations: list[tuple[str, str]]) -> set[GoldPage]:
-    """Distinct gold pages from `(doc_path, page_or_section)` pairs."""
+    """Distinct gold pages from `(doc_path, page_or_section)` pairs.
+
+    Parsed pages and unparsed tokens from the same spec both count. An
+    unparsed token stays in the recall denominator and is never covered.
+    """
     found: set[GoldPage] = set()
     for doc_path, spec in citations:
-        pages = parse_page_spec(spec)
-        if not pages:
+        pages, unparsed = parse_page_spec(spec)
+        if not pages and not unparsed:
             found.add(GoldPage(doc_path, None, spec))
             continue
         found.update(GoldPage(doc_path, page) for page in pages)
+        found.update(GoldPage(doc_path, None, token) for token in unparsed)
     return found
 
 
@@ -136,9 +165,8 @@ class QAResult:
     # Always defined — see `citation_precision_programmatic` docstring for
     # how the four (empty/non-empty × model/gold) combinations map to a value.
     citation_precision_programmatic: float
-    # `float | None` — `None` iff out-of-corpus (no gold docs, so no
-    # retrieval ground truth to score against). Skipped records also carry
-    # None here (populated by the eval loop's error path).
+    # `None` when there is no gold page to score, and on the pipeline-failure
+    # path. The aggregator skips `None`.
     recall_at_5: float | None
     judge_answer_correct: bool | None
     judge_citations_semantically_valid: bool | None
@@ -155,6 +183,10 @@ class QAResult:
     # (and legacy results.jsonl rows) parse without rewrite.
     rerank_cost_usd: float = 0.0
     error: str | None = None
+    # Page ranges that produced the page-level scores. Empty when the
+    # pipeline failed before retrieval. Same coordinate system as `PageSpan`.
+    model_citation_spans: tuple[PageSpan, ...] = ()
+    retrieved_page_spans_top10: tuple[PageSpan, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -369,6 +401,14 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
 # ── Serialization helpers ─────────────────────────────────────────────
 
 
+def _span_dict(span: PageSpan) -> dict[str, Any]:
+    return {
+        "doc_path": span.doc_path,
+        "page_start": span.page_start,
+        "page_end": span.page_end,
+    }
+
+
 def qaresult_to_dict(r: QAResult) -> dict[str, Any]:
     """Serialize a `QAResult` to a JSON-safe dict. QAType stored as its str value."""
     return {
@@ -379,7 +419,9 @@ def qaresult_to_dict(r: QAResult) -> dict[str, Any]:
         "gold_citation_doc_paths": r.gold_citation_doc_paths,
         "model_answer": r.model_answer,
         "model_citation_doc_paths": r.model_citation_doc_paths,
+        "model_citation_spans": [_span_dict(span) for span in r.model_citation_spans],
         "retrieved_doc_paths_top10": r.retrieved_doc_paths_top10,
+        "retrieved_page_spans_top10": [_span_dict(span) for span in r.retrieved_page_spans_top10],
         "citation_precision_programmatic": r.citation_precision_programmatic,
         "recall_at_5": r.recall_at_5,
         "judge_answer_correct": r.judge_answer_correct,

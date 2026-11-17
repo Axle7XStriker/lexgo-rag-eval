@@ -16,6 +16,7 @@ from evals.metrics import (
     aggregate,
     citation_precision_programmatic,
     gold_pages,
+    parse_page_spec,
     recall_at_k,
 )
 from src.qa_schema import QAType
@@ -133,6 +134,16 @@ class TestRecallAtK:
     def test_unparsed_spec_stays_a_miss(self) -> None:
         r = recall_at_k([_span("a", 12)], _gold(("a", "slide 12"), ("a", "12")))
         assert r == 0.5
+
+    def test_mixed_spec_keeps_unparsed_token(self) -> None:
+        r = recall_at_k([_span("a", 53)], _gold(("a", "53, slide 12")))
+        assert r == 0.5
+
+    def test_invalid_tokens_stay_unparsed(self) -> None:
+        assert parse_page_spec("0") == ([], ["0"])
+        assert parse_page_spec("9-2") == ([], ["9-2"])
+        assert parse_page_spec("1-100000000") == ([], ["1-100000000"])
+        assert parse_page_spec("53-54") == ([53, 54], [])
 
     def test_empty_retrieval_zero(self) -> None:
         """Pipeline retrieved nothing but a gold page exists → 0.0."""
@@ -335,3 +346,37 @@ class TestAggregate:
         m = aggregate(results)
         assert QAType.FACTUAL in m.accuracy_by_type
         assert QAType.ADVERSARIAL not in m.accuracy_by_type
+
+
+def test_known_textbook_citations_use_pdf_page_index() -> None:
+    """Gold numbers are compared to the PDF page index, not the printed folio.
+
+    DMS f040 cites 53-54, and that PDF index holds the WAL definition.
+    CLRS x009 cites 50, and that PDF index holds the selection-sort exercise.
+    CLRS f012 cites 1048, which is the printed label of PDF page 1069.
+    One shift cannot fix both CLRS citations, so the metric does not apply one.
+    """
+    from pathlib import Path
+
+    import pymupdf
+
+    clrs = Path("corpus/6.006/textbook/A4_clrs_3ed.pdf")
+    dms = Path("corpus/6.830/textbook/B5_dms_3ed.pdf")
+    if not clrs.exists() or not dms.exists():
+        pytest.skip("textbook PDFs are not in this checkout")
+
+    dms_doc = pymupdf.open(dms)
+    wal = dms_doc[52].get_text()
+    dms_doc.close()
+    assert "Write-Ahead Log" in wal
+    assert parse_page_spec("53-54") == ([53, 54], [])
+
+    clrs_doc = pymupdf.open(clrs)
+    selection = clrs_doc[49].get_text()
+    labeled_page = clrs_doc[1068]
+    label = labeled_page.get_label()
+    np_text = labeled_page.get_text()
+    clrs_doc.close()
+    assert "selection sort" in selection.lower()
+    assert label == "1048"
+    assert "NP-Completeness" in np_text

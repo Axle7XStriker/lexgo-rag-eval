@@ -221,6 +221,8 @@ def _run_one(
             judge_cost_usd=0.0,
             rerank_cost_usd=query_result.rerank_cost_usd,
             error=f"judge_failed: {type(e).__name__}: {e}",
+            model_citation_spans=tuple(model_spans),
+            retrieved_page_spans_top10=tuple(retrieved_spans[:10]),
         )
 
     return QAResult(
@@ -237,6 +239,8 @@ def _run_one(
         judge_answer_correct=verdict.answer_correct,
         judge_citations_semantically_valid=verdict.citations_semantically_valid,
         judge_rationale=verdict.rationale,
+        model_citation_spans=tuple(model_spans),
+        retrieved_page_spans_top10=tuple(retrieved_spans[:10]),
         latency_ms=query_result.latency_ms,
         generate_input_tokens=query_result.tokens_input,
         generate_output_tokens=query_result.tokens_output,
@@ -393,7 +397,7 @@ def _write_summary_md(
         f"{_format_pct(metrics.citation_precision_programmatic_mean)} |"
     )
     lines.append(
-        f"| citation precision (judge rate) | "
+        f"| semantic citation validity (judge rate) | "
         f"{_format_pct(metrics.citation_precision_judge_rate)} |"
     )
     lines.append(f"| mean page recall@{metrics.k} | {_format_pct(metrics.mean_recall_at_k)} |")

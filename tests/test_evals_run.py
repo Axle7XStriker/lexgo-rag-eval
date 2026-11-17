@@ -397,6 +397,19 @@ class TestMainHappyPath:
         results = [json.loads(li) for li in result_lines]
         ids = [r["qa_id"] for r in results]
         assert ids == ["f001", "x001", "p001", "o001", "a001"]
+        assert results[0]["model_citation_spans"] == [
+            {
+                "doc_path": "6.006/lectures/A1_lec03.pdf",
+                "page_start": 1,
+                "page_end": 1,
+            }
+        ]
+        assert results[0]["retrieved_page_spans_top10"][0] == {
+            "doc_path": "6.006/lectures/A1_lec03.pdf",
+            "page_start": 1,
+            "page_end": 1,
+        }
+        assert len(results[0]["retrieved_page_spans_top10"]) == 5
 
         # Fake generator matches question → correct answers for f001/x001/p001/o001,
         # wrong on a001 → 4/5 = 80% accuracy.
@@ -528,6 +541,8 @@ class TestMainSkipRecovery:
         assert all(r["error"] is not None for r in results)
         assert all("pipeline_failed" in r["error"] for r in results)
         assert all(r["judge_answer_correct"] is None for r in results)
+        assert all(r["model_citation_spans"] == [] for r in results)
+        assert all(r["retrieved_page_spans_top10"] == [] for r in results)
 
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert manifest["totals"]["n_evaluated"] == 0
