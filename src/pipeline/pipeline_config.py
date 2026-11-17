@@ -188,8 +188,8 @@ PIPELINES: dict[str, PipelineConfig] = {
         key="p1",
         chunker=ChunkerConfig(
             algorithm="fixed",
-            target_tokens=500,
-            overlap_tokens=50,
+            target_tokens=512,
+            overlap_tokens=64,
         ),
         retriever=RetrieverConfig(kind="dense", top_k=10),
         reranker=None,
@@ -201,10 +201,10 @@ PIPELINES: dict[str, PipelineConfig] = {
             # `target_tokens` documents the intended band center; the
             # semantic chunker doesn't cut ON it, but min/max are anchored
             # around it so P2 chunks are roughly comparable in size to P1.
-            target_tokens=500,
-            percentile_threshold=95.0,
-            min_tokens=200,
-            max_tokens=750,
+            target_tokens=512,
+            percentile_threshold=90.0,
+            min_tokens=256,
+            max_tokens=1024,
         ),
         retriever=RetrieverConfig(kind="dense", top_k=10),
         reranker=None,
@@ -217,8 +217,8 @@ PIPELINES: dict[str, PipelineConfig] = {
         # while its chunk_set_id matches P1 so both reuse the same DB rows.
         chunker=ChunkerConfig(
             algorithm="fixed",
-            target_tokens=500,
-            overlap_tokens=50,
+            target_tokens=512,
+            overlap_tokens=64,
         ),
         # Hybrid: BM25 (Postgres FTS ts_rank_cd) ∪ dense (pgvector cosine),
         # fused via Reciprocal Rank Fusion with k=60. top_k=10 = same
@@ -234,8 +234,8 @@ PIPELINES: dict[str, PipelineConfig] = {
         # while its chunk_set_id matches P1/P3 so all three share DB rows.
         chunker=ChunkerConfig(
             algorithm="fixed",
-            target_tokens=500,
-            overlap_tokens=50,
+            target_tokens=512,
+            overlap_tokens=64,
         ),
         # Hybrid top-20 pre-rerank: a wider pool than P3's top-10 so the
         # reranker has more candidates to re-order. rrf_k=60 keeps the fusion

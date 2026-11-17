@@ -24,21 +24,22 @@ evals/
 Prerequisites:
 
 ```
-make db-up          # start local Postgres + pgvector
-make ingest         # populate the P1 chunks table (idempotent)
-make validate       # golden-set integrity check (exit 0 on OK)
+make db-up                      # start local Postgres + pgvector
+make ingest                     # default pipeline p1
+make ingest PIPELINE=p2         # p1 or p2; p3 and p4 read the p1 chunk set
+make validate                   # golden-set integrity check (exit 0 on OK)
 ```
 
 Then:
 
 ```
-make eval                       # defaults to --pipeline p1
-make eval PIPELINE=p4           # P4: hybrid + Cohere rerank
+make eval                       # default pipeline p1
+make eval PIPELINE=p2           # p1, p2, p3, or p4
 ```
 
 Four pipelines are registered (`p1`..`p4` — see `src/pipeline/pipeline_config.py`).
 Each has a distinct pipeline `tag` for eval provenance. Storage uses a separate
-`chunk_set_id`: P1/P3/P4 share their fixed 500/50 chunks, while P2's semantic
+`chunk_set_id`: P1, P3, and P4 share their fixed 512/64 chunks, while P2's semantic
 chunks remain separate.
 
 Artifacts land under `evals/runs/eval_<UTC-timestamp>/`. Each run captures
@@ -80,6 +81,6 @@ Every eval run captures:
   `{provider, model, top_n}` for P4), model IDs
 - `cost_usd` — generate + judge + rerank, each tracked separately in the
   manifest `totals` block; headline is `cost_usd_generate_judge_rerank`
-- `metrics` — accuracy, citation precision, retrieval recall@5, p95 latency
+- `metrics` — accuracy, page citation precision, page recall@5, p95 latency
 
 Numbers without provenance don't count.

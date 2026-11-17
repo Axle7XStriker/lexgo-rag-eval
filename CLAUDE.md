@@ -10,10 +10,6 @@
 
 A rigorously-evaluated multi-source RAG system over academic course materials, with measured tradeoffs across chunking, retrieval, and reranking strategies.
 
-**Timebox:** ~26 hrs of build time over 4 weeks. Non-negotiable.
-
-**Primary success metric:** answer accuracy on a 100-Q&A golden set — the **delta between baseline (P1) and best pipeline (P4) is the story.**
-
 ---
 
 ## Scope
@@ -66,15 +62,6 @@ If any of the following comes up, STOP and flag before proceeding:
 - **B4:** Red Book 4th ed (Hellerstein/Stonebraker). Copyrighted; not distributed. Place a legal PDF at `corpus/6.830/textbook/B4_red_book_4ed.pdf` to participate in retrieval.
 - **B5:** Ramakrishnan/Gehrke DMS 3rd ed — fetched from a user-supplied URL.
 
-**Q&A authoring strategy for 6.830:**
-- **Lectures first (B1)** — they simplify the papers and anchor most factual/paraphrase Q&As.
-- **Quizzes (B2)** — mine for factual-recall Q&As grounded in the *solutions* (never treat the quiz question as a golden Q&A verbatim — it must be re-authored so the golden Q wording differs from the corpus wording, or it becomes a trivial retrieval test). Great for cross-source synthesis: "the quiz tests X; how does the lecture explain it / the paper deepen it."
-- **Papers (B3)** — primarily for cross-source synthesis ("how does this paper's approach to X compare to the lecture recommendation?").
-
-Design 6.006 Q&As around concepts and complexity claims, not "what does line 47 do."
-
-**Format verified 2026-08-15:** OCW PDFs copy-paste cleanly into text editor.
-
 ---
 
 ## Retrieval pipeline matrix
@@ -83,10 +70,10 @@ All 4 pipelines use the **same 100 Q&As** and the **same generation prompt**. On
 
 | Pipeline | Chunking | Retrieval | Rerank | Purpose |
 |---|---|---|---|---|
-| **P1 baseline** | Fixed 500 tokens, 50 overlap | Dense (Voyage) top-10 | — | Establish floor |
-| **P2 semantic chunks** | Semantic split | Dense top-10 | — | Isolate chunking effect |
-| **P3 hybrid** | Fixed 500/50 | BM25 (Postgres FTS) + dense (RRF fusion), top-10 | — | Isolate retrieval fusion effect |
-| **P4 hybrid + rerank** | Fixed 500/50 | Hybrid top-20 | Cohere Rerank 3 → top-10 | Best case |
+| **P1 baseline** | Fixed | Dense (Voyage) | — | Establish floor |
+| **P2 semantic chunks** | Semantic split | Dense | — | Isolate chunking effect |
+| **P3 hybrid** | Fixed | BM25 (Postgres FTS) + dense (RRF fusion) | — | Isolate retrieval fusion effect |
+| **P4 hybrid + rerank** | Fixed | Hybrid | Cohere Rerank 3 | Best case |
 
 ---
 
@@ -139,27 +126,6 @@ LLM-as-judge using Claude Haiku. Given (question, gold answer, gold citations, m
 
 ---
 
-## 4-week schedule (26 hrs total)
-
-| Week | Hrs | Work |
-|---|---|---|
-| **1** | 6.5 | Scoping locked. README skeleton + blog outline (2 hrs) ← **BEFORE any code**. Repo + Streamlit skeleton + Voyage/Cohere API keys (1 hr). Start golden set — target 20-30 Q&As (3-3.5 hrs). |
-| **2** | 6.5 | Finish golden set — 70-80 more Q&As (5-6 hrs). **Hard checkpoint:** if incomplete by end of W2, cut P2 or P3 from the pipelines matrix. |
-| **3** | 6.5 | P1 baseline pipeline + eval loop (3 hrs). P2/P3/P4 pipelines (3.5 hrs — each ~1 hr once infra reused). Sanity gate check after P1. |
-| **4** | 6.5 | Streamlit demo polish (1 hr). Deploy demo (1 hr). Blog post draft (3 hrs). README final + repo cleanup (1.5 hrs). |
-
----
-
-## Risks & mitigations
-
-1. **Golden set curation blows the budget** *(most likely failure mode)*. W1 checkpoint = 20-30 done; W2 hard checkpoint = 100 done. Cut a pipeline before cutting golden-set quality.
-2. **Baseline too good or too bad kills the story.** Sanity-check numbers after P1 baseline before building P2-P4.
-3. **Writeup debt.** README skeleton + blog outline land W1 BEFORE any code. Budget 8 of 26 hrs on writing, front-loaded.
-4. **Cohere Rerank cost.** ~2000 rerank calls × $0.001 ≈ $2. Not a real risk, noted for completeness.
-5. **6.830 papers dense — Q&A authoring slower than lectures.** Get most Q&As from lectures; use papers only for cross-source synthesis.
-
----
-
 ## Definition of done
 
 - [ ] Repo public with README leading with numbers table
@@ -176,7 +142,7 @@ LLM-as-judge using Claude Haiku. Given (question, gold answer, gold citations, m
 - **Prompts under version control** — `prompts/` directory with dated versions once code lands.
 - **Eval reproducibility** — every run captures git SHA + prompt version + config. Numbers are meaningless without provenance.
 - **No mocked LLM calls in eval runs.** Mocks are OK for pipeline structure tests only; numbers are only real if they came from real API calls.
-- **Kill early.** If a direction isn't producing signal by end of W2, escalate — don't burn W3-4 hoping.
+- **Kill early.** If a direction isn't producing signal within 2 weeks, escalate — don't burn remaining time hoping.
 
 ---
 
@@ -186,4 +152,3 @@ LLM-as-judge using Claude Haiku. Given (question, gold answer, gold citations, m
 - If asked to fluff up the frontend (Next.js, styling, auth), refer back to the "Streamlit only" constraint.
 - If asked to speed up golden-set curation via LLM generation, refuse — the golden set's integrity is load-bearing.
 - Prefer running actual evals over theorizing about them.
-- When scoping pipelines, remember the 26-hr timebox. If a proposed addition costs >2 hrs, name what gets cut to accommodate.
