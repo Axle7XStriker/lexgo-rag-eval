@@ -57,15 +57,15 @@ Requires Python 3.12, [uv](https://docs.astral.sh/uv/), and Postgres with pgvect
 git clone https://github.com/Axle7XStriker/lexgo-rag-eval.git
 cd lexgo-rag-eval
 
-cp .env.example .env         # then fill in ANTHROPIC_API_KEY, VOYAGE_API_KEY, COHERE_API_KEY
+cp .env.example .env        # then fill in ANTHROPIC_API_KEY, VOYAGE_API_KEY, COHERE_API_KEY
 
-make setup                            # uv sync — creates .venv, installs pinned deps
-make corpus                           # download MIT OCW PDFs into corpus/ (idempotent, ~2 min)
-make db-up                            # start local Postgres + pgvector
-[PIPELINE=<p1|p2|p3|p4>] make ingest  # ingest corpus into the db
-make app                              # streamlit run app.py — Demo + Author pages in the sidebar
-make validate                         # lint the golden Q&A set (evals/golden/qa.jsonl)
-[PIPELINE=<p1|p2|p3|p4>] make eval    # score the golden file on a pipeline
+make setup                  # uv sync — creates .venv, installs pinned deps
+make corpus                 # download MIT OCW PDFs into corpus/ (idempotent, ~2 min)
+make db-up                  # start local Postgres + pgvector
+PIPELINE=p1 make ingest     # ingest corpus into the db (p1/p2/p3/p4)
+make app                    # streamlit run app.py — Demo + Author pages in the sidebar
+make validate               # lint the golden Q&A set (evals/golden/qa.jsonl)
+PIPELINE=p1 make eval       # score the golden file on a pipeline (p1/p2/p3/p4)
 ```
 
 The Streamlit app ships two pages:
