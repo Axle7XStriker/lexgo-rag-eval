@@ -3,9 +3,9 @@
 Two families of helpers:
   1. Per-Q&A metrics — `citation_precision_programmatic`, `recall_at_k`.
      Citation precision is always defined (every combination of empty /
-     non-empty model & gold citation sets carries a signal). `recall_at_k`
-     returns `None` only for out-of-corpus (no gold docs means no retrieval
-     ground truth). The aggregator skips `None`s from denominators.
+     non-empty model and gold page sets carries a signal). `recall_at_k`
+     returns `None` only when there is no gold page. The aggregator skips
+     `None`s from denominators.
   2. `QAResult` + `RunMetrics` dataclasses — the frozen record shapes
      `evals/run.py` persists per Q&A and aggregates at the end of a run.
 
@@ -13,10 +13,10 @@ Design notes worth remembering:
   - Kept adjacent to the aggregator so the record shape and the code that
     reads it don't drift. If either grows enough to justify a split, move
     the aggregator to `evals/aggregate.py` and keep the dataclasses here.
-  - Only `recall_at_k` is exposed as the retrieval headline. An earlier
-    `hit_rate_at_k` was multiplicity-weighted over the gold list and either
-    collapsed to `recall_at_k` (distinct gold) or inflated it (duplicated
-    gold doc_path from multi-page factual Q&As) — misleading either way.
+  - Only `recall_at_k` is exposed as the retrieval headline. The unit is a
+    page on a document. A retrieved chunk covers every page in its inclusive
+    range. An earlier `hit_rate_at_k` counted repeated gold docs and was
+    dropped.
   - Percentiles use `statistics.quantiles(..., method="inclusive")` so
     single-item inputs return that item's value (numpy would raise).
     Small-sample p95 is a rough number by construction — we surface it
@@ -33,6 +33,7 @@ Design notes worth remembering:
 
 from __future__ import annotations
 
+import re
 import statistics
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,6 +46,67 @@ from src.qa_schema import QAType
 # field name because the eval loop only reports one k today; changing
 # DEFAULT_K also means renaming that field (and its consumers).
 DEFAULT_K = 5
+
+_PAGE = re.compile(r"^\d+$")
+_RANGE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
+
+
+@dataclass(frozen=True)
+class PageSpan:
+    """Inclusive page range on one document. A single page has equal ends."""
+
+    doc_path: str
+    page_start: int
+    page_end: int
+
+    def covers(self, page: int) -> bool:
+        return self.page_start <= page <= self.page_end
+
+
+@dataclass(frozen=True)
+class GoldPage:
+    """One gold page. `page is None` when `spec` did not parse as page numbers."""
+
+    doc_path: str
+    page: int | None = None
+    spec: str = ""
+
+
+def parse_page_spec(spec: str) -> list[int]:
+    """Expand `4`, `4,5`, and `53-54` into page numbers. Other text yields []."""
+    pages: list[int] = []
+    for part in spec.split(","):
+        token = part.strip()
+        if _PAGE.fullmatch(token):
+            pages.append(int(token))
+            continue
+        match = _RANGE.fullmatch(token)
+        if match is None:
+            continue
+        start, end = int(match.group(1)), int(match.group(2))
+        if start > end:
+            start, end = end, start
+        pages.extend(range(start, end + 1))
+    return pages
+
+
+def gold_pages(citations: list[tuple[str, str]]) -> set[GoldPage]:
+    """Distinct gold pages from `(doc_path, page_or_section)` pairs."""
+    found: set[GoldPage] = set()
+    for doc_path, spec in citations:
+        pages = parse_page_spec(spec)
+        if not pages:
+            found.add(GoldPage(doc_path, None, spec))
+            continue
+        found.update(GoldPage(doc_path, page) for page in pages)
+    return found
+
+
+def _span_hits(span: PageSpan, pages: set[GoldPage]) -> bool:
+    return any(
+        span.doc_path == gold.doc_path and gold.page is not None and span.covers(gold.page)
+        for gold in pages
+    )
 
 
 @dataclass(frozen=True)
@@ -136,50 +198,50 @@ class RunMetrics:
 
 
 def citation_precision_programmatic(
-    model_doc_paths: list[str],
-    gold_doc_paths: list[str],
+    model_spans: list[PageSpan],
+    gold: set[GoldPage],
 ) -> float:
-    """Fraction of the model's cited doc_paths that appear in the gold set.
+    """Fraction of cited chunks whose page range covers a gold page on that file.
 
-    Every combination of empty / non-empty (model, gold) has a well-defined
-    value — none is dropped from the mean:
+    Every combination of empty and non-empty model and gold sets has a
+    defined value.
 
-    - model=[],  gold=[]  → 1.0  (correct: nothing to cite, nothing cited)
-    - model=[],  gold=[x] → 0.0  (model failed to cite when gold existed)
-    - model=[x], gold=[]  → 0.0  (every model citation is unfounded)
-    - otherwise           → |{p in model: p in gold}| / |model|
+    - model=[], gold=[] → 1.0 (nothing to cite, nothing cited)
+    - model=[], gold present → 0.0 (model cited nothing)
+    - model present, gold=[] → 0.0 (every citation is unfounded)
+    - otherwise → cited spans that cover a gold page, divided by cited spans
 
-    Model citations are compared as a multiset over doc_paths — if the
-    model cited the same doc_path twice, both count. That's the honest
-    reading of "precision of the model's citations."
+    Each cited span counts once, including a repeated span. The right file
+    on the wrong page is a miss.
     """
-    if not model_doc_paths:
-        return 1.0 if not gold_doc_paths else 0.0
-    gold_set = set(gold_doc_paths)
-    hits = sum(1 for p in model_doc_paths if p in gold_set)
-    return hits / len(model_doc_paths)
+    if not model_spans:
+        return 1.0 if not gold else 0.0
+    hits = sum(1 for span in model_spans if _span_hits(span, gold))
+    return hits / len(model_spans)
 
 
 def recall_at_k(
-    retrieved_doc_paths: list[str],
-    gold_doc_paths: list[str],
+    retrieved_spans: list[PageSpan],
+    gold: set[GoldPage],
     k: int = DEFAULT_K,
 ) -> float | None:
-    """`(# distinct gold doc_paths in top-k) / (# distinct gold doc_paths)`.
+    """Distinct gold pages covered by the top-k chunk spans, over distinct gold pages.
 
-    Returns `None` for out-of-corpus (denominator would be zero). Distinctness
-    is on both sides — a gold set with the same doc_path listed twice still
-    counts as one target, and a retrieved list with duplicates gets one hit.
-
-    When `len(gold) > k`, the metric caps at `k / len(gold)` even if every
-    top-k slot is a gold hit — the top-k window physically can't cover more
-    distinct docs than it has slots. That's the honest reading, not a bug.
+    Returns `None` when there is no gold page. A span covers a gold page when
+    the file matches and the page sits in the span's inclusive range. One
+    span can cover several gold pages. A gold spec that is not a page number
+    stays in the denominator and is never covered.
     """
-    if not gold_doc_paths:
+    if not gold:
         return None
-    gold_set = set(gold_doc_paths)
-    top_k = set(retrieved_doc_paths[:k])
-    return len(gold_set & top_k) / len(gold_set)
+    window = retrieved_spans[:k]
+    covered = sum(
+        1
+        for page in gold
+        if page.page is not None
+        and any(span.doc_path == page.doc_path and span.covers(page.page) for span in window)
+    )
+    return covered / len(gold)
 
 
 # ── Aggregation ───────────────────────────────────────────────────────

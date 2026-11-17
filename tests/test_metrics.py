@@ -10,12 +10,24 @@ from __future__ import annotations
 import pytest
 
 from evals.metrics import (
+    GoldPage,
+    PageSpan,
     QAResult,
     aggregate,
     citation_precision_programmatic,
+    gold_pages,
     recall_at_k,
 )
 from src.qa_schema import QAType
+
+
+def _span(doc: str, start: int, end: int | None = None) -> PageSpan:
+    return PageSpan(doc, start, end if end is not None else start)
+
+
+def _gold(*pages: tuple[str, str]) -> set[GoldPage]:
+    return gold_pages(list(pages))
+
 
 # ── Per-Q&A metric helpers ────────────────────────────────────────────
 
@@ -23,94 +35,108 @@ from src.qa_schema import QAType
 class TestCitationPrecision:
     def test_full_overlap(self) -> None:
         prec = citation_precision_programmatic(
-            model_doc_paths=["a", "b"],
-            gold_doc_paths=["a", "b", "c"],
+            [_span("a", 1), _span("b", 2, 4)],
+            _gold(("a", "1"), ("b", "3"), ("c", "9")),
         )
         assert prec == 1.0
 
-    def test_partial_overlap(self) -> None:
+    def test_right_file_wrong_page_misses(self) -> None:
         prec = citation_precision_programmatic(
-            model_doc_paths=["a", "x", "y", "z"],
-            gold_doc_paths=["a", "b"],
+            [_span("a", 1), _span("a", 8), _span("b", 2), _span("z", 1)],
+            _gold(("a", "1"), ("b", "9")),
         )
         assert prec == pytest.approx(0.25)
 
     def test_no_overlap(self) -> None:
         prec = citation_precision_programmatic(
-            model_doc_paths=["x", "y"],
-            gold_doc_paths=["a", "b"],
+            [_span("x", 1), _span("y", 2)],
+            _gold(("a", "1"), ("b", "2")),
         )
         assert prec == 0.0
 
     def test_both_empty_perfect(self) -> None:
         """No gold to cite and model rightly didn't cite → perfect precision."""
-        assert citation_precision_programmatic(model_doc_paths=[], gold_doc_paths=[]) == 1.0
+        assert citation_precision_programmatic([], set()) == 1.0
 
     def test_model_empty_gold_present_zero(self) -> None:
-        """Gold cites existed but model cited nothing → 0.0 (missed all)."""
-        assert citation_precision_programmatic(model_doc_paths=[], gold_doc_paths=["a"]) == 0.0
+        """Gold pages existed but model cited nothing → 0.0."""
+        assert citation_precision_programmatic([], _gold(("a", "1"))) == 0.0
 
     def test_zero_gold_cites_zero_precision(self) -> None:
-        """Model cites on an out-of-corpus Q&A → 0.0 (all cites are unfounded)."""
-        assert citation_precision_programmatic(model_doc_paths=["a"], gold_doc_paths=[]) == 0.0
+        """Model cites on an out-of-corpus Q&A → 0.0."""
+        assert citation_precision_programmatic([_span("a", 1)], set()) == 0.0
 
     def test_duplicate_model_cites_counted(self) -> None:
-        """Multiset semantics: the same doc cited twice counts twice on both sides."""
+        """Each cited span counts, including a repeated span."""
         prec = citation_precision_programmatic(
-            model_doc_paths=["a", "a", "b"],
-            gold_doc_paths=["a"],
+            [_span("a", 1), _span("a", 1), _span("b", 2)],
+            _gold(("a", "1")),
         )
         assert prec == pytest.approx(2 / 3)
 
 
 class TestRecallAtK:
-    def test_all_gold_present(self) -> None:
+    def test_span_covers_every_page_in_range(self) -> None:
         r = recall_at_k(
-            retrieved_doc_paths=["a", "b", "c", "d", "e"],
-            gold_doc_paths=["a", "b"],
+            [_span("a", 1, 3)],
+            _gold(("a", "1,3"), ("a", "2")),
         )
         assert r == 1.0
 
     def test_half_gold_present(self) -> None:
         r = recall_at_k(
-            retrieved_doc_paths=["a", "x", "y", "z", "w"],
-            gold_doc_paths=["a", "b"],
+            [_span("a", 1), _span("x", 1), _span("y", 1), _span("z", 1), _span("w", 1)],
+            _gold(("a", "1"), ("b", "2")),
         )
         assert r == 0.5
 
     def test_no_gold_present(self) -> None:
         r = recall_at_k(
-            retrieved_doc_paths=["x", "y", "z"],
-            gold_doc_paths=["a", "b"],
+            [_span("a", 9), _span("b", 9)],
+            _gold(("a", "1"), ("b", "2")),
         )
         assert r == 0.0
 
     def test_out_of_corpus_returns_none(self) -> None:
-        assert recall_at_k(retrieved_doc_paths=["a"], gold_doc_paths=[]) is None
+        assert recall_at_k([_span("a", 1)], set()) is None
 
     def test_distinct_denominator(self) -> None:
-        """Distinct gold count in denominator — duplicates in gold don't inflate it."""
+        """The same page listed twice is one target."""
         r = recall_at_k(
-            retrieved_doc_paths=["a", "b", "c", "d", "e"],
-            gold_doc_paths=["a", "a", "b"],  # 2 distinct
+            [_span("a", 1), _span("a", 2)],
+            _gold(("a", "1"), ("a", "1,2")),
         )
         assert r == 1.0
 
-    def test_gold_larger_than_k_caps_at_k_over_gold(self) -> None:
-        """When |gold| > k the metric can't exceed k / |gold| — top-k physically
-        can't cover more distinct docs than it has slots. Honest, not a bug."""
-        # 7 distinct gold docs, k=5 — retrieving every slot of the top-5 as gold
-        # is the best possible outcome and it still reads as 5/7.
+    def test_window_ignores_spans_past_k(self) -> None:
         r = recall_at_k(
-            retrieved_doc_paths=["a", "b", "c", "d", "e"],
-            gold_doc_paths=["a", "b", "c", "d", "e", "f", "g"],
+            [
+                _span("a", 1),
+                _span("a", 2),
+                _span("a", 3),
+                _span("a", 4),
+                _span("a", 5),
+                _span("a", 6),
+            ],
+            _gold(("a", "6")),
             k=5,
         )
-        assert r == pytest.approx(5 / 7)
+        assert r == 0.0
+
+    def test_hyphen_range_and_comma_list(self) -> None:
+        r = recall_at_k(
+            [_span("book", 53, 54), _span("book", 10)],
+            _gold(("book", "53-54"), ("book", "10,11")),
+        )
+        assert r == pytest.approx(3 / 4)
+
+    def test_unparsed_spec_stays_a_miss(self) -> None:
+        r = recall_at_k([_span("a", 12)], _gold(("a", "slide 12"), ("a", "12")))
+        assert r == 0.5
 
     def test_empty_retrieval_zero(self) -> None:
-        """Pipeline retrieved nothing but gold exists → 0.0 (empty set intersection)."""
-        assert recall_at_k(retrieved_doc_paths=[], gold_doc_paths=["a"]) == 0.0
+        """Pipeline retrieved nothing but a gold page exists → 0.0."""
+        assert recall_at_k([], _gold(("a", "1"))) == 0.0
 
 
 # ── Aggregate ────────────────────────────────────────────────────────
