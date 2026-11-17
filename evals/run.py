@@ -47,10 +47,12 @@ from pathlib import Path
 from typing import Any
 
 from evals.metrics import (
+    PageSpan,
     QAResult,
     RunMetrics,
     aggregate,
     citation_precision_programmatic,
+    gold_pages,
     qaresult_to_dict,
     recall_at_k,
     runmetrics_to_dict,
@@ -125,6 +127,7 @@ def _run_one(
     in `answer_question`).
     """
     gold_doc_paths = [c.doc_path for c in record.gold_citations]
+    gold = gold_pages([(c.doc_path, c.page_or_section) for c in record.gold_citations])
     started = time.perf_counter()
 
     try:
@@ -155,7 +158,7 @@ def _run_one(
             model_answer="",
             model_citation_doc_paths=[],
             retrieved_doc_paths_top10=[],
-            citation_precision_programmatic=citation_precision_programmatic([], gold_doc_paths),
+            citation_precision_programmatic=citation_precision_programmatic([], gold),
             recall_at_5=None,
             judge_answer_correct=None,
             judge_citations_semantically_valid=None,
@@ -173,8 +176,12 @@ def _run_one(
 
     model_doc_paths = [c.doc_path for c in query_result.citations]
     retrieved_doc_paths = [c.doc_path for c in query_result.retrieved_chunks]
-    prec = citation_precision_programmatic(model_doc_paths, gold_doc_paths)
-    recall5 = recall_at_k(retrieved_doc_paths, gold_doc_paths, k=5)
+    model_spans = [PageSpan(c.doc_path, c.page_start, c.page_end) for c in query_result.citations]
+    retrieved_spans = [
+        PageSpan(c.doc_path, c.page_start, c.page_end) for c in query_result.retrieved_chunks
+    ]
+    prec = citation_precision_programmatic(model_spans, gold)
+    recall5 = recall_at_k(retrieved_spans, gold, k=5)
 
     try:
         verdict = judge.judge(
@@ -214,6 +221,8 @@ def _run_one(
             judge_cost_usd=0.0,
             rerank_cost_usd=query_result.rerank_cost_usd,
             error=f"judge_failed: {type(e).__name__}: {e}",
+            model_citation_spans=tuple(model_spans),
+            retrieved_page_spans_top10=tuple(retrieved_spans[:10]),
         )
 
     return QAResult(
@@ -230,6 +239,8 @@ def _run_one(
         judge_answer_correct=verdict.answer_correct,
         judge_citations_semantically_valid=verdict.citations_semantically_valid,
         judge_rationale=verdict.rationale,
+        model_citation_spans=tuple(model_spans),
+        retrieved_page_spans_top10=tuple(retrieved_spans[:10]),
         latency_ms=query_result.latency_ms,
         generate_input_tokens=query_result.tokens_input,
         generate_output_tokens=query_result.tokens_output,
@@ -382,14 +393,14 @@ def _write_summary_md(
     lines.append(f"| n_skipped | {metrics.n_skipped} |")
     lines.append(f"| accuracy (overall) | {_format_pct(metrics.accuracy_overall)} |")
     lines.append(
-        f"| citation precision (programmatic mean) | "
+        f"| page citation precision (programmatic mean) | "
         f"{_format_pct(metrics.citation_precision_programmatic_mean)} |"
     )
     lines.append(
-        f"| citation precision (judge rate) | "
+        f"| semantic citation validity (judge rate) | "
         f"{_format_pct(metrics.citation_precision_judge_rate)} |"
     )
-    lines.append(f"| mean recall@{metrics.k} | {_format_pct(metrics.mean_recall_at_k)} |")
+    lines.append(f"| mean page recall@{metrics.k} | {_format_pct(metrics.mean_recall_at_k)} |")
     lines.append(f"| p50 latency | {_format_ms(metrics.p50_latency_ms)} |")
     lines.append(f"| p95 latency | {_format_ms(metrics.p95_latency_ms)} |")
     lines.append(f"| cost — generate | ${metrics.total_generate_cost_usd:.4f} |")
@@ -652,8 +663,8 @@ def main() -> int:
     print(f"  evaluated: {metrics.n_evaluated}    skipped: {metrics.n_skipped}")
     print(
         f"  accuracy: {_format_pct(metrics.accuracy_overall)}    "
-        f"cite_prec: {_format_pct(metrics.citation_precision_programmatic_mean)}    "
-        f"recall@{metrics.k}: {_format_pct(metrics.mean_recall_at_k)}"
+        f"page_cite_prec: {_format_pct(metrics.citation_precision_programmatic_mean)}    "
+        f"page_recall@{metrics.k}: {_format_pct(metrics.mean_recall_at_k)}"
     )
     print(
         f"  latency  p50: {_format_ms(metrics.p50_latency_ms)}    "
