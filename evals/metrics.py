@@ -1,34 +1,13 @@
-"""Pure-function metrics for the eval loop — no I/O, no side effects.
+"""Pure-function metrics for the eval loop.
 
 Two families of helpers:
   1. Per-Q&A metrics — `citation_precision_programmatic`, `recall_at_k`.
      Citation precision is always defined (every combination of empty /
-     non-empty model and gold page sets carries a signal). `recall_at_k`
-     returns `None` only when there is no gold page. The aggregator skips
-     `None`s from denominators.
+     non-empty model & gold citation sets carries a signal). `recall_at_k`
+     returns `None` only for out-of-corpus (no gold docs means no retrieval
+     ground truth). The aggregator skips `None`s from denominators.
   2. `QAResult` + `RunMetrics` dataclasses — the frozen record shapes
      `evals/run.py` persists per Q&A and aggregates at the end of a run.
-
-Design notes worth remembering:
-  - Kept adjacent to the aggregator so the record shape and the code that
-    reads it don't drift. If either grows enough to justify a split, move
-    the aggregator to `evals/aggregate.py` and keep the dataclasses here.
-  - Only `recall_at_k` is exposed as the retrieval headline. The unit is a
-    page on a document. A retrieved chunk covers every page in its inclusive
-    range. An earlier `hit_rate_at_k` counted repeated gold docs and was
-    dropped.
-  - Percentiles use `statistics.quantiles(..., method="inclusive")` so
-    single-item inputs return that item's value (numpy would raise).
-    Small-sample p95 is a rough number by construction — we surface it
-    for anomaly detection, not for capacity planning.
-  - `total_generate_judge_cost_usd` is exactly what it says: the Anthropic
-    generate + judge spend. Voyage embed spend is logged per-call in
-    `logs/llm_calls.jsonl` but not aggregated here — the field name is
-    honest about that scope so external reports don't misquote it.
-  - `total_rerank_cost_usd` is Cohere Rerank spend only (0.0 for P1-P3,
-    non-zero for P4). `total_generate_judge_rerank_cost_usd` sums all three
-    LLM-ish spend categories. Voyage embed cost still lives per-call in
-    `logs/llm_calls.jsonl` and is not aggregated.
 """
 
 from __future__ import annotations
@@ -40,17 +19,10 @@ from typing import Any
 
 from src.qa_schema import QAType
 
-# Recall-at-K headline slice. Different from any pipeline's `retriever.top_k` —
-# P1..P4 fan out to different top-K values, and reporting a moving-k recall would
-# make cross-pipeline comparison meaningless. Baked into the `QAResult.recall_at_5`
-# field name because the eval loop only reports one k today; changing
-# DEFAULT_K also means renaming that field (and its consumers).
 DEFAULT_K = 5
 
 _PAGE = re.compile(r"^\d+$")
 _RANGE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
-# Widest gold range in qa.jsonl is 22 pages (526-547). A wider token is kept
-# as text so a typo cannot allocate a huge page list.
 _MAX_RANGE_PAGES = 40
 
 
@@ -162,11 +134,7 @@ class QAResult:
     model_answer: str
     model_citation_doc_paths: list[str]
     retrieved_doc_paths_top10: list[str]
-    # Always defined — see `citation_precision_programmatic` docstring for
-    # how the four (empty/non-empty × model/gold) combinations map to a value.
     citation_precision_programmatic: float
-    # `None` when there is no gold page to score, and on the pipeline-failure
-    # path. The aggregator skips `None`.
     recall_at_5: float | None
     judge_answer_correct: bool | None
     judge_citations_semantically_valid: bool | None
@@ -178,13 +146,8 @@ class QAResult:
     judge_input_tokens: int
     judge_output_tokens: int
     judge_cost_usd: float
-    # Cohere Rerank per-call spend. 0.0 for skipped records whose rerank call never
-    # ran or those that don't use reranking. Defaulted so pre-P4 constructions
-    # (and legacy results.jsonl rows) parse without rewrite.
     rerank_cost_usd: float = 0.0
     error: str | None = None
-    # Page ranges that produced the page-level scores. Empty when the
-    # pipeline failed before retrieval. Same coordinate system as `PageSpan`.
     model_citation_spans: tuple[PageSpan, ...] = ()
     retrieved_page_spans_top10: tuple[PageSpan, ...] = ()
 
@@ -197,17 +160,15 @@ class RunMetrics:
     (non-skipped) record; missing types are absent, not 0.0 — a report that
     reads 0.0 accuracy on a type with zero samples would be misleading.
 
-    `k` is the retrieval slice depth for the recall aggregate (fixed at 5
-    today; captured explicitly so future P2..P4 runs that vary it are
-    unambiguous in the manifest).
+    `k` is the retrieval slice depth for the recall aggregate.
 
     `total_generate_judge_cost_usd` sums Anthropic generate + judge spend
-    only. Voyage embed spend is NOT included — see the module docstring.
+    only. Voyage embed spend is NOT included.
     """
 
-    n_records: int  # total records loaded from qa.jsonl
-    n_evaluated: int  # records with error is None
-    n_skipped: int  # records with error is not None
+    n_records: int
+    n_evaluated: int
+    n_skipped: int
     accuracy_overall: float | None
     accuracy_by_type: dict[QAType, float] = field(default_factory=dict)
     citation_precision_programmatic_mean: float | None = None
@@ -219,14 +180,10 @@ class RunMetrics:
     total_generate_cost_usd: float = 0.0
     total_judge_cost_usd: float = 0.0
     total_generate_judge_cost_usd: float = 0.0
-    # Cohere Rerank spend summed across all records (including skipped —
-    # we paid for whatever partial calls happened).
     total_rerank_cost_usd: float = 0.0
-    # All-LLM headline total: generate + judge + rerank.
     total_generate_judge_rerank_cost_usd: float = 0.0
 
 
-# ── Per-Q&A metrics ───────────────────────────────────────────────────
 
 
 def citation_precision_programmatic(
@@ -294,20 +251,12 @@ def _rate_or_none(bools: list[bool]) -> float | None:
 
 
 def _percentile(values: list[float], pct: float) -> float | None:
-    """Approximate percentile (0..100). Returns `None` for empty input.
-
-    For a single element, returns that element's value — small-sample p95 is
-    a rough number by construction, and this keeps `summary.md` populated on
-    dev runs with only a handful of records.
-    """
+    """Approximate percentile (0..100). Returns `None` for empty input."""
     if not values:
         return None
     if len(values) == 1:
         return values[0]
     sorted_vals = sorted(values)
-    # statistics.quantiles(n=100) returns 99 cut points → index pct-1.
-    # `inclusive` method matches the endpoints of the sample rather than
-    # projecting beyond them; it's the more intuitive choice for latency.
     cuts = statistics.quantiles(sorted_vals, n=100, method="inclusive")
     idx = max(0, min(len(cuts) - 1, round(pct) - 1))
     return cuts[idx]
@@ -336,8 +285,7 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
     accuracy_overall = _rate_or_none(verdicts)
 
     accuracy_by_type: dict[QAType, float] = {}
-    # Group by QAType; only types with >= 1 non-None verdict get a row —
-    # keeps `summary.md` honest about which buckets actually had samples.
+    # Group by QAType; only types with >= 1 non-None verdict get a row.
     by_type: dict[QAType, list[bool]] = {}
     for r in evaluated:
         if r.judge_answer_correct is None:
@@ -348,8 +296,7 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
         if rate is not None:
             accuracy_by_type[qa_type] = rate
 
-    # Citation precision — programmatic mean over every evaluated record
-    # (the metric is always defined; every combination carries a signal).
+    # Citation precision — programmatic mean over every evaluated record.
     prec_values = [r.citation_precision_programmatic for r in evaluated]
     citation_precision_programmatic_mean = _mean_or_none(prec_values)
 
@@ -362,8 +309,7 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
     ]
     citation_precision_judge_rate = _rate_or_none(cite_judge_bools)
 
-    # Retrieval recall over in-corpus Q&As (out-of-corpus rows had recall
-    # set to None by the per-Q&A helper above).
+    # Retrieval recall over in-corpus Q&As.
     recall_values = [r.recall_at_5 for r in evaluated if r.recall_at_5 is not None]
     mean_recall_at_k = _mean_or_none(recall_values)
 
