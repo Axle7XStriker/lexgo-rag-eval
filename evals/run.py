@@ -17,8 +17,8 @@ Design notes worth remembering:
     Same shape as `scripts/ingest.py` opens one embedder + store for the
     document loop.
   - Pipelines are registered in `src.pipeline.pipeline_config.PIPELINES`;
-    `--pipeline` accepts any key from that registry. Adding P2..P4 is a
-    one-line dict entry, not a change here.
+    `--pipeline` accepts any key from that registry. A new pipeline is a
+    registry entry, not a change here.
   - Malformed golden file is FATAL. Same contract as `make validate`:
     refuse to run against a broken qa.jsonl rather than silently evaluating
     the parseable subset.
@@ -79,17 +79,11 @@ from src.qa_schema import GOLDEN_TOTAL, QARecord, QAType, counts_by_type, load_j
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_QA_PATH = REPO_ROOT / "evals" / "golden" / "qa.jsonl"
 
-# CLI keys are exactly the keys registered in `src.pipeline.pipeline_config.PIPELINES`.
 SUPPORTED_PIPELINES: tuple[str, ...] = tuple(PIPELINES.keys())
 
 
 def _git_sha() -> str:
-    """Current git commit SHA, or `"unknown"` on any failure.
-
-    Falls back rather than raising because a captured artifact with
-    `git_sha: unknown` is still useful for the operator; a crash on
-    `git rev-parse` would kill an otherwise successful eval run.
-    """
+    """Current git commit SHA, or `"unknown"` on any failure."""
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -117,14 +111,10 @@ def _run_one(
     reranker_config: RerankerConfig | None,
     run_id: str,
 ) -> QAResult:
-    """Evaluate one record end-to-end. Never raises — catches → error field.
+    """Evaluate one record. Pipeline and judge failures become `QAResult.error`.
 
-    Returns a `QAResult` with `error` set to a short string when any step
-    raises after its own retries have been exhausted. The caller decides
-    what to do with that (log + continue is the current policy).
-
-    `reranker` + `reranker_config` are both-or-neither (invariant enforced
-    in `answer_question`).
+    Setup before those calls can still raise. The caller logs a recorded
+    error and continues.
     """
     gold_doc_paths = [c.doc_path for c in record.gold_citations]
     gold = gold_pages([(c.doc_path, c.page_or_section) for c in record.gold_citations])
@@ -143,9 +133,7 @@ def _run_one(
             run_id=run_id,
         )
     except Exception as e:
-        # Everything from `answer_question` (embed, retrieve, rerank, generate)
-        # is already retried at the provider client level. A raised exception
-        # here is a terminal failure for this Q&A — record it and move on.
+        # Provider clients already retried. This failure is terminal for the question.
         elapsed_ms = (time.perf_counter() - started) * 1000
         cause = e.cause if isinstance(e, QueryExecutionError) else e
         rerank_cost_usd = e.rerank_cost_usd if isinstance(e, QueryExecutionError) else 0.0
@@ -193,10 +181,7 @@ def _run_one(
             run_id=run_id,
         )
     except Exception as e:
-        # Judge failure is recoverable: the pipeline output is preserved,
-        # programmatic metrics are still computed, but accuracy is unknown
-        # for this Q&A. The record lands with error set so the operator
-        # notices; aggregate metrics drop it from the accuracy denominator.
+        # Keep the pipeline output. Accuracy stays unknown and leaves the denominator.
         elapsed_ms = query_result.latency_ms
         return QAResult(
             qa_id=record.id,
@@ -273,9 +258,7 @@ def _snapshot_llm_calls(source: Path, dest: Path, run_id: str) -> int:
             try:
                 rec = json.loads(stripped)
             except json.JSONDecodeError:
-                # A corrupted line elsewhere in the log is not our problem —
-                # the ingest run's snapshot function has the same tolerance.
-                continue
+                continue  # A bad line in the shared log is not this run's record.
             if rec.get("run_id") == run_id:
                 fout.write(stripped + "\n")
                 written += 1
@@ -290,11 +273,7 @@ def _format_pct(value: float | None) -> str:
 
 
 def _chunker_summary(chunker_cfg: dict[str, Any]) -> str:
-    """Render the chunker's algorithm-specific knobs for `summary.md`.
-
-    Kept minimal — the full config is already in `manifest.json` for
-    reproducibility; this line is for a human skimming the summary.
-    """
+    """Render the chunker's algorithm-specific knobs in a human-readable format."""
     algo = chunker_cfg["algorithm"]
     if algo == "fixed":
         return (
@@ -318,13 +297,7 @@ def _format_ms(value: float | None) -> str:
 
 
 def _per_type_counts(results: list[QAResult]) -> dict[QAType, int]:
-    """Per-QAType count of records with a non-`None` judge verdict.
-
-    Used to populate the `n` column of the per-type accuracy table in
-    `summary.md`. Skipped records (error is not None) and evaluated-but-
-    judge-failed records (judge_answer_correct is None) are excluded, so
-    the count matches the denominator of the per-type accuracy rate.
-    """
+    """Per-QAType count of records with a non-`None` judge verdict."""
     counts: dict[QAType, int] = {}
     for r in results:
         if r.error is not None or r.judge_answer_correct is None:
@@ -340,12 +313,7 @@ def _write_summary_md(
     metrics: RunMetrics,
     results: list[QAResult],
 ) -> None:
-    """Render a human-readable markdown summary alongside `manifest.json`.
-
-    Mirrors the manifest's shape but rendered as tables for a human reader.
-    Skip list is enumerated so a partial run tells the operator exactly
-    which Q&As did not score and why.
-    """
+    """Render a human-readable markdown summary alongside `manifest.json`."""
     skipped = [r for r in results if r.error is not None]
     per_type = _per_type_counts(results)
 
@@ -370,10 +338,7 @@ def _write_summary_md(
     lines.append(f"- embedding model: `{models['embedding_model']}`")
     lines.append(f"- chunker: `{chunker_cfg['algorithm']}` ({_chunker_summary(chunker_cfg)})")
     lines.append(f"- retriever: `{retriever_cfg['kind']}`, top_k={retriever_cfg['top_k']}")
-    # Rerank line always rendered — every pipeline could configure a reranker;
-    # P1-P3 explicitly don't. `n/a` makes that choice legible when scanning
-    # two summaries side-by-side, rather than making the reader wonder whether
-    # the row was omitted or the field never existed.
+    # Always show the row so a pipeline without a reranker reads as n/a.
     if reranker_cfg is not None:
         lines.append(
             f"- reranker: `{reranker_cfg['provider']}`/`{reranker_cfg['model']}`, "
@@ -406,10 +371,9 @@ def _write_summary_md(
     lines.append(f"| cost — generate | ${metrics.total_generate_cost_usd:.4f} |")
     lines.append(f"| cost — judge | ${metrics.total_judge_cost_usd:.4f} |")
     lines.append(f"| cost — generate + judge | ${metrics.total_generate_judge_cost_usd:.4f} |")
-    # Rerank cost always rendered — 0.0 for P1-P3 is useful signal (an eval
-    # against a pipeline that unexpectedly turned on a reranker would show
-    # here immediately). The "all LLM" row below is the headline total.
-    lines.append(f"| cost — rerank | ${metrics.total_rerank_cost_usd:.4f} |")
+    lines.append(  # 0.0 still shows that this run did not rerank.
+        f"| cost — rerank | ${metrics.total_rerank_cost_usd:.4f} |"
+    )
     lines.append(
         f"| cost — generate + judge + rerank | "
         f"${metrics.total_generate_judge_rerank_cost_usd:.4f} |"
@@ -459,19 +423,14 @@ def main() -> int:
         help=f"Path to qa.jsonl (default: {DEFAULT_QA_PATH.relative_to(REPO_ROOT)}).",
     )
     parser.add_argument(
-        # Default reads settings.log_level (which honors .env) rather than
-        # os.environ directly — otherwise a .env-only LOG_LEVEL override is
-        # silently ignored for the eval loop but honored everywhere else.
         "--log-level",
-        default=settings.log_level,
+        default=settings.log_level,  # Settings reads .env; os.environ would miss it.
     )
     args = parser.parse_args()
 
     configure_logging(args.log_level)
     logger = get_logger("evals.run")
 
-    # Load + strict-validate the golden file up front — refuse to run against
-    # a broken qa.jsonl. Same contract as `make validate`.
     records, per_line_errors = load_jsonl(args.qa_path)
     if per_line_errors:
         print(f"\nCannot evaluate: {args.qa_path} has {len(per_line_errors)} parse/schema errors:")
@@ -481,19 +440,12 @@ def main() -> int:
         print("\nFix the file (or run `make validate`) and re-run `make eval`.\n")
         return 1
     if not records:
-        # Zero-record run is not an error — it's normal during golden-set
-        # authoring before any Q&As exist. Print + exit cleanly so `make
-        # eval` on a fresh clone doesn't look like a broken step.
         print(f"\n{args.qa_path} has zero records — nothing to evaluate. Exiting.\n")
         return 0
 
     cfg = get_pipeline(args.pipeline)
 
     run_started = datetime.now(UTC)
-    # Microseconds in the id so two runs kicked off inside the same second
-    # (rerun-fast, accidental `make eval &`) get separate directories AND
-    # the `_snapshot_llm_calls` filter (`rec["run_id"] == run_id`) doesn't
-    # pull the other run's records into this run's snapshot.
     run_id = f"eval_{run_started.strftime('%Y%m%dT%H%M%S_%fZ')}"
     run_dir = settings.evals_dir / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -528,10 +480,6 @@ def main() -> int:
         model=settings.judge_model,
         log_path=settings.llm_call_log,
     )
-    # Reranker: only build when the active pipeline needs one (P4). Keeping
-    # construction conditional so that pipelines that don't need it don't instantiate
-    # a Cohere client at all — not strictly needed today (Settings already
-    # requires COHERE_API_KEY), but it's one fewer dependency on the hot path.
     reranker: CohereReranker | None = None
     if cfg.reranker is not None:
         reranker = CohereReranker(
@@ -542,8 +490,6 @@ def main() -> int:
 
     results: list[QAResult] = []
     wall_started = time.perf_counter()
-    # Open the results file up front + write per Q&A so a crash mid-run
-    # still leaves a partial artifact the operator can inspect.
     with (
         VectorStore(settings.database_url) as store,
         results_path.open("w", encoding="utf-8") as results_fp,
@@ -603,14 +549,8 @@ def main() -> int:
             "answer": ANSWER_PROMPT_VERSION,
             "judge": JUDGE_PROMPT_VERSION,
         },
-        # `config.pipeline` = full PipelineConfig (chunker/retriever/reranker
-        # knobs + derived tag and chunk_set_id) so the artifact records both
-        # pipeline identity and the physical retrieval set. These identifiers
-        # are intentionally NOT duplicated outside `config.pipeline`.
-        # `config.models` = provider identities held constant across pipelines
-        # (chat, judge, embedding) — kept separate because they're not part of
-        # the pipeline's identity (a change here doesn't warrant a new pipeline tag,
-        # but it DOES belong in the manifest for reproducibility).
+        # Pipeline identity stays in config.pipeline. Model ids sit beside it
+        # because a model change does not mint a new pipeline tag.
         "config": {
             "pipeline": pipeline_to_manifest_dict(cfg),
             "models": {
@@ -681,9 +621,6 @@ def main() -> int:
     )
     print(f"  artifacts: {artifacts_display}")
     print("────────────────────────────────────────────────────────────\n")
-    # Always exit 0 — per-Q&A skips are reported in summary.md; the
-    # operator decides whether to iterate. A crash before this point still
-    # exits non-zero via the usual Python semantics.
     return 0
 
 

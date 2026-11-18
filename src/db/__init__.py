@@ -1,6 +1,4 @@
-"""Postgres+pgvector schema for the RAG pipeline.
+"""Postgres+pgvector schema for stored documents and chunk sets.
 
-The schema itself lives in schema.sql — kept as raw SQL (not ORM classes)
-because there is exactly one code path that reads it and the SQL is more
-scannable than any DSL rendering of it.
+The schema itself live in schema.sql. This package does not define ORM models.
 """

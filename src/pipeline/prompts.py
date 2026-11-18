@@ -1,12 +1,4 @@
-"""Shared prompt-loading helpers and constants for the P1 pipeline.
-
-Both `src.pipeline.query` (answer prompt) and `src.pipeline.judge` (judge
-prompt) parse a section-based prompt file at `prompts/<role>/<version>.md`,
-substitute `{out_of_corpus_sentinel}` at load time, and validate that every
-per-request placeholder the caller will fill is actually present. Keeping
-one loader + one sentinel here means the two callers can't drift on either
-the parse rules or the sentinel literal.
-"""
+"""Shared prompt-loading helpers and constants for the pipelines."""
 
 from __future__ import annotations
 
@@ -14,21 +6,11 @@ import functools
 import re
 from pathlib import Path
 
-# Repo-relative prompts directory. `parents[2]` from `src/pipeline/prompts.py`
-# lands on the repo root — the same anchor query.py / judge.py used before.
 PROMPTS_DIR = Path(__file__).resolve().parents[2] / "prompts"
 
-# Section markers inside a prompt file. Anchored to line starts (re.MULTILINE)
-# rather than substring `find` — otherwise a body comment like
-# `contrast with the '# User template' section` would silently shift the
-# parsed boundary and truncate the system body.
 _SYSTEM_MARKER_RE = re.compile(r"^# System[ \t]*$", re.MULTILINE)
 _USER_TEMPLATE_MARKER_RE = re.compile(r"^# User template[ \t]*$", re.MULTILINE)
 
-# Exact sentinel string Claude must return when the context doesn't cover
-# the question. Threaded INTO both the answer and judge prompt templates as
-# `{out_of_corpus_sentinel}` so this constant is the single source of truth —
-# the prompt files cannot drift to a different literal string.
 OUT_OF_CORPUS_SENTINEL = "This isn't covered in the provided course materials."
 
 
@@ -96,12 +78,6 @@ def load_prompt(
     raw_system = text[sys_match.end() : user_match.start()].strip()
     user_template = text[user_match.end() :].strip()
 
-    # Fail fast on template drift.
-    #   - The system body MUST reference {out_of_corpus_sentinel}, or the
-    #     code constant and the prompt's actual instruction would silently
-    #     drift apart.
-    #   - The user template MUST contain every per-request placeholder the
-    #     caller fills — otherwise a raw literal would be shipped to Claude.
     if "{out_of_corpus_sentinel}" not in raw_system:
         raise ValueError(
             f"{path}: system body must reference '{{out_of_corpus_sentinel}}' "

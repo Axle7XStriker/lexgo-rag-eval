@@ -1,43 +1,17 @@
-"""Ingest orchestrator — corpus PDFs → pgvector, per pipeline.
+"""Ingest corpus PDFs into the chunk set selected by a pipeline.
 
-For each present PDF in the manifest: extract text → chunk per the
-`--pipeline` selection → embed via Voyage → upsert into the `documents`
-and `chunks` tables. Chunks land tagged with the pipeline's derived
-`chunk_set_id` (`PipelineConfig.chunk_set_id`, hashes `ChunkerConfig`
-only), so pipelines with equal chunker configs share one physical copy
-of chunks + embeddings. Idempotent: unchanged documents (for the resolved
-chunk set) are skipped by content-hash short-circuit.
+Equal chunker configurations share one stored chunk set. A document is skipped
+only when its text hash matches and that chunk set already has rows. Each
+document replacement is one transaction, so failed writes remain retryable.
 
 CLI::
 
   python -m scripts.ingest [--pipeline p1] [--only DOC_PATH] [--force]
                            [--dry-run] [--batch-size N] [--log-level LEVEL]
 
-Design notes worth remembering:
-  - Idempotency key is `(documents.content_hash, chunks-exist-for-chunk_set_id)`.
-    Match on BOTH → skip embed + upsert; miss on either (or --force) →
-    re-embed. Requiring the chunks-exist half means a prior partial-
-    failure ingest recovers on the next run instead of being permanently
-    short-circuited by a stale hash. Keying on `chunk_set_id` means that once
-    P1 has populated the fixed(500,50) chunk set, subsequent
-    `--pipeline p3` / `--pipeline p4` runs correctly see "chunks already
-    present for this chunk set" and skip — no duplicate embedding spend.
-  - Per-doc write is one transaction: upsert `documents` + DELETE stale
-    chunks for `(doc_id, chunk_set_id)` + insert new chunks + commit.
-    Chunk-write failures roll back the document row's new hash too, so
-    the invariant above holds.
-  - One VectorStore, one VoyageEmbedder, one loop. No parallelism — the
-    Voyage SDK is sync, the DB writes are cheap, and the total budget is
-    a few hundred chunks. Parallelism would be complexity without payoff.
-  - Missing REQUIRED corpus files fail-fast at doc time (log + surface in
-    summary + non-zero exit). Missing OPTIONAL files (per MANIFEST.optional)
-    are warned + skipped; optional extract_failed / error are also demoted.
-  - Per-doc summary rows land in `logs/ingest_<utc_iso>.jsonl` — one JSONL
-    record per document with num_chunks, tokens, cost, elapsed. Per Voyage
-    call, one line lands in `logs/llm_calls.jsonl` tagged with the same
-    run_id so cost can be attributed to a specific ingest run.
-  - --dry-run opens NO database connection — extract + chunk + estimate
-    only. Useful for pre-flight cost checks on a laptop with no docker up.
+Required corpus failures make the command fail. Optional corpus failures are
+reported but do not change the exit status. A dry run opens no database and
+makes no paid embedding call.
 """
 
 from __future__ import annotations
@@ -66,21 +40,16 @@ from src.pipeline.hashing import join_pages
 from src.pipeline.pipeline_config import PIPELINES, PipelineConfig, get_pipeline
 from src.pipeline.store import ChunkRow, DocumentRow, VectorStore
 
-# Finite outcome set for one document's ingest attempt. Kept as a Literal so
-# the type checker catches typos across `_process_entry` and `_print_summary`.
 DocStatus = Literal["ingested", "skipped_unchanged", "missing", "extract_failed", "error"]
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CORPUS_ROOT = REPO_ROOT / "corpus"
-# Minimum extracted-text length below which a doc is treated as extraction
-# failure (log + skip, don't fail the run). Guards against a scanned PDF
-# with unreadable text yielding a spurious 0-chunk document row.
-MIN_EXTRACTED_CHARS = 200
+MIN_EXTRACTED_CHARS = 200  # Shorter text is a failed extract, not an empty document.
 
 
 @dataclass
 class DocResult:
-    """Per-document outcome. Written to the run log; aggregated into the summary."""
+    """Outcome and accounting for one manifest entry."""
 
     source_id: str
     doc_path: str
@@ -94,8 +63,7 @@ class DocResult:
 
 
 def _select_manifest_entries(only: str | None) -> list[ManifestEntry]:
-    """Return the manifest entries to process — the full manifest when `only` is None,
-    otherwise the subset matching either a full `dest_path` or a `source_id`."""
+    """Return the manifest entries to process. The full manifest when `only` is None."""
     if not only:
         return list(MANIFEST)
     matches = [e for e in MANIFEST if e.dest_path == only or e.source_id == only]
@@ -110,8 +78,6 @@ def _select_manifest_entries(only: str | None) -> list[ManifestEntry]:
 
 def _write_run_log(path: Path, results: list[DocResult]) -> None:
     """One JSON object per doc, appended to the per-run log."""
-    # Ensure the log directory exists — first-time runs on a fresh checkout
-    # hit this before anything else has written under logs/.
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:
         for r in results:
@@ -181,12 +147,7 @@ def _fetch_existing(
 
 
 def _tokens_since(log_path: Path, offset_bytes: int) -> tuple[int, float]:
-    """Sum input_tokens and cost_usd from `log_path` starting at `offset_bytes`.
-
-    Ingest snapshots the log file size before each doc's embed call; after
-    the call, everything appended since is attributed to that doc. This is
-    simpler and more accurate than duplicating token accounting in embed.py.
-    """
+    """Sum input_tokens and cost_usd from `log_path` starting at `offset_bytes`."""
     if not log_path.exists():
         return 0, 0.0
     tokens = 0
@@ -216,22 +177,7 @@ def _process_entry(
     logger,
     run_id: str | None = None,
 ) -> DocResult:
-    """Extract + chunk + embed + upsert one manifest entry. Never raises.
-
-    `cfg` — the active PipelineConfig. Its `chunk_set_id` goes into
-    the `chunks.chunk_set_id` column and drives the idempotency
-    short-circuit; its `tag` is logged alongside for pipeline-level
-    provenance. Its `chunker.algorithm` decides whether dry-run can
-    call `chunker(doc)` at all (semantic chunkers embed sentences
-    internally, so calling one in dry-run would violate the documented
-    "no Voyage calls" contract).
-
-    `chunker` — a callable that turns an ExtractedDoc into a list of Chunks.
-    Built once per run in `main()` from the active `cfg.chunker.algorithm`.
-
-    `store` may be None in --dry-run (no DB is opened at all). Real runs
-    must pass a live VectorStore.
-    """
+    """Ingest (extract + chunk + embed + upsert) one manifest entry and return failures as data."""
     pipeline_tag = cfg.tag
     chunk_set_id = cfg.chunk_set_id
     dest = CORPUS_ROOT / entry.dest_path
@@ -251,9 +197,6 @@ def _process_entry(
             logger.error("required_missing", doc_path=entry.dest_path, source_id=entry.source_id)
         return result
 
-    # Extract. `OSError` catches PermissionError, corrupt-file I/O errors,
-    # and anything pymupdf raises through the filesystem layer — without
-    # this, one unreadable PDF kills the whole run.
     try:
         doc = extract_pdf(dest)
     except (OSError, ValueError) as e:
@@ -276,21 +219,12 @@ def _process_entry(
         )
         return result
 
-    # Idempotency short-circuit — same content hash AND chunks exist for
-    # THIS chunk set, and not forced → skip. The chunks-exist leg is what
-    # keeps a partially-failed prior ingest (doc row committed, chunks
-    # empty) from being permanently skipped. Because the leg checks
-    # chunk_set_id (not pipeline tag), a `--pipeline p3` run after P1
-    # has populated the fixed(500,50) chunk set CORRECTLY no-ops on
-    # every doc — the two pipelines share one chunk set by design.
+    # A matching document with no chunks is a partial ingest and must retry.
     if store is not None:
         try:
             existing = _fetch_existing_retrying(store, entry.dest_path, chunk_set_id)
         except psycopg.Error as e:
-            # A failed SELECT on a live connection poisons the transaction
-            # until rolled back — otherwise every subsequent doc's SELECT
-            # fails with `current transaction is aborted`. A dropped socket
-            # cannot be rolled back; leave it and surface the doc error.
+            # Reset recoverable state so later documents can continue.
             store._rollback_if_alive()
             result.status = "error"
             result.error = f"idempotency lookup failed: {type(e).__name__}: {e}"
@@ -310,18 +244,11 @@ def _process_entry(
             )
             return result
 
-    # --dry-run early exit for chunkers that themselves call the embedder.
-    # The semantic chunker embeds every sentence internally, so invoking it
-    # here would burn real budget and silently populate `logs/llm_calls.jsonl`
-    # while the summary reports `cost_usd = 0.0`. Instead, estimate the
-    # sentence-embed token count directly from the raw doc text (an upper
-    # bound: the real run also embeds each chunk once at ingest time, but
-    # the sentence pass dominates). num_chunks is left at 0 because the
-    # chunk count is only knowable after actually chunking.
+    # Avoid the semantic chunker's paid sentence embeddings during a dry run.
     if dry_run and cfg.chunker.algorithm == "semantic":
         encoder = tiktoken.get_encoding(cfg.chunker.encoding)
         estimated_tokens = len(encoder.encode(join_pages([p.text for p in doc.pages])))
-        result.status = "ingested"  # dry-run success shape
+        result.status = "ingested"
         result.num_chunks = 0
         result.tokens_embedded = estimated_tokens
         result.cost_usd = 0.0
@@ -334,7 +261,6 @@ def _process_entry(
         )
         return result
 
-    # Chunk via the pipeline-specific chunker passed in from main().
     chunks = chunker(doc)
     result.num_chunks = len(chunks)
     if not chunks:
@@ -345,10 +271,8 @@ def _process_entry(
         return result
 
     if dry_run:
-        # Report tokens as the sum of per-chunk num_tokens — an estimate, not
-        # a Voyage-billed number. Useful for a pre-flight cost check.
         estimated_tokens = sum(c.num_tokens for c in chunks)
-        result.status = "ingested"  # dry-run success shape
+        result.status = "ingested"
         result.tokens_embedded = estimated_tokens
         result.cost_usd = 0.0
         result.elapsed_ms = (time.perf_counter() - started) * 1000
@@ -362,10 +286,6 @@ def _process_entry(
 
     assert store is not None, "non-dry-run requires a live VectorStore"
 
-    # Embed. Snapshot log size so we can attribute per-doc token counts.
-    # If a batch fails partway through, tokens for earlier successful
-    # batches are still in the log — attribute what actually landed so
-    # the summary reflects real spend even on partial-failure docs.
     log_offset = log_path.stat().st_size if log_path.exists() else 0
     try:
         embeddings = embedder.embed_documents([c.text for c in chunks], run_id=run_id)
@@ -392,10 +312,7 @@ def _process_entry(
     result.tokens_embedded = tokens_billed
     result.cost_usd = cost
 
-    # Atomic write: upsert doc + wipe stale chunks for this chunk set +
-    # insert new chunks, all in one transaction. If chunks fail, the doc
-    # row rolls back too — so the next run's hash check won't skip a
-    # half-ingested doc, and shrinking chunk sets don't leave orphans.
+    # Replace the document and its chunk set together to avoid partial ingests.
     doc_row = DocumentRow(
         source_id=entry.source_id,
         doc_path=entry.dest_path,
@@ -419,8 +336,6 @@ def _process_entry(
     try:
         store.replace_document_chunks(doc_row, chunk_rows, chunk_set_id=chunk_set_id)
     except Exception as e:
-        # DB errors surface into the summary rather than aborting the whole
-        # run — the outer main() exits non-zero if any required entry failed.
         result.status = "error"
         result.error = f"upsert failed: {type(e).__name__}: {e}"
         result.elapsed_ms = (time.perf_counter() - started) * 1000
@@ -466,9 +381,6 @@ def _print_summary(results: list[DocResult]) -> None:
     )
     for status in ("missing", "extract_failed", "error"):
         rows = buckets.get(status, [])
-        # `missing` is the only status that splits required vs. optional —
-        # optional-missing is demoted to a low-noise line, required-missing
-        # (and every extract_failed / error) stays loud.
         is_missing_status = status == "missing"
         if is_missing_status:
             required_rows = [r for r in rows if _is_required(r.doc_path)]
@@ -493,7 +405,7 @@ def _is_required(doc_path: str) -> bool:
     for e in MANIFEST:
         if e.dest_path == doc_path:
             return not e.optional
-    return True  # unknown path → treat as required so it stays loud
+    return True
 
 
 def _build_chunker(
@@ -502,13 +414,6 @@ def _build_chunker(
     embedder: VoyageEmbedder,
     run_id: str,
 ) -> Callable[[ExtractedDoc], list[Chunk]]:
-    """Dispatch on `cfg.chunker.algorithm` and return an ExtractedDoc→chunks callable.
-
-    Constructing the closure once per run (rather than per document) means
-    the embedder + run_id are captured for the semantic chunker without
-    threading them through `_process_entry`. Each new chunker algorithm
-    adds one `elif` branch here.
-    """
     algorithm = cfg.chunker.algorithm
     if algorithm == "fixed":
         return lambda doc: chunk_fixed(doc, cfg.chunker)
@@ -557,9 +462,6 @@ def main() -> int:
         help="Override Voyage embed batch size (default: 64).",
     )
     parser.add_argument(
-        # Default reads settings.log_level (which honors .env) rather than
-        # os.environ directly — otherwise a .env-only LOG_LEVEL override is
-        # silently ignored for ingest but honored everywhere else.
         "--log-level",
         default=settings.log_level,
     )
@@ -587,11 +489,8 @@ def main() -> int:
     if args.batch_size is not None:
         embedder_kwargs["batch_size"] = args.batch_size
 
-    # run_id ties per-doc rows in `ingest_run_<ts>.jsonl` to per-call rows in
-    # `llm_calls.jsonl` so a cost regression can be attributed to a specific
-    # run without timestamp-window heuristics.
     run_started = datetime.now(UTC)
-    run_id = f"ingest_{run_started.strftime('%Y%m%dT%H%M%SZ')}"
+    run_id = f"ingest_{run_started.strftime('%Y%m%dT%H%M%SZ')}"  # Joins both log streams.
     run_log = settings.log_dir / f"{run_id}.jsonl"
 
     embedder = VoyageEmbedder(
@@ -604,8 +503,6 @@ def main() -> int:
     chunker = _build_chunker(cfg, embedder=embedder, run_id=run_id)
 
     results: list[DocResult] = []
-    # --dry-run runs entirely without a DB — the point of dry-run is to
-    # pre-flight the corpus + estimate cost on a laptop with no docker up.
     store_ctx = _NullContext() if args.dry_run else VectorStore(settings.database_url)
     with store_ctx as store:
         if store is not None:
@@ -645,13 +542,6 @@ def main() -> int:
 
 
 def _any_required_failed(results: list[DocResult]) -> bool:
-    """True iff any REQUIRED entry ended in a failure status.
-
-    Failure statuses are missing, extract_failed, and error. Optional
-    entries in ANY of those states are demoted to non-failure — an
-    operator-placed optional PDF that is corrupt should not be louder
-    than one that is simply absent.
-    """
     return any(
         r.status in {"error", "extract_failed", "missing"} and _is_required(r.doc_path)
         for r in results
@@ -659,7 +549,7 @@ def _any_required_failed(results: list[DocResult]) -> bool:
 
 
 class _NullContext:
-    """Context manager that yields None. Used to skip DB open in --dry-run."""
+    """Context manager used when a dry run must not open the database."""
 
     def __enter__(self) -> None:
         return None

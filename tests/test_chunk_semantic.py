@@ -1,8 +1,6 @@
 """Semantic chunker tests. Fully offline — fake embedder returns canned vectors.
 
-Mirrors `tests/test_chunk.py`'s style: synthetic `ExtractedDoc`s and a
-`_FakeEmbedder` injected in place of Voyage. Covers:
-
+Covers:
   - Sentence splitter edge cases (periods, question marks, ellipses,
     paragraph breaks, bullet-like content).
   - Boundary math: canned distances that make the 95th-percentile cut
@@ -31,8 +29,6 @@ from src.pipeline.chunk_semantic import (
 from src.pipeline.embed import VoyageEmbedder
 from src.pipeline.extract import ExtractedDoc, PageText
 from src.pipeline.pipeline_config import ChunkerConfig
-
-# ── Fixtures ──────────────────────────────────────────────────────────
 
 
 def _doc(pages: list[str]) -> ExtractedDoc:
@@ -64,14 +60,11 @@ def _cfg(
 
 @dataclass
 class _FakeEmbedder:
-    """Duck-types VoyageEmbedder — returns canned vectors keyed by input text.
+    """Duck-types VoyageEmbedder — returns canned vectors keyed by input text."""
 
-    `vectors_by_prefix` maps a sentence-prefix substring → vector. The
-    first prefix that matches a sentence wins. Sentences with no matching
-    prefix get `default_vector`.
-    """
-
+    # maps a sentence-prefix substring → vector
     vectors_by_prefix: dict[str, list[float]] = field(default_factory=dict)
+    # used for sentences with no matching prefix
     default_vector: list[float] = field(default_factory=lambda: [1.0, 0.0, 0.0, 0.0])
     calls: list[dict] = field(default_factory=list)
 
@@ -93,9 +86,6 @@ class _FakeEmbedder:
         return out
 
 
-# ── Sentence splitter ────────────────────────────────────────────────
-
-
 class TestSplitSentences:
     def test_period_question_exclamation(self) -> None:
         doc = _doc(["First. Second? Third! Fourth."])
@@ -103,7 +93,6 @@ class TestSplitSentences:
         assert [s.text for s in sents] == ["First.", "Second?", "Third!", "Fourth."]
 
     def test_paragraph_break_splits(self) -> None:
-        # A blank line is a hard split even without terminal punctuation.
         doc = _doc(["Alpha paragraph without period\n\nBeta paragraph"])
         sents = _split_sentences(doc)
         assert [s.text for s in sents] == [
@@ -112,8 +101,6 @@ class TestSplitSentences:
         ]
 
     def test_ellipsis_not_split_mid_sentence(self) -> None:
-        # `...` inside a sentence followed by lowercase should not split.
-        # (Regex requires capital/digit/bracket after the whitespace.)
         doc = _doc(["I was thinking... maybe we shouldn't. Second sentence."])
         sents = _split_sentences(doc)
         assert [s.text for s in sents] == [
@@ -136,8 +123,6 @@ class TestSplitSentences:
         ]
 
     def test_blank_middle_page_preserves_page_numbers(self) -> None:
-        # Mirrors test_extract's blank-page invariant: sentences on page 3
-        # must still report page 3 even if page 2 is empty.
         doc = _doc(["Alpha.", "", "Gamma."])
         sents = _split_sentences(doc)
         assert [(s.text, s.page_start, s.page_end) for s in sents] == [
@@ -146,9 +131,6 @@ class TestSplitSentences:
         ]
 
     def test_sentence_wrapping_across_pages_is_not_fragmented(self) -> None:
-        # A sentence that line-wraps across a PDF page boundary must remain
-        # one sentence — pre-fix, per-page splitting fragmented it into two
-        # meaningless half-sentences and corrupted the distance signal.
         doc = _doc(
             [
                 "Prior sentence. The quicksort algorithm has average-",
@@ -156,16 +138,11 @@ class TestSplitSentences:
             ]
         )
         sents = _split_sentences(doc)
-        # The wrapped sentence stays one _Sentence — both halves are present
-        # in a single entry. The exact joiner between halves (space or `\n`)
-        # is not asserted here; what matters is that they weren't split into
-        # two half-sentences.
         assert len(sents) == 3
         assert sents[0].text == "Prior sentence."
         assert sents[2].text == "Following sentence."
         assert "average-" in sents[1].text
         assert "case complexity O(n log n)." in sents[1].text
-        # The wrapped sentence spans both pages; the others sit on one page each.
         assert [(s.page_start, s.page_end) for s in sents] == [(1, 1), (1, 2), (2, 2)]
 
     def test_page_boundary_between_sentences_does_not_over_split(self) -> None:
@@ -178,12 +155,8 @@ class TestSplitSentences:
         assert [s.text for s in sents] == ["First.", "Second.", "Third.", "Fourth."]
 
 
-# ── Percentile helper ────────────────────────────────────────────────
-
-
 class TestPercentile:
     def test_nearest_rank_at_boundary(self) -> None:
-        # 10 values → 95th percentile = value at index ceil(0.95*10)-1 = 9 (max).
         assert _percentile(list(range(10)), 95.0) == 9
 
     def test_median(self) -> None:
@@ -201,9 +174,6 @@ class TestPercentile:
             _percentile([1.0], 150.0)
 
 
-# ── Cosine distance ──────────────────────────────────────────────────
-
-
 class TestCosineDistance:
     def test_identical_vectors_zero(self) -> None:
         assert _cosine_distance([1.0, 0.0], [1.0, 0.0]) == pytest.approx(0.0)
@@ -215,20 +185,11 @@ class TestCosineDistance:
         assert _cosine_distance([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(2.0)
 
     def test_zero_vector_returns_max_distance(self) -> None:
-        # Guard against div-by-zero on a degenerate embedding.
         assert _cosine_distance([0.0, 0.0], [1.0, 0.0]) == 1.0
-
-
-# ── Chunker: happy path + boundary placement ─────────────────────────
 
 
 class TestChunkerHappyPath:
     def test_cuts_land_at_expected_boundary(self) -> None:
-        # 5 sentences, first 3 point one way, last 2 point orthogonally.
-        # Consecutive distances will be roughly [0, 0, 1, 0] — the single
-        # `1.0` (max) lands ≥ 95th percentile, so exactly one cut fires,
-        # between sentences 3 and 4. Bounds are permissive (min=1, max=999)
-        # so the cut is preserved.
         pages = [
             "Alpha sentence about dogs. Beta about dogs too. Gamma dogs again. "
             "Delta about photosynthesis. Epsilon photosynthesis too."
@@ -263,7 +224,6 @@ class TestChunkerHappyPath:
         assert embedder.calls == [{"n": 2, "run_id": "run_abc"}]
 
     def test_content_hashes_deterministic(self) -> None:
-        # Same input + same fake vectors → identical Chunk.content_hash.
         embedder = _FakeEmbedder()
         pages = ["First. Second. Third. Fourth."]
         a = chunk_semantic(_doc(pages), embedder=embedder, config=_cfg(min_tokens=1))
@@ -280,14 +240,11 @@ class TestChunkerHappyPath:
         assert [c.chunk_index for c in chunks] == list(range(6))
 
 
-# ── Early returns ────────────────────────────────────────────────────
-
-
 class TestEarlyReturns:
     def test_empty_doc_returns_empty(self) -> None:
         embedder = _FakeEmbedder()
         assert chunk_semantic(_doc([]), embedder=embedder, config=_cfg()) == []
-        assert embedder.calls == []  # no wasted API call
+        assert embedder.calls == []
 
     def test_whitespace_only_returns_empty(self) -> None:
         embedder = _FakeEmbedder()
@@ -303,11 +260,7 @@ class TestEarlyReturns:
         )
         assert len(chunks) == 1
         assert chunks[0].text == "Just one sentence."
-        # No embed call — the single-sentence path short-circuits.
         assert embedder.calls == []
-
-
-# ── Page attribution ─────────────────────────────────────────────────
 
 
 class TestPageRanges:
@@ -321,14 +274,12 @@ class TestPageRanges:
         assert [(c.page_start, c.page_end) for c in chunks] == [(1, 1)] * 3
 
     def test_multi_page_chunk_reports_page_range(self) -> None:
-        embedder = _FakeEmbedder()  # every sentence gets default_vector
+        embedder = _FakeEmbedder()
         chunks = chunk_semantic(
             _doc(["Short.", "Also short.", "Third short."]),
             embedder=embedder,
             config=_cfg(min_tokens=100, percentile_threshold=95.0),
         )
-        # min_tokens=100 forces all groups to merge → one chunk spanning
-        # pages 1-3.
         assert len(chunks) == 1
         assert chunks[0].page_start == 1
         assert chunks[0].page_end == 3
@@ -340,20 +291,13 @@ class TestPageRanges:
             embedder=embedder,
             config=_cfg(min_tokens=100, percentile_threshold=95.0),
         )
-        # Single merged chunk covers pages 1-3 even though page 2 is blank.
         assert len(chunks) == 1
         assert chunks[0].page_start == 1
         assert chunks[0].page_end == 3
 
 
-# ── Bound enforcement ────────────────────────────────────────────────
-
-
 class TestBoundEnforcement:
     def test_undersized_groups_merge(self) -> None:
-        # Distances are roughly [0, 0.8, 1, 0], so percentile cutting creates
-        # groups [Alpha, Beta], [Gamma], and [Delta, Epsilon]. The undersized
-        # Gamma group should merge left across the lower-distance boundary.
         embedder = _FakeEmbedder(
             vectors_by_prefix={
                 "Alpha": [1.0, 0.0],
@@ -384,9 +328,6 @@ class TestBoundEnforcement:
                 "Zeta": [0.5, 0.8660254],
             },
         )
-        # The 100th-percentile cut separates Alpha from the rest. The
-        # remaining oversized group must then split at its strongest
-        # internal boundary, between Delta and Epsilon.
         chunks = chunk_semantic(
             _doc(["Alpha one. Beta two. Gamma three. Delta four. Epsilon five. Zeta six."]),
             embedder=embedder,
@@ -400,25 +341,19 @@ class TestBoundEnforcement:
         assert all(chunk.num_tokens <= 9 for chunk in chunks)
 
     def test_single_oversized_sentence_falls_back_to_fixed_split(self) -> None:
-        # A single sentence longer than max_tokens has no semantic
-        # boundary to split on — the fallback fixed-window split must fire.
         embedder = _FakeEmbedder()
-        long_sentence = "word " * 200 + "end."  # ~200 tokens, max_tokens=50
+        long_sentence = "word " * 200 + "end."
         chunks = chunk_semantic(
             _doc([long_sentence]),
             embedder=embedder,
             config=_cfg(min_tokens=1, max_tokens=50, percentile_threshold=95.0),
         )
-        assert len(chunks) > 1  # split into windows
+        assert len(chunks) > 1
         assert chunks[-1].num_tokens <= 50
         assert all(c.num_tokens == 50 for c in chunks[:-1])
         assert "".join(c.text for c in chunks) == long_sentence
         assert embedder.calls == []
-        # All chunks share the sentence's originating page.
         assert all(c.page_start == 1 and c.page_end == 1 for c in chunks)
-
-
-# ── Validation ───────────────────────────────────────────────────────
 
 
 class TestConfigValidation:
@@ -470,11 +405,7 @@ class TestConfigValidation:
             chunk_semantic(_doc(["A."]), embedder=embedder, config=cfg)
 
 
-# ── Structural guard ─────────────────────────────────────────────────
-
-
 def test_fake_embedder_signature_matches_real() -> None:
-    """Same guard as test_ingest.py — chunker's fake embedder must match Voyage's."""
     real = inspect.signature(VoyageEmbedder.embed_documents)
     fake = inspect.signature(_FakeEmbedder.embed_documents)
     assert fake == real

@@ -1,15 +1,4 @@
-"""Shared fake Anthropic client + error factories used by test_generate and test_judge.
-
-Both ClaudeGenerator and ClaudeJudge wrap the sync `anthropic.Anthropic`
-client with the same `.messages.create(**kwargs)` surface, the same
-tenacity retry policy, and the same typed-exception classes. The fakes here
-are the seam their tests inject via `client=`.
-
-Kept as a plain module (not a conftest fixture) because tests need to
-construct these types explicitly per-case — programming canned responses,
-raising specific exceptions, inspecting recorded calls — not just receive
-a wired-up default.
-"""
+"""Shared fake Anthropic client + error factories used by test_generate and test_judge."""
 
 from __future__ import annotations
 
@@ -28,12 +17,10 @@ from anthropic import (
     RateLimitError,
 )
 
-# ── Anthropic response shape ──────────────────────────────────────────
-
 
 @dataclass
 class FakeTextBlock:
-    """Shape of a `text` block in response.content — only the two fields we read."""
+    """Shape of a `text` block in response.content — only what we read."""
 
     text: str
     type: str = "text"
@@ -54,15 +41,12 @@ class FakeMessage:
     stop_reason: str = "end_turn"
 
 
-# One entry in `FakeMessagesAPI.responses`: either a canned message or a
-# callable invoked with the request kwargs so retry tests can raise then
-# succeed. Mirrors the `_ResponseItem` pattern in tests/test_embed.py.
 ResponseItem = FakeMessage | Callable[[dict], FakeMessage]
 
 
 @dataclass
 class FakeMessagesAPI:
-    """Duck-types client.messages — only `.create()` because that's all we call."""
+    """Duck-types client.messages — only what we call."""
 
     responses: list[ResponseItem] = field(default_factory=list)
     calls: list[dict] = field(default_factory=list)
@@ -70,7 +54,6 @@ class FakeMessagesAPI:
     def create(self, **kwargs) -> FakeMessage:
         self.calls.append(kwargs)
         if not self.responses:
-            # Sensible default so tests that don't program responses still work.
             return FakeMessage(
                 content=[FakeTextBlock(text="ok")],
                 usage=FakeUsage(input_tokens=10, output_tokens=5),
@@ -83,15 +66,11 @@ class FakeMessagesAPI:
 
 @dataclass
 class FakeClient:
-    """Duck-types anthropic.Anthropic. Only `.messages` is used."""
+    """Duck-types anthropic.Anthropic. Only what is used."""
 
     messages: FakeMessagesAPI = field(default_factory=FakeMessagesAPI)
 
 
-# ── Error factories ───────────────────────────────────────────────────
-
-# httpx Request/Response are required by the SDK's typed exceptions. Building
-# one once at module level keeps the factory calls readable.
 _HTTP_REQ = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
 
 
@@ -121,9 +100,6 @@ def connection_error() -> APIConnectionError:
 
 def timeout_error() -> APITimeoutError:
     return APITimeoutError(request=_HTTP_REQ)
-
-
-# ── Log helpers ───────────────────────────────────────────────────────
 
 
 def read_log(path: Path) -> list[dict]:

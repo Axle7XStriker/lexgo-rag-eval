@@ -25,11 +25,11 @@ def configure_logging(log_level: str = "INFO") -> None:
     """Configure structlog. Idempotent.
 
     Renderer is chosen by whether stderr is a TTY:
-      - TTY  → structlog.dev.ConsoleRenderer (colorized, human-readable).
+      - TTY: structlog.dev.ConsoleRenderer (colorized, human-readable).
         This is what you get during interactive CLI runs (`make corpus`,
         `streamlit run`) where JSON-per-line would drown out the
         progress printouts.
-      - non-TTY → JSONRenderer (CI, redirection, log-collection pipelines
+      - non-TTY: JSONRenderer (CI, redirection, log-collection pipelines
         that expect one JSON record per line).
     """
     is_tty = sys.stderr.isatty()

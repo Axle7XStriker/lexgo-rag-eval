@@ -31,18 +31,12 @@ from src.pipeline.store import RetrievedChunk, VectorStore
 
 _logger = get_logger("query")
 
-# `role` + `version` locate the prompt file at prompts/<role>/<version>.md.
-# When we author a v2 answer prompt, bump PROMPT_VERSION here. Any change to
-# the prompt file's semantics MUST come with a version bump.
 PROMPT_ROLE = "answer"
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v1"  # Bump when answer semantics change.
 
-# Placeholders the answer user template MUST contain — enforced at load time.
 _REQUIRED_USER_PLACEHOLDERS: tuple[str, ...] = ("{question}", "{context}")
 
-# Match [N] citation brackets. Anchored with `[` and `]` — Claude occasionally
-# emits `(1)` or bare `1.` prose references; those are intentionally ignored.
-_CITATION_RE = re.compile(r"\[(\d+)\]")
+_CITATION_RE = re.compile(r"\[(\d+)\]")  # Only [N] is a citation.
 
 
 @dataclass(frozen=True)
@@ -65,8 +59,6 @@ class RetrievedCitation:
 
 @dataclass(frozen=True)
 class QueryResult:
-    """Full return shape of `answer_question`. Consumed by Streamlit + eval loop."""
-
     query: str
     answer: str
     citations: list[RetrievedCitation]  # first-mention order, deduped
@@ -154,13 +146,7 @@ def _parse_citations(
 
 
 def _validate_retriever_config(retriever_config: RetrieverConfig) -> None:
-    """Reject unsupported or incomplete retriever configurations.
-
-    Hybrid-only: `rrf_k` must be set and positive. Catching `rrf_k <= 0`
-    here (not deeper in `_rrf_fuse`) means a misconfigured pipeline fails
-    before `embed_query` spends a Voyage call — the pipeline embed cost
-    for a run that was always going to fail is strictly waste.
-    """
+    """Reject unsupported or incomplete retriever configurations."""
     if retriever_config.kind not in ("dense", "hybrid"):
         raise ValueError(f"unknown retriever.kind: {retriever_config.kind!r}")
     if retriever_config.kind == "hybrid":
@@ -241,17 +227,6 @@ def answer_question(
       7. Format enumerated context block, substitute into the user template.
       8. Call Claude for the answer.
       9. Parse `[N]` citations, map to `RetrievedChunk` provenance, dedup.
-
-    `reranker` and `reranker_config` must both be provided or both omitted
-    (invariant enforced in `_validate_reranker_pair`).
-
-    If a stage after reranking fails, `QueryExecutionError` retains the paid
-    rerank cost while preserving the original exception as its cause.
-
-    Wall-clock `latency_ms` covers the whole run (steps 1-9, whichever ran);
-    individual provider tokens/cost land in `logs/llm_calls.jsonl` per each
-    client's own bookkeeping. `QueryResult.rerank_cost_usd` is populated
-    from the Cohere call when the reranker ran (0.0 otherwise).
     """
     started = time.perf_counter()
     _validate_retriever_config(retriever)
@@ -272,11 +247,7 @@ def answer_question(
     )
 
     if not retrieved:
-        # Empty retrieval → the prompt would have Claude respond with the
-        # sentinel anyway; skipping the call saves the token spend and keeps
-        # cost accounting clean for the degenerate case (wrong chunk_set_id,
-        # empty DB, over-filtering). Reranker is also skipped — no candidates
-        # to re-order means no reason to spend.
+        # Empty retrieval must not incur rerank or generation cost.
         _logger.info(
             "empty_retrieval",
             query=query,
@@ -298,12 +269,7 @@ def answer_question(
             rerank_cost_usd=0.0,
         )
 
-    # Rerank + generate live inside the same try so a billed-but-failed
-    # rerank (RerankExecutionError carries its own cost_usd) or any later
-    # failure both preserve the paid rerank cost via QueryExecutionError.
-    # A pre-API rerank failure (retries exhausted, httpx raise) leaves the
-    # local accumulator at 0.0 — no billing happened, nothing to preserve.
-    rerank_cost_usd = 0.0
+    rerank_cost_usd = 0.0  # Kept when generation or parsing fails after a paid rerank.
     try:
         if reranker is not None:
             rr = reranker.rerank(
@@ -342,16 +308,11 @@ def answer_question(
             rerank_cost_usd=rerank_cost_usd,
         )
     except Exception as exc:
-        # RerankExecutionError carries the paid cost on itself (parse error
-        # after Cohere returned); unwrap to the underlying cause so the
-        # caller sees the real failure class, not an internal wrapper.
         if isinstance(exc, RerankExecutionError):
             rerank_cost_usd = exc.cost_usd
             cause: Exception = exc.cause
         else:
             cause = exc
         if reranker is None:
-            # No reranker configured → no paid cost to smuggle, no reason
-            # to wrap. Preserve the original raise.
             raise
         raise QueryExecutionError(cause, rerank_cost_usd=rerank_cost_usd) from exc

@@ -1,1 +1,1 @@
-"""RAG pipeline building blocks: chunker → embed → store → retrieve → answer → judge."""
+"""RAG pipeline building blocks: chunk, embed, store, retrieve, answer, and judge."""

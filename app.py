@@ -1,15 +1,7 @@
 """lexgo — RAG eval demo (Streamlit entrypoint).
 
-This file is the landing page. Two subpages live in `pages/`:
-  - Demo — query the RAG pipeline (lands W3)
-  - Author — hand-curate the 100-Q&A golden set
-
-Streamlit auto-discovers the `pages/` directory and renders navigation in
-the sidebar. Booting via `make app` opens all three pages.
-
-Per-page browser-tab icons are set via `st.set_page_config(page_icon=...)`
-inside each page file — kept out of the filenames so `git`, `ls`, and shell
-completion stay ergonomic.
+Landing page. Demo and Author live in `pages/` and Streamlit discovers them.
+Page icons are set inside each page file so the filenames stay plain.
 """
 
 import streamlit as st

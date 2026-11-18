@@ -40,9 +40,6 @@ from src.qa_schema import (
     load_jsonl,
 )
 
-# The single source of truth for "which PDFs are in the corpus." Any citation
-# whose doc_path is not here means either (a) a typo, or (b) someone forgot to
-# add the PDF to the manifest. Both are eval-breaking — treat as errors.
 KNOWN_DOC_PATHS: set[str] = {entry.dest_path for entry in MANIFEST}
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -120,8 +117,6 @@ def build_report(records: list[QARecord], errors: list[LineError]) -> Validation
     """
     id_counter = Counter(r.id for r in records)
     duplicate_ids = sorted(id_ for id_, n in id_counter.items() if n > 1)
-    # Dedupe: same bad doc_path cited twice within a record (or across records)
-    # should not inflate the count — one entry per (record_id, doc_path).
     seen: set[str] = set()
     unknown_doc_paths: list[str] = []
     for r in records:
@@ -168,10 +163,6 @@ def _print_report(report: ValidationReport, path: Path) -> None:
             semantic_paraphrase          3 / 20   [===-----------------]
             out_of_corpus                1 / 10   [==------------------]
             adversarial                  1 / 5    [====----------------]
-
-    When errors, duplicate ids, or unknown doc_paths are present, they are
-    listed above the progress table. When the set is complete + distribution
-    correct, a `✓ 100 records, distribution matches target` line is appended.
     """
     print(f"\nlexgo golden set: {path}")
     print(
@@ -212,7 +203,7 @@ def _print_report(report: ValidationReport, path: Path) -> None:
 
 
 def _typed_report_exit_code(report: ValidationReport) -> int:
-    """Map a ValidationReport to the CLI exit code — see module docstring."""
+    """Map a ValidationReport to the CLI exit code"""
     if not report.is_clean:
         return 1
     if report.is_overfull:
@@ -223,8 +214,6 @@ def _typed_report_exit_code(report: ValidationReport) -> int:
 
 
 def main() -> int:
-    """CLI entry point. Parses --path, runs `validate_golden`, prints the
-    report, and returns the exit code documented in the module docstring."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "--path",

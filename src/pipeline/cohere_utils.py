@@ -1,18 +1,4 @@
-"""Shared helpers for Cohere client wrappers (currently CohereReranker).
-
-Mirror of `src.pipeline.anthropic_utils`. Lives here so a change (new
-retryable exception class, pricing adjustment, provider rename) is a
-one-file edit that every Cohere callsite picks up.
-
-Cohere's typed exception hierarchy (as of cohere 7.x): all 4xx/5xx errors
-subclass `cohere.core.api_error.ApiError`, which carries a `status_code`
-attribute. `is_retryable` prefers the typed subclass check (`TooManyRequestsError`,
-`InternalServerError`, `ServiceUnavailableError`, `GatewayTimeoutError`)
-and falls back to a 5xx `status_code` check for any future server-side
-subclass the SDK adds. Everything 4xx (auth, bad request, 404, 422) is
-treated as deterministic and fails fast — these are author errors, not
-transient conditions.
-"""
+"""Shared helpers for Cohere client wrappers (currently CohereReranker)."""
 
 from __future__ import annotations
 
@@ -64,17 +50,9 @@ def is_retryable(exc: BaseException) -> bool:
     ):
         return True
     if isinstance(exc, ApiError):
-        # Catches any future 5xx subclass the SDK adds without needing a
-        # code change here. 4xx stays non-retryable.
         code = exc.status_code
         return isinstance(code, int) and code >= 500
-    # httpx transport failures: cover every timeout flavor (ConnectTimeout,
-    # ReadTimeout, WriteTimeout, PoolTimeout — all siblings under
-    # TimeoutException, not subclasses of each other) and every network-
-    # layer error (ConnectError/ReadError/WriteError/CloseError under
-    # NetworkError), plus RemoteProtocolError. Narrower than TransportError
-    # because LocalProtocolError / ProxyError / UnsupportedProtocol are
-    # author-side bugs, not transient conditions.
+    # Author-side protocol and proxy errors stay out of this union.
     return isinstance(
         exc,
         httpx.TimeoutException | httpx.NetworkError | httpx.RemoteProtocolError,

@@ -1,44 +1,6 @@
-"""Cohere Rerank 3 client with retry, cost logging, and per-call accounting.
+"""Cohere rerank client with retry and per-call cost logging.
 
-One class, `CohereReranker`. One public method: `rerank(query, chunks, top_n)`.
-
-Design notes worth remembering:
-  - Mirrors `VoyageEmbedder` / `ClaudeGenerator` line-for-line: sync client,
-    `SecretStr` key, `tenacity` retries on transient exceptions only,
-    fail-fast on unknown model in `__init__`, exactly one `log_llm_call` per
-    successful API return (including the case where response-parsing then
-    raises — we were billed, we log), dependency-injection seam via
-    `client=` for tests.
-  - Shared retry / cost / provider helpers live in
-    `src.pipeline.cohere_utils` so a future second Cohere callsite picks up
-    changes without duplication.
-  - Tenacity is the single retry layer. The SDK's own `max_retries` is
-    disabled (`max_retries=0`) at client construction — otherwise a
-    transient 429 would be retried 2x by the SDK + 4x by tenacity = up to
-    15 compounded attempts per rerank call, each with its own backoff.
-  - Cohere's SDK is sync. One rerank call per query, no batching — the eval
-    loop reranks 100 queries sequentially; parallelism is complexity without
-    payoff at this scale.
-  - Pricing is PER-SEARCH ($0.002 per API call), independent of query or
-    document token counts. We log `input_tokens=0` + `output_tokens=0` to
-    keep the `logs/llm_calls.jsonl` schema uniform across providers; the
-    `cost_usd` field is the honest per-call charge.
-  - Returns a NEW list of `RetrievedChunk` in reranked order with the
-    Cohere relevance score (in [0, 1]) overwriting the retriever's score.
-    Downstream renders this verbatim; document the semantic shift in any
-    UI that surfaces the number.
-  - Empty-chunks short-circuit: `rerank([])` returns an empty result with
-    zero cost and zero latency, no API call. Guards against spending on a
-    doomed call when upstream retrieval returned nothing (and matches the
-    `answer_question` empty-retrieval short-circuit semantic).
-  - `top_n` is clamped to `len(chunks)` before the API call — Cohere errors
-    `BadRequestError` if `top_n > len(documents)`, which would waste a
-    retry cycle on a deterministic client bug.
-  - If the API call succeeds but response-parsing raises (malformed
-    `index` or missing field — rare SDK regression), the call is logged
-    with its honest per-search cost, then the caller sees a
-    `RerankExecutionError` carrying both the underlying cause and
-    `cost_usd` so the paid charge isn't silently lost from accounting.
+Retries, pricing, and the provider name live in `src.pipeline.cohere_utils`.
 """
 
 from __future__ import annotations
@@ -83,18 +45,9 @@ class RerankResult:
 
 
 class RerankExecutionError(RuntimeError):
-    """A rerank API call that was BILLED but whose response couldn't be parsed.
+    """A billed rerank response that could not be parsed.
 
-    Raised only after Cohere returned successfully (HTTP 2xx + a response
-    object) but subsequent parsing raised — e.g. a `results[i].index`
-    outside `[0, len(chunks))` from an SDK regression. The underlying
-    exception is preserved on `.cause` and the per-call charge on
-    `.cost_usd` so the callers can preserve the paid cost rather than
-    silently losing it.
-
-    Transient API-level failures (429, 5xx, httpx transport errors) go
-    through tenacity and reraise unchanged — they're not billed and
-    don't need this wrapper.
+    `.cause` is the parse error and `.cost_usd` is the charge already paid.
     """
 
     def __init__(self, cause: Exception, *, cost_usd: float) -> None:
@@ -104,12 +57,6 @@ class RerankExecutionError(RuntimeError):
 
 
 class CohereReranker:
-    """Sync Cohere Rerank client wrapper with retry, cost accounting, and per-call logging.
-
-    Not thread-safe (the underlying `cohere.ClientV2` is not documented as
-    such). Fine for the sequential eval loop and single-request Streamlit path.
-    """
-
     def __init__(
         self,
         *,
@@ -118,8 +65,6 @@ class CohereReranker:
         log_path: Path,
         client: cohere.ClientV2 | None = None,
     ) -> None:
-        # Fail fast on unknown models. If a new Cohere model is being trialed,
-        # add it to PRICING first.
         if model not in PRICING:
             raise ValueError(
                 f"unknown Cohere model {model!r}; add its price to "
@@ -128,12 +73,9 @@ class CohereReranker:
             )
         self._model = model
         self._log_path = log_path
-        # `client` injection is the seam tests use — no HTTP mock required.
-        # `max_retries=0` disables the SDK's own retry layer: tenacity owns
-        # retries here. One retry layer, not two.
         self._client = client or cohere.ClientV2(
             api_key=api_key.get_secret_value(),
-            max_retries=0,
+            max_retries=0,  # This client already retries. The SDK default would retry again.
         )
 
     @property
@@ -151,8 +93,7 @@ class CohereReranker:
         """Rerank `chunks` by Cohere relevance to `query`; return top-`top_n`.
 
         Empty `chunks` → empty result, zero cost, zero latency, no API call.
-        `top_n` is clamped to `len(chunks)` to avoid a Cohere 400 error on
-        the trivially-oversized request.
+        `top_n` is clamped to the candidate count.
         """
         if top_n <= 0:
             raise ValueError(f"top_n must be positive, got {top_n}")
@@ -174,11 +115,6 @@ class CohereReranker:
         top_n: int,
         run_id: str | None,
     ) -> RerankResult:
-        """One Cohere Rerank API call. Wrapped in tenacity — do not call directly from tests."""
-        # Clamp before the API call: `top_n > len(documents)` is a
-        # Cohere BadRequestError (4xx, non-retryable), which would surface
-        # as a mysterious skip in the eval loop. Clamping here keeps the
-        # caller's `top_n` as a UPPER bound rather than a strict count.
         effective_top_n = min(top_n, len(chunks))
 
         started = time.perf_counter()
@@ -193,10 +129,6 @@ class CohereReranker:
 
         reranked: list[RetrievedChunk] = []
         try:
-            # V2RerankResponse.results is sorted by relevance descending;
-            # each entry has `index` (into `chunks`) and `relevance_score`
-            # (in [0, 1]). Build the reranked list by mapping back through
-            # `chunks` and overwriting score.
             for r in response.results:
                 if not 0 <= r.index < len(chunks):
                     raise IndexError(
@@ -218,10 +150,7 @@ class CohereReranker:
                     )
                 )
         except Exception as parse_exc:
-            # Response-parse errors (bad index, unexpected shape from an SDK
-            # regression). Log the call before raising so logs/llm_calls.jsonl
-            # matches the actual invoice, and wrap the exception so callers
-            # see the paid cost (if any).
+            # Record paid calls even when their response cannot be consumed.
             log_llm_call(
                 self._log_path,
                 provider=PROVIDER,
@@ -247,14 +176,11 @@ class CohereReranker:
             provider=PROVIDER,
             model=self._model,
             operation="rerank_chunks",
-            # Rerank bills per-call; token counts don't apply. Kept in the
-            # shared log schema for uniformity with chat/embed/judge entries.
             input_tokens=0,
             output_tokens=0,
             cost_usd=cost_usd,
             latency_ms=elapsed_ms,
             run_id=run_id,
-            # Rerank doesn't use a prompt template, so no prompt_version.
             prompt_version=None,
             extra={
                 "num_candidates": len(chunks),
@@ -272,5 +198,4 @@ def make_reranker(
     log_path: Path,
     client: cohere.ClientV2 | None = None,
 ) -> CohereReranker:
-    """Convenience factory. Kept thin — most callers instantiate directly."""
     return CohereReranker(api_key=api_key, model=model, log_path=log_path, client=client)

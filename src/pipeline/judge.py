@@ -1,25 +1,4 @@
-"""Anthropic Claude LLM-as-judge with retry, prompt versioning, and per-call cost logging.
-
-One class, `ClaudeJudge`. One method: `judge(...)` — one API call per Q&A that
-returns a `JudgeResult` with both verdicts (answer + citations) plus a short
-rationale, parsed from the model's strict-JSON reply.
-
-Design notes worth remembering:
-  - Mirrors `ClaudeGenerator` line-for-line: sync `Anthropic` client,
-    `SecretStr` key, `tenacity` retries on transient exceptions only,
-    fail-fast on unknown model in `__init__`, exactly one `log_llm_call` per
-    API call, dependency-injection seam via `client=`. Shared retry / cost /
-    provider helpers live in `src.pipeline.anthropic_utils`; shared prompt
-    loading + the out-of-corpus sentinel live in `src.pipeline.prompts`.
-  - The prompt is a strict-JSON contract. We parse `response.text` with
-    `json.loads` and raise `JudgeParseError` on any deviation (malformed
-    JSON, missing key, wrong type). The eval loop catches this and skips
-    the Q&A rather than silently marking it incorrect — a broken judge
-    reply is a signal to iterate on the prompt, not an accuracy datapoint.
-  - Thinking is disabled and sampling parameters are omitted, same as the
-    generator: Haiku 5.5 rejects `temperature` and would otherwise spend
-    `max_tokens` on adaptive thinking before the JSON verdict.
-"""
+"""Anthropic Claude LLM-as-judge with retry, prompt versioning, and per-call cost logging."""
 
 from __future__ import annotations
 
@@ -47,22 +26,11 @@ from src.pipeline.anthropic_utils import (
 )
 from src.pipeline.prompts import load_prompt, render_user_template
 
-# Aligned with the generator's 1024. The judge's payload is a 1-3 sentence
-# rationale plus a short strict-JSON envelope — well under 1024 in the common
-# case — but 512 was tight enough that a verbose rationale on a borderline
-# Q&A could stop the reply mid-JSON, trip _parse_verdict, and silently skip
-# the record. Extra headroom costs pennies; a silently-skipped Q&A costs
-# more (and the operator only sees it as "skip: JSON parse error", not as
-# "max_tokens truncation").
-DEFAULT_MAX_TOKENS = 1024
+DEFAULT_MAX_TOKENS = 1024  # Avoids truncating valid verdict JSON.
 
-# `role` + `version` locate the prompt file at prompts/<role>/<version>.md.
-# Bump PROMPT_VERSION on any semantic change to the judge prompt; captured
-# eval runs record the version so an accuracy shift is attributable.
 PROMPT_ROLE = "judge"
-PROMPT_VERSION = "v1"
+PROMPT_VERSION = "v1"  # Bump when verdict semantics change.
 
-# Placeholders the judge user template MUST contain — enforced at load time.
 _REQUIRED_USER_PLACEHOLDERS: tuple[str, ...] = (
     "{question}",
     "{gold_answer}",
@@ -71,9 +39,6 @@ _REQUIRED_USER_PLACEHOLDERS: tuple[str, ...] = (
     "{model_citations_block}",
 )
 
-# JSON keys the judge MUST return. Missing any of them → JudgeParseError.
-# `answer_correct` and `citations_semantically_valid` must be bools;
-# `rationale` must be a string.
 _REQUIRED_JSON_KEYS: tuple[str, ...] = (
     "answer_correct",
     "citations_semantically_valid",
@@ -107,12 +72,7 @@ class JudgeResult:
 
 
 def _parse_verdict(text: str) -> tuple[bool, bool, str]:
-    """Parse the judge's raw reply into (answer_correct, citations_valid, rationale).
-
-    The judge prompt forbids Markdown / prose wrappers, but we still handle
-    surrounding whitespace — a leading blank line from Claude is not a
-    contract violation. Anything else raises `JudgeParseError`.
-    """
+    """Parse the judge's raw reply into (answer_correct, citations_valid, rationale)."""
     stripped = text.strip()
     try:
         obj: Any = json.loads(stripped)
@@ -137,9 +97,6 @@ def _parse_verdict(text: str) -> tuple[bool, bool, str]:
         raise JudgeParseError(
             f"judge reply key 'rationale' must be a str, got {type(obj['rationale']).__name__}"
         )
-    # Empty / whitespace-only rationale defeats the whole point of the field
-    # (it's the audit column in summary.md for borderline verdicts). Reject
-    # instead of quietly storing "" and calling the record valid.
     if not obj["rationale"].strip():
         raise JudgeParseError("judge reply key 'rationale' must not be empty")
     return obj["answer_correct"], obj["citations_semantically_valid"], obj["rationale"]
@@ -157,11 +114,7 @@ def _format_citations_block(citation_doc_paths: list[str]) -> str:
 
 
 class ClaudeJudge:
-    """Sync Anthropic client wrapper for LLM-as-judge, with retry + cost logging.
-
-    Not thread-safe (the underlying `Anthropic` client isn't documented as
-    such). Fine for the sequential eval loop.
-    """
+    """Sync Anthropic client wrapper for LLM-as-judge, with retry + cost logging."""
 
     def __init__(
         self,
@@ -171,8 +124,6 @@ class ClaudeJudge:
         log_path: Path,
         client: Anthropic | None = None,
     ) -> None:
-        # Fail fast on unknown models: a silent $0 per-call cost would poison
-        # the blog's cost story with no visible signal.
         if model not in PRICING:
             raise ValueError(
                 f"unknown Anthropic model {model!r}; add its price to "
@@ -181,7 +132,6 @@ class ClaudeJudge:
             )
         self._model = model
         self._log_path = log_path
-        # `client` injection is the seam tests use — no HTTP mock required.
         self._client = client or Anthropic(api_key=api_key.get_secret_value())
 
     @property
@@ -243,7 +193,6 @@ class ClaudeJudge:
         max_tokens: int,
         run_id: str | None,
     ) -> JudgeResult:
-        """One API call. Wrapped in tenacity — do not call directly from tests."""
         started = time.perf_counter()
         response = self._client.messages.create(
             model=self._model,
@@ -254,7 +203,6 @@ class ClaudeJudge:
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
 
-        # Concatenate every text block. See ClaudeGenerator for the rationale.
         text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
         text = "".join(text_parts)
 
@@ -262,6 +210,7 @@ class ClaudeJudge:
         output_tokens = int(getattr(response.usage, "output_tokens", 0) or 0)
         cost_usd = cost_for(self._model, input_tokens, output_tokens)
 
+        # Paid even if it fails.
         log_llm_call(
             self._log_path,
             provider=PROVIDER,
@@ -276,13 +225,9 @@ class ClaudeJudge:
             extra={
                 "max_tokens": max_tokens,
                 "thinking": "disabled",
-                # stop_reason is load-bearing for debugging refusal / max_tokens
-                # truncation — cheap to record, expensive to reconstruct later.
                 "stop_reason": getattr(response, "stop_reason", None),
             },
         )
-        # Parsing happens AFTER the log write. A malformed reply is still a
-        # real API call we paid for; recording it keeps cost accounting honest.
         answer_correct, citations_valid, rationale = _parse_verdict(text)
         return JudgeResult(
             answer_correct=answer_correct,
@@ -301,5 +246,4 @@ def make_judge(
     log_path: Path,
     client: Anthropic | None = None,
 ) -> ClaudeJudge:
-    """Convenience factory. Kept thin — most callers instantiate directly."""
     return ClaudeJudge(api_key=api_key, model=model, log_path=log_path, client=client)

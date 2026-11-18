@@ -1,49 +1,8 @@
-"""Embedding-based semantic chunker (a.k.a. "semantic splitting").
+"""Split documents where adjacent sentence embeddings diverge.
 
-The technique — split a document into sentences, embed each, and cut where
-consecutive-sentence embedding distance jumps past a per-document
-percentile threshold — was popularized by **Greg Kamradt** in
-["The 5 Levels of Text Splitting for Retrieval"][kamradt] (2024). It's a
-community-adopted heuristic, NOT a peer-reviewed paper. Reference
-implementations that follow the same recipe:
-
-  - LangChain — `SemanticChunker` in `langchain_experimental.text_splitter`
-    ([source](https://github.com/langchain-ai/langchain-experimental/blob/main/libs/experimental/langchain_experimental/text_splitter.py))
-  - LlamaIndex — `SemanticSplitterNodeParser`
-    ([docs](https://docs.llamaindex.ai/en/stable/api_reference/node_parsers/semantic_splitter/))
-
-We reimplement rather than depending on either library because both add a
-large dependency tree (LangChain in particular), our corpus is small
-enough that our own sentence splitter suffices.
-
-"Semantic chunking" is distinct from adjacent published techniques:
-  - **Late chunking** (Günther et al., 2024, [arXiv:2409.04701]) — embeds
-    the full doc first, then pools per chunk. Different mechanism.
-  - **Cross-segment classifier** approaches (Lukasik et al., 2020,
-    [ACL 2020]) — train a supervised model to predict segment boundaries.
-    Different mechanism.
-
-[kamradt]: https://github.com/FullStackRetrieval-com/RetrievalTutorials/blob/main/tutorials/LevelsOfTextSplitting/5_Levels_Of_Text_Splitting.ipynb
-[arXiv:2409.04701]: https://arxiv.org/abs/2409.04701
-[ACL 2020]: https://aclanthology.org/2020.acl-main.380/
-
-Design notes worth remembering:
-  - Sentence splitter is regex-based, no external NLP dep. Splits on
-    `.!?` followed by whitespace + capital/digit/bracket, and on blank
-    lines. Handles current corpus adequately; edge cases (formulas,
-    footnote glue) surface as short "sentences" that the min-token
-    merge step absorbs.
-  - Emits the same `Chunk` dataclass P1 emits — DB rows are shape-
-    compatible, only the `chunk_set_id` differs (P2's `ChunkerConfig`
-    differs from P1's).
-  - Uses the same `cl100k_base` tokenizer as `chunk_fixed` for `num_tokens`
-    accounting, so P1 vs P2 token counts are directly comparable.
-  - Cost: one `embed_documents` batch per ~64 sentences at chunk time
-    (Voyage-3-large ~ $0.13/1M input tokens). For our corpus (~10 docs,
-    thousands of sentences) that's a one-time ~$1-3 spend, logged in
-    `logs/llm_calls.jsonl` under the ingest `run_id`.
-  - Empty/whitespace-only doc → `[]` (matches `chunk_fixed`).
-  - Single-sentence doc → one chunk, no embed call needed (short-circuit).
+The chunker emits the same `Chunk` shape and token accounting as the fixed
+chunker. Page boundaries use one newline so wrapped sentences remain intact;
+content hashing continues to use the canonical two-newline page separator.
 """
 
 from __future__ import annotations
@@ -65,12 +24,7 @@ _logger = get_logger("chunk_semantic")
 
 
 class _Embedder(Protocol):
-    """Structural type for the embedder dependency.
-
-    Only `embed_documents` is called; matches VoyageEmbedder's signature
-    exactly. Declared as a Protocol so tests can inject fakes without
-    subclassing.
-    """
+    """Structural type for the embedder dependency."""
 
     def embed_documents(
         self,
@@ -80,13 +34,7 @@ class _Embedder(Protocol):
     ) -> list[list[float]]: ...
 
 
-# Split on `.!?` followed by whitespace and a capital / digit / opening
-# bracket — or on a blank line (paragraph break). The blank-line branch is
-# the paragraph-boundary signal in OCW notes where sentences don't always
-# end with `.`. False positives from abbreviations ("Dr.", "e.g.") produce
-# short pseudo-sentences that the min-token merge step reabsorbs; false
-# negatives just leave two sentences fused, absorbed by the max-token
-# split step. Neither corrupts the output.
+# Sentence end or a blank line. A lowercase continuation stays intact. "Dr." still splits.
 _SENTENCE_SPLIT_RE = re.compile(
     r"(?<=[.!?])\s+(?=[A-Z(\[\d])"
     r"|\n\s*\n"
@@ -95,52 +43,25 @@ _SENTENCE_SPLIT_RE = re.compile(
 
 @dataclass(frozen=True)
 class _Sentence:
-    """One sentence with the 1-indexed page range it spans.
-
-    Most sentences fit on one page (`page_start == page_end`). A sentence
-    that wraps line-wise across a PDF page boundary (common in OCW notes)
-    carries both endpoints so page-range attribution on the emitted `Chunk`
-    stays honest.
-    """
+    """One sentence with the 1-indexed page range it spans."""
 
     text: str
     page_start: int
     page_end: int
 
 
-# Single-newline separator used only for splitting sentences across pages.
-# `PAGE_JOIN` from hashing.py is `\n\n`, which would trigger the paragraph-
-# break branch of `_SENTENCE_SPLIT_RE` at every page and fragment sentences
-# that wrap across page boundaries — the exact bug this joiner exists to
-# avoid. Content hashing still uses PAGE_JOIN; only sentence-splitting uses
-# this one.
 _SENTENCE_PAGE_JOIN = "\n"
 
 
 def _split_sentences(doc: ExtractedDoc) -> list[_Sentence]:
     """Split the whole doc's text into sentences, tagging each with its page range.
-
-    Joins pages before splitting rather than per-page-splitting, because a
-    sentence that line-wraps across a PDF page boundary ("The quicksort
-    algorithm has average-" / "case complexity O(n log n).") would otherwise
-    be fragmented into two half-sentences whose individual embeddings are
-    meaningless and would corrupt the consecutive-sentence distance signal
-    the percentile threshold is computed on. Each sentence's page range is
-    derived from its character offset in the joined string.
-
     Filters empty and whitespace-only results. Preserves reading order.
     """
     if not doc.pages:
         return []
 
-    # rstrip each page's text so page boundaries in the joined string are a
-    # single `\n` — a blank line at the bottom of one page plus a blank at
-    # the top of the next would otherwise reconstruct `\n\s*\n` and trigger
-    # a spurious sentence split at every page break.
-    stripped = [p.text.rstrip() for p in doc.pages]
+    stripped = [p.text.rstrip() for p in doc.pages]  # Else a blank line splits each page.
 
-    # Record the character offset where each page's text begins in the joined
-    # string, so we can map a sentence's start/end offsets back to page numbers.
     offsets: list[int] = []
     running = 0
     for i, text in enumerate(stripped):
@@ -152,7 +73,6 @@ def _split_sentences(doc: ExtractedDoc) -> list[_Sentence]:
 
     def page_at(offset: int) -> int:
         """1-indexed PDF page number containing character `offset` in `joined`."""
-        # Linear scan — page counts per doc are small.
         for i in range(len(offsets) - 1, -1, -1):
             if offsets[i] <= offset:
                 return doc.pages[i].page_number
@@ -185,11 +105,7 @@ def _split_sentences(doc: ExtractedDoc) -> list[_Sentence]:
 
 
 def _cosine_distance(a: list[float], b: list[float]) -> float:
-    """Cosine distance = 1 - cosine similarity. Zero-vector safe.
-
-    Pure Python — no numpy dep, and the arithmetic is fine at our scale
-    (a few thousand ~1024-dim vectors per doc, one-time per ingest).
-    """
+    """Cosine distance = 1 - cosine similarity. Zero-vector safe."""
     dot = 0.0
     na = 0.0
     nb = 0.0
@@ -198,28 +114,18 @@ def _cosine_distance(a: list[float], b: list[float]) -> float:
         na += x * x
         nb += y * y
     if na == 0.0 or nb == 0.0:
-        # Degenerate embedding (all zeros) — treat as maximum distance
-        # rather than dividing by zero. Shouldn't happen with Voyage but
-        # cheap to be defensive.
         return 1.0
     return 1.0 - dot / (math.sqrt(na) * math.sqrt(nb))
 
 
 def _percentile(values: list[float], p: float) -> float:
-    """Nearest-rank percentile. `p` in [0, 100]. `values` must be non-empty.
-
-    Chosen over linear-interpolation percentiles (numpy.percentile,
-    statistics.quantiles) because it always returns an actual distance
-    from the input distribution — cleaner threshold semantics for the
-    log messages when a run's cut behavior is being debugged.
-    """
+    """Return an observed distance at the nearest-rank percentile."""
     if not values:
         raise ValueError("percentile of empty sequence")
     if not 0.0 <= p <= 100.0:
         raise ValueError(f"percentile p={p} out of range [0, 100]")
     sorted_vals = sorted(values)
-    # Nearest-rank formula: index = ceil(p/100 * n) - 1, clamped to [0, n-1].
-    idx = math.ceil(p / 100.0 * len(sorted_vals)) - 1
+    idx = math.ceil(p / 100.0 * len(sorted_vals)) - 1  # Nearest-rank index.
     idx = max(0, min(len(sorted_vals) - 1, idx))
     return sorted_vals[idx]
 
@@ -257,29 +163,13 @@ def _merge_undersized(
     encoder: tiktoken.Encoding,
     min_tokens: int,
 ) -> list[list[_Sentence]]:
-    """Merge every group under `min_tokens` into a neighbor.
-
-    Merge direction: prefer the side with the LOWER cross-boundary distance
-    (semantically closer). Ties and edge cases (first/last group) fall back
-    to the sole available neighbor. Iterates until every group meets the
-    threshold or only one group remains.
-
-    `distances[i]` is the semantic distance between the original sentence i
-    and i+1 — used to pick the closer neighbor. Distances aren't re-derived
-    after a merge because the merged group's cross-boundary distances (to
-    its new left/right neighbors) are already in the same `distances` list;
-    only intra-group distances become stale, which we don't reference here.
-    """
+    """Merge every group under `min_tokens` into a neighbor."""
     if len(groups) <= 1:
         return groups
 
     def group_tokens(g: list[_Sentence]) -> int:
         return _tokens_of(" ".join(s.text for s in g), encoder)
 
-    # Track each group's starting sentence index in the original list so
-    # we can look up cross-boundary distances. Distance BEFORE group i is
-    # `distances[start_index_of_group_i - 1]`; AFTER is
-    # `distances[start_index_of_group_i + len(group_i) - 1]`.
     def start_indices(gs: list[list[_Sentence]]) -> list[int]:
         idx: list[int] = []
         running = 0
@@ -309,12 +199,9 @@ def _merge_undersized(
                 merged = g + working[i + 1]
                 working = [*working[:i], merged, *working[i + 2 :]]
             else:
-                # Sole undersized group and no neighbors — nothing to merge
-                # with. Keep the tail (better a short chunk than a lost
-                # one) and stop.
                 break
             changed = True
-            break  # restart the outer pass so `starts`/indices rebuild
+            break
         if not changed:
             break
     return working
@@ -356,11 +243,9 @@ def _split_oversized(
         if group_tokens(g) <= max_tokens:
             return [g]
         if len(g) == 1:
-            # A single monster sentence: no semantic boundary exists.
-            # Fall back to a fixed token-window split, preserving the page
-            # tag on every fragment.
-            return _fixed_split_single_sentence(g[0], encoder=encoder, max_tokens=max_tokens)
-        # Find the internal boundary with the highest distance.
+            return _fixed_split_single_sentence(  # No semantic cut exists inside one sentence.
+                g[0], encoder=encoder, max_tokens=max_tokens
+            )
         start = start_index(g, all_sentences)
         internal_dists = distances[start : start + len(g) - 1]
         cut = max(range(len(internal_dists)), key=lambda i: internal_dists[i])
@@ -380,12 +265,7 @@ def _fixed_split_single_sentence(
     encoder: tiktoken.Encoding,
     max_tokens: int,
 ) -> list[list[_Sentence]]:
-    """Fallback: a single sentence too long for `max_tokens`.
-
-    Tokenizes and splits into contiguous `max_tokens`-sized windows,
-    reconstituting each as a `_Sentence` on the SAME page (the source
-    sentence was on one page by construction). No overlap.
-    """
+    """Fallback: a single sentence too long for `max_tokens`."""
     tokens = encoder.encode(sentence.text)
     if not tokens:
         return []
@@ -410,13 +290,7 @@ def _finalize(
     *,
     encoder: tiktoken.Encoding,
 ) -> list[Chunk]:
-    """Turn sentence groups into `Chunk` records with page ranges + hashes.
-
-    Joins group sentences with a single space (matches the sentence-boundary
-    convention we split on). Emits `num_tokens` from cl100k_base and
-    `content_hash` = sha256 of the joined text so dedup + idempotency
-    stay identical to `chunk_fixed`.
-    """
+    """Turn sentence groups into `Chunk` records with page ranges + hashes."""
     chunks: list[Chunk] = []
     for idx, group in enumerate(groups):
         if not group:
@@ -482,8 +356,6 @@ def chunk_semantic(
             f"min_tokens ({config.min_tokens}) must be ≤ max_tokens ({config.max_tokens})"
         )
 
-    # Whitespace-only inputs would produce spurious empty chunks; match
-    # `chunk_fixed`'s early return.
     if not any(p.text.strip() for p in doc.pages):
         return []
 
@@ -493,8 +365,6 @@ def chunk_semantic(
 
     encoder = tiktoken.get_encoding(config.encoding)
 
-    # Single-sentence doc: no distances to compute, no embedding call
-    # needed. Emit one chunk (respecting max_tokens if the sentence is huge).
     if len(sentences) == 1:
         groups = _split_oversized(
             [sentences],

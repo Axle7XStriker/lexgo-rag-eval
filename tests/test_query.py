@@ -1,12 +1,8 @@
-"""Query pipeline tests. Fully offline — fake embedder, store, generator.
+"""Query pipeline tests.
 
 Covers: end-to-end shape, citation dedup + first-mention order, out-of-range
 marker handling, out-of-corpus prompt path, empty-retrieval short-circuit,
 context block format, and dense/hybrid retriever dispatch.
-
-Tests create a small prompt file rather than use the production prompt, so
-they exercise `load_prompt` without coupling pipeline behaviour to any
-production prompt's wording.
 """
 
 from __future__ import annotations
@@ -61,12 +57,9 @@ CTX:
     prompts_module.load_prompt.cache_clear()
 
 
-# ── Fake dependencies ────────────────────────────────────────────────
-
-
 @dataclass
 class _FakeEmbedder:
-    """Duck-types VoyageEmbedder — only .embed_query is called by the pipeline."""
+    """Duck-types VoyageEmbedder — only what is called by the pipeline."""
 
     vector: list[float] = field(default_factory=lambda: [0.1] * 4)
     calls: list[str] = field(default_factory=list)
@@ -78,13 +71,7 @@ class _FakeEmbedder:
 
 @dataclass
 class _FakeStore:
-    """Duck-types VectorStore — implements both dense_search and hybrid_search.
-
-    `to_return` is shared across both — pipeline tests don't care which
-    call served the row set; retrieval-mode dispatch is what's under test.
-    Separate `dense_calls` / `hybrid_calls` lists let tests assert which
-    branch actually ran (only one should, per `retriever.kind`).
-    """
+    """Duck-types VectorStore — implements both dense_search and hybrid_search."""
 
     to_return: list[RetrievedChunk] = field(default_factory=list)
     dense_calls: list[dict] = field(default_factory=list)
@@ -120,12 +107,7 @@ class _FakeStore:
 
 @dataclass
 class _FakeReranker:
-    """Duck-types CohereReranker — only .rerank is called.
-
-    `reorder` is a 0-indexed permutation of the input chunks saying what
-    the fake "reranks" them to. If None (default), reverses the input —
-    enough to prove ordering was changed.
-    """
+    """Duck-types CohereReranker — only what is called."""
 
     reorder: list[int] | None = None
     cost_usd: float = 0.0042
@@ -143,7 +125,6 @@ class _FakeReranker:
             {"query": query, "top_n": top_n, "run_id": run_id, "n_candidates": len(chunks)}
         )
         order = self.reorder if self.reorder is not None else list(reversed(range(len(chunks))))
-        # Clamp to top_n and to len(chunks), same semantics as the real class.
         order = order[: min(top_n, len(chunks))]
         reranked = [
             RetrievedChunk(
@@ -156,7 +137,7 @@ class _FakeReranker:
                 text=chunks[i].text,
                 page_start=chunks[i].page_start,
                 page_end=chunks[i].page_end,
-                score=0.99 - 0.01 * rank,  # synthetic rerank relevance
+                score=0.99 - 0.01 * rank,
             )
             for rank, i in enumerate(order)
         ]
@@ -165,7 +146,7 @@ class _FakeReranker:
 
 @dataclass
 class _FakeGenerator:
-    """Duck-types ClaudeGenerator — only .generate is called."""
+    """Duck-types ClaudeGenerator — only what is called."""
 
     reply_text: str = "generic answer"
     input_tokens: int = 100
@@ -199,13 +180,7 @@ class _FakeGenerator:
 
 
 def _chunk(marker: int, doc_path: str, source_id: str = "A1") -> RetrievedChunk:
-    """Build a RetrievedChunk with unique-per-marker text so we can spot it in prompts.
-
-    `doc_path` here is a synthetic fixture, NOT validated against the real
-    corpus manifest — pipeline tests are decoupled from corpus content by
-    design (same principle as the prompt fixture above). Manifest
-    integrity is tested by test_ingest.py + test_fetch_corpus.py.
-    """
+    """Build a RetrievedChunk with unique-per-marker text so we can spot it in prompts."""
     return RetrievedChunk(
         chunk_id=1000 + marker,
         document_id=1,
@@ -220,12 +195,8 @@ def _chunk(marker: int, doc_path: str, source_id: str = "A1") -> RetrievedChunk:
     )
 
 
-# ── End-to-end ────────────────────────────────────────────────────────
-
-
 class TestEndToEnd:
     def test_happy_path(self, tmp_path: Path) -> None:
-        """Returns model's answer verbatim; cited chunks parsed in first-mention order."""
         chunks = [
             _chunk(1, "fixture/A1_doc03.pdf", "A1"),
             _chunk(2, "fixture/A2_doc03.pdf", "A2"),
@@ -233,8 +204,6 @@ class TestEndToEnd:
         ]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
-        # Generator cites [1] then [3] — assert both make it into citations,
-        # in that order, with the right doc_path provenance.
         generator = _FakeGenerator(
             reply_text="The answer is X [1] because of Y [3].",
             input_tokens=500,
@@ -252,7 +221,6 @@ class TestEndToEnd:
             run_id="run_test",
         )
 
-        # Answer text is returned verbatim.
         assert result.answer == "The answer is X [1] because of Y [3]."
         assert result.tokens_input == 500
         assert result.tokens_output == 25
@@ -260,16 +228,13 @@ class TestEndToEnd:
         assert result.prompt_version == PROMPT_VERSION
         assert result.query == "what is merge sort?"
 
-        # Full retrieval preserved for UI + eval.
         assert result.retrieved_chunks == chunks
 
-        # Citations parsed, deduped, first-mention order.
         assert [c.marker for c in result.citations] == [1, 3]
         assert result.citations[0].doc_path == "fixture/A1_doc03.pdf"
         assert result.citations[1].doc_path == "fixture/A3_doc01.pdf"
         assert result.citations[0].source_id == "A1"
 
-        # Dependencies invoked with the query + run_id threaded through.
         assert embedder.calls == ["what is merge sort?"]
         assert len(store.dense_calls) == 1
         assert store.dense_calls[0]["chunk_set_id"] == TEST_PIPELINE_CFG.chunk_set_id
@@ -278,7 +243,6 @@ class TestEndToEnd:
         assert generator.calls[0]["run_id"] == "run_test"
 
     def test_generator_receives_substituted_prompt(self, tmp_path: Path) -> None:
-        """{question} and {context} placeholders are filled before the generator sees the prompt."""
         chunks = [
             _chunk(1, "fixture/A1_doc01.pdf", "A1"),
             _chunk(2, "fixture/B1_doc02.pdf", "B1"),
@@ -297,51 +261,37 @@ class TestEndToEnd:
         )
 
         call = generator.calls[0]
-        # Canned template is passed through verbatim as system, and the
-        # out-of-corpus sentinel must be reachable to Claude via the system
-        # prompt — otherwise a P1 "not in corpus" answer would be impossible.
         assert call["system"] == f"SYSTEM: sentinel is '{OUT_OF_CORPUS_SENTINEL}'."
         assert OUT_OF_CORPUS_SENTINEL in call["system"]
-        # Question text made it into the substituted user prompt.
         assert "what is merge sort?" in call["user"]
-        # Both enumerated chunk headers appear, in order.
         assert "[1] A1 fixture/A1_doc01.pdf" in call["user"]
         assert "[2] B1 fixture/B1_doc02.pdf" in call["user"]
-        # And the chunk bodies.
         assert "chunk-1-body" in call["user"]
         assert "chunk-2-body" in call["user"]
 
 
-# ── Citation parsing ──────────────────────────────────────────────────
-
-
 class TestCitationParsing:
     def test_dedup_first_mention_order(self) -> None:
-        """Repeated `[N]` markers dedup; overall order = first-appearance order."""
         chunks = [_chunk(i, f"fixture/A1_doc{i:02d}.pdf") for i in (1, 2, 3)]
         cits = _parse_citations("Foo [3] bar [1] baz [3][1][2] end.", chunks)
         assert [c.marker for c in cits] == [3, 1, 2]
 
     def test_out_of_range_dropped(self) -> None:
-        """`[N]` past top-k is dropped (not raised) — no invented citations in the output."""
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         cits = _parse_citations("Ok [1] and also [9].", chunks)
         assert [c.marker for c in cits] == [1]
 
     def test_zero_and_negative_ignored(self) -> None:
-        """[0] out of range (1-indexed), [-N] doesn't match \\d+ — both ignored."""
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         cits = _parse_citations("Bad [0] good [1] weird [-2].", chunks)
         assert [c.marker for c in cits] == [1]
 
     def test_no_markers_returns_empty(self) -> None:
-        """An answer with no `[N]` brackets produces zero citations, not an error."""
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         cits = _parse_citations("No brackets here at all.", chunks)
         assert cits == []
 
     def test_all_out_of_range_returns_empty(self, tmp_path: Path) -> None:
-        """End-to-end: only-invented markers → empty citations; answer text round-trips."""
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -358,12 +308,8 @@ class TestCitationParsing:
         assert result.citations == []
 
 
-# ── Out-of-corpus paths ───────────────────────────────────────────────
-
-
 class TestOutOfCorpus:
     def test_sentinel_text_preserved(self, tmp_path: Path) -> None:
-        """When Claude returns the sentinel, pipeline passes it through (generator ran)."""
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -381,7 +327,6 @@ class TestOutOfCorpus:
         assert len(generator.calls) == 1
 
     def test_empty_retrieval_short_circuits(self, tmp_path: Path) -> None:
-        """No chunks retrieved → skip generator entirely, return sentinel + zero cost."""
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
         generator = _FakeGenerator(reply_text="should not be called")
@@ -400,19 +345,13 @@ class TestOutOfCorpus:
         assert result.tokens_input == 0
         assert result.tokens_output == 0
         assert result.cost_usd == 0.0
-        # The generator MUST NOT be called — that's the whole point.
         assert generator.calls == []
-        # Embedder + store both ran (retrieval was attempted).
         assert embedder.calls == ["q"]
         assert len(store.dense_calls) == 1
 
 
-# ── Context formatter ────────────────────────────────────────────────
-
-
 class TestFormatContext:
     def test_shape(self) -> None:
-        """Each chunk renders `[N] source_id doc_path (pages P-Q)` header + body, blank line."""
         chunks = [
             _chunk(1, "fixture/A1_doc01.pdf", "A1"),
             _chunk(2, "fixture/B1_doc02.pdf", "B1"),
@@ -420,37 +359,19 @@ class TestFormatContext:
         out = _format_context(chunks)
         assert "[1] A1 fixture/A1_doc01.pdf" in out
         assert "[2] B1 fixture/B1_doc02.pdf" in out
-        # Page range rendered in the header (chunk 1 → page_start=1, page_end=1).
         assert "pages 1–1" in out
         assert "chunk-1-body" in out
         assert "chunk-2-body" in out
-        # Blank line between chunks.
         assert "\n\n" in out
 
     def test_score_not_rendered_in_llm_prompt(self) -> None:
-        """Guard: score was intentionally dropped from the LLM context block.
-
-        Different retrievers emit different score semantics (cosine for dense,
-        tiny RRF values for hybrid) — surfacing them to Claude is at best noise
-        and at worst a false confidence signal. If score creeps back in, this
-        test fails and the author gets to re-decide, not accidentally regress.
-        """
         chunks = [_chunk(1, "fixture/A1_doc01.pdf", "A1")]
         out = _format_context(chunks)
         assert "score" not in out.lower()
 
 
-# ── Retriever dispatch (dense vs hybrid) ─────────────────────────────
-
-
 class TestRetrieverDispatch:
-    """`answer_question` picks the store method based on `retriever.kind`.
-
-    The pipeline-config registry entries (P1/P2 dense, P3 hybrid) are
-    exercised at the module level; here we assert the dispatch layer
-    directly so a bug in the branch selection surfaces without needing
-    a live DB or a specific registry entry.
-    """
+    """`answer_question` picks the store method based on `retriever.kind`."""
 
     def test_dense_routes_to_dense_search(self) -> None:
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
@@ -501,7 +422,6 @@ class TestRetrieverDispatch:
         }
 
     def test_hybrid_without_rrf_k_raises(self) -> None:
-        """Config-authoring error: `kind='hybrid'` with `rrf_k=None` must fail loud."""
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
         generator = _FakeGenerator()
@@ -515,7 +435,6 @@ class TestRetrieverDispatch:
                 chunk_set_id="test_broken_hybrid",
                 retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=None),
             )
-        # Validation happens before any injected dependency performs I/O.
         assert embedder.calls == []
         assert store.dense_calls == []
         assert store.hybrid_calls == []
@@ -523,12 +442,6 @@ class TestRetrieverDispatch:
 
     @pytest.mark.parametrize("bad_rrf_k", [0, -1, -60])
     def test_hybrid_with_non_positive_rrf_k_raises_before_embed(self, bad_rrf_k: int) -> None:
-        """`rrf_k <= 0` must fail at config validation, not deep in `_rrf_fuse`.
-
-        Catching it at the `answer_question` entrypoint means a misconfigured
-        pipeline doesn't bill a Voyage embed call before `_rrf_fuse` raises
-        — the embed on a doomed run is strictly waste.
-        """
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
         generator = _FakeGenerator()
@@ -542,22 +455,16 @@ class TestRetrieverDispatch:
                 chunk_set_id="test_bad_rrf_k",
                 retriever=RetrieverConfig(kind="hybrid", top_k=5, rrf_k=bad_rrf_k),
             )
-        # The cost-protection assertion: embed MUST NOT have been called.
         assert embedder.calls == []
         assert store.dense_calls == []
         assert store.hybrid_calls == []
         assert generator.calls == []
 
     def test_unknown_kind_raises(self) -> None:
-        """Literal drift guard: adding a new `kind` without a dispatch branch fails loud.
-
-        Cast through `type: ignore` so the runtime `raise` gets exercised even
-        though mypy would reject this at author time.
-        """
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
         generator = _FakeGenerator()
-        broken = RetrieverConfig(kind="mystery", top_k=5)  # type: ignore[arg-type]
+        broken = RetrieverConfig(kind="mystery", top_k=5)
 
         with pytest.raises(ValueError, match=r"unknown retriever\.kind"):
             answer_question(
@@ -574,22 +481,13 @@ class TestRetrieverDispatch:
         assert generator.calls == []
 
 
-# ── Rerank branch (P4) ────────────────────────────────────────────────
-
-
 _RERANK_CFG = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=2)
 
 
 class TestRerankBranch:
-    """`answer_question` optionally reranks between retrieval and generation.
-
-    `reranker` and `reranker_config` are either both None and the branch
-    is skipped. Or, the retrieved chunks are reordered to the top-N returned
-    by the reranker before the generator sees them.
-    """
+    """`answer_question` optionally reranks between retrieval and generation."""
 
     def test_rerank_applied_when_configured(self) -> None:
-        """Generator receives reranked order; retrieved_chunks reflects post-rerank set."""
         chunks = [
             _chunk(1, "fixture/A1_doc01.pdf", "A1"),
             _chunk(2, "fixture/A2_doc02.pdf", "A2"),
@@ -597,9 +495,7 @@ class TestRerankBranch:
         ]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
-        reranker = _FakeReranker(reorder=[2, 0], cost_usd=0.001)  # keep chunk 3 then 1
-        # Generator cites [1] then [2] — those map to the RERANKED order, not
-        # the retrieval order. Proves the LLM saw the reranked list.
+        reranker = _FakeReranker(reorder=[2, 0], cost_usd=0.001)
         generator = _FakeGenerator(reply_text="Answer uses [1] and [2].")
 
         result = answer_question(
@@ -614,28 +510,23 @@ class TestRerankBranch:
             run_id="eval_test_run",
         )
 
-        # Reranker was called with the full retrieval set + top_n from config.
         assert len(reranker.calls) == 1
         assert reranker.calls[0]["top_n"] == 2
         assert reranker.calls[0]["run_id"] == "eval_test_run"
         assert reranker.calls[0]["n_candidates"] == 3
 
-        # QueryResult.retrieved_chunks is the POST-rerank set, size top_n.
         assert len(result.retrieved_chunks) == 2
         assert [c.doc_path for c in result.retrieved_chunks] == [
             "fixture/A3_doc03.pdf",
             "fixture/A1_doc01.pdf",
         ]
-        # Citations map through to the reranked chunks' doc_paths.
         assert [c.doc_path for c in result.citations] == [
             "fixture/A3_doc03.pdf",
             "fixture/A1_doc01.pdf",
         ]
-        # Rerank cost threaded through to the result.
         assert result.rerank_cost_usd == 0.001
 
     def test_rerank_omitted_when_none(self) -> None:
-        """No reranker + no config → reranker never called."""
         chunks = [_chunk(1, "fixture/A1_doc01.pdf")]
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=chunks)
@@ -653,7 +544,6 @@ class TestRerankBranch:
             reranker_config=None,
         )
 
-        # Reranker never called; retrieval order preserved; cost 0.0.
         assert reranker.calls == []
         assert [c.doc_path for c in result.retrieved_chunks] == ["fixture/A1_doc01.pdf"]
         assert result.rerank_cost_usd == 0.0
@@ -674,7 +564,6 @@ class TestRerankBranch:
                 reranker=reranker,
                 reranker_config=None,
             )
-        # Validation fires before any I/O — cheap-fail is the whole point.
         assert embedder.calls == []
         assert reranker.calls == []
         assert generator.calls == []
@@ -698,7 +587,6 @@ class TestRerankBranch:
         assert generator.calls == []
 
     def test_empty_retrieval_skips_rerank(self) -> None:
-        """Empty retrieval short-circuits BEFORE the rerank step runs."""
         embedder = _FakeEmbedder()
         store = _FakeStore(to_return=[])
         reranker = _FakeReranker()
@@ -717,13 +605,10 @@ class TestRerankBranch:
 
         assert result.answer == OUT_OF_CORPUS_SENTINEL
         assert result.rerank_cost_usd == 0.0
-        # Reranker and generator both skipped — no spend on a doomed query.
         assert reranker.calls == []
         assert generator.calls == []
 
     def test_rerank_parse_error_preserves_paid_cost(self) -> None:
-        """Rerank API billed but response-parse raised → QueryExecutionError
-        carries the paid cost, generator is never called."""
 
         @dataclass
         class _BillingRaiseReranker:
@@ -763,23 +648,12 @@ class TestRerankBranch:
             )
 
         err = exc_info.value
-        # Paid cost from the RerankExecutionError flows through to the
-        # outer QueryExecutionError so _run_one lands it on the QAResult.
         assert err.rerank_cost_usd == pytest.approx(0.002)
-        # Underlying cause is unwrapped from the internal RerankExecutionError
-        # wrapper — caller sees the real failure class.
         assert isinstance(err.cause, IndexError)
-        # Generator was never called — rerank raised before context formatting.
         assert generator.calls == []
         assert len(reranker.calls) == 1
 
     def test_rerank_prebilling_raise_leaves_cost_zero(self) -> None:
-        """Rerank raised BEFORE Cohere billed (retries exhausted / httpx) →
-        QueryExecutionError carries cost_usd=0.0, generator never called.
-
-        Distinct from the parse-error path: here the reranker raises a plain
-        exception (not RerankExecutionError), so no cost was committed.
-        """
 
         @dataclass
         class _PreBillingRaiseReranker:
@@ -815,8 +689,6 @@ class TestRerankBranch:
             )
 
         err = exc_info.value
-        # Nothing was billed — accumulator stays at 0.0.
         assert err.rerank_cost_usd == 0.0
-        # Raw cause is the real exception from the reranker.
         assert isinstance(err.cause, RuntimeError)
         assert generator.calls == []

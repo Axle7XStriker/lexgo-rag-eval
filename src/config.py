@@ -30,15 +30,9 @@ class Settings(BaseSettings):
         description="Postgres+pgvector connection string; matches docker-compose defaults.",
     )
 
-    # TODO(#2): verify these IDs against the provider SDKs at first API call.
     chat_model: str = "claude-haiku-5-5"
     judge_model: str = "claude-haiku-5-5"
     embedding_model: str = "voyage-3-large"
-    # Rerank model is NOT in Settings — it varies per pipeline and is owned
-    # by `src.pipeline.pipeline_config.PIPELINES[...].reranker.model`, so
-    # callers construct `CohereReranker` from the active PipelineConfig,
-    # not from env. Settings owning a `rerank_model` would be a second
-    # source of truth.
 
     log_level: str = "INFO"
     log_dir: Path = REPO_ROOT / "logs"

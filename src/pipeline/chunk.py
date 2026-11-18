@@ -1,20 +1,4 @@
-"""Fixed-window token chunker.
-
-Target/overlap tokens are driven by the caller's `ChunkerConfig` (from
-`src.pipeline.pipeline_config`) — the P1 baseline uses 500/50, but any
-`ChunkerConfig(algorithm="fixed", target_tokens=..., overlap_tokens=...)`
-is a valid input.
-
-Design notes worth remembering:
-  - Voyage does not publish a public tokenizer. cl100k_base (OpenAI's) is
-    the de facto lingua franca — fast, offline, and stable. The 500-token
-    target is *approximate* vs. Voyage's internal count.
-  - Pages join with `hashing.PAGE_JOIN` into one token stream. The
-    separator's tokens are attributed to whichever page's boundary they
-    straddle — cheap and honest enough for citations.
-  - The final chunk is kept even if shorter than `target_tokens` — dropping
-    the tail would silently lose the last few paragraphs of every doc.
-"""
+"""Fixed-window token chunker."""
 
 from __future__ import annotations
 
@@ -49,9 +33,6 @@ def _encode_pages(
       - `page_starts[i]` = the index in `tokens` where page `i+1` begins.
       - `tokens` = concatenated tokens for all pages, with `PAGE_JOIN` tokens
         inserted between pages so a chunk that straddles pages reports both.
-
-    `_page_of(token_index, page_starts)` maps an absolute token index in
-    `tokens` back to a 1-indexed page number.
     """
     starts: list[int] = []
     tokens: list[int] = []
@@ -60,19 +41,12 @@ def _encode_pages(
         starts.append(len(tokens))
         tokens.extend(encoder.encode(page.text))
         if idx < len(doc.pages) - 1:
-            # Attribute the join tokens to the current page's tail; the next
-            # page's `starts[i+1]` will point at the first token of its own
-            # text, so a chunk that straddles the boundary reports both pages.
             tokens.extend(join_tokens)
     return starts, tokens
 
 
 def _page_of(token_index: int, page_starts: list[int]) -> int:
-    """1-indexed page number containing `token_index` in the joined stream.
-
-    Linear scan (not bisect) — page counts per doc are small (≤ hundreds)
-    and this keeps the code obvious.
-    """
+    """1-indexed page number containing `token_index` in the joined stream."""
     page = 1
     for p, start in enumerate(page_starts, start=1):
         if start <= token_index:
@@ -113,9 +87,6 @@ def chunk_fixed(doc: ExtractedDoc, config: ChunkerConfig) -> list[Chunk]:
     if target_tokens <= 0:
         raise ValueError(f"target_tokens must be > 0, got {target_tokens}")
 
-    # Whitespace-only inputs would tokenize to whitespace tokens and produce
-    # a spurious first chunk of literal whitespace. Guard here so callers get
-    # an unambiguous empty list rather than an ingested whitespace chunk.
     if not any(p.text.strip() for p in doc.pages):
         return []
 

@@ -1,24 +1,7 @@
 """Postgres+pgvector store for the RAG pipelines.
 
-Design notes:
-- Sync psycopg 3. Eval loop is a batch job over 100 Q&As, not a serving
-  path — an async pool would be complexity without a payoff.
-- pgvector's psycopg adapter registered per-connection so `vector` columns
-  become Python lists on read and accept lists on write.
-- Schema is applied idempotently by `ensure_schema()` reading schema.sql;
-  callers can invoke on every ingest run without special-casing "first
-  time" vs "subsequent" runs.
-- Chunks tagged by `chunk_set_id` — an identifier derived from a
-  pipeline's `ChunkerConfig` only (see `PipelineConfig.chunk_set_id`).
-  Pipelines whose chunker configs are equal share one physical chunk set;
-  P1/P3/P4 (all `fixed(500, 50)`) all key off the same id, so ingest for
-  the second/third pipeline no-ops. An A/B eval across pipelines filters
-  on the chunk set the active pipeline resolves to — a WHERE-clause
-  change, not DDL.
-- One global HNSW index over `chunks.embedding` for cosine similarity.
-  Queries compose `WHERE chunk_set_id = $1` with the index scan; at our
-  scale (a few thousand chunks per set) that's cheaper than maintaining
-  a separate HNSW index per set and keeps the schema simpler.
+Equal chunker configs share one `chunk_set_id` and one stored copy.
+Retrieval filters that id in the query.
 """
 
 from __future__ import annotations
@@ -38,32 +21,29 @@ SCHEMA_PATH = Path(_db_pkg_file).parent / "schema.sql"
 EMBEDDING_DIM = 1024  # voyage-3-large
 
 
-# ── Typed rows ────────────────────────────────────────────────────────
-
-
 @dataclass(frozen=True)
 class DocumentRow:
-    """A row destined for the `documents` table (pre-insert form)."""
+    """A row destined for the `documents` table."""
 
-    source_id: str  # A1..A4 / B1..B5
-    doc_path: str  # relative to corpus/, matches Citation.doc_path
+    source_id: str
+    doc_path: str
     title: str | None
     num_pages: int | None
-    content_hash: str  # sha256 of extracted text
+    content_hash: str
 
 
 @dataclass(frozen=True)
 class ChunkRow:
-    """A chunk destined for the `chunks` table (pre-insert form)."""
+    """A chunk destined for the `chunks` table."""
 
-    chunk_set_id: str  # e.g. "fixed_500_50_1b2c3d4e"
+    chunk_set_id: str
     chunk_index: int
     text: str
     num_tokens: int
     page_start: int
     page_end: int
-    content_hash: str  # sha256 of chunk text
-    embedding: list[float]  # length must equal EMBEDDING_DIM
+    content_hash: str
+    embedding: list[float]
 
 
 @dataclass(frozen=True)
@@ -79,15 +59,12 @@ class RetrievedChunk:
     text: str
     page_start: int
     page_end: int
-    score: float  # cosine similarity in [-1, 1] (higher is closer)
-
-
-# ────────────── Row + fusion helpers ──────────────
+    score: float
 
 
 def _row_to_retrieved(row: tuple) -> RetrievedChunk:
-    """Adapt a psycopg row (columns per `VectorStore._SELECT_COLUMNS + score`)
-    into a `RetrievedChunk`. Keeps dense + lexical branches in lockstep."""
+    """Adapt a psycopg row into a `RetrievedChunk`.
+    Keeps dense + lexical branches in lockstep."""
     return RetrievedChunk(
         chunk_id=row[0],
         document_id=row[1],
@@ -127,26 +104,19 @@ def _rrf_fuse(
     score. When a chunk appears in both lists, its non-score fields are
     carried forward from the dense result for deterministic provenance.
 
-    Cost: O(N+M) construction, O((N+M) log (N+M)) sort. N and M ≤ top_k
-    for us (~10 each), so this is free.
     """
     _validate_rrf_params(rrf_k=rrf_k, top_k=top_k)
 
-    # Sum inverse ranks per chunk_id. Rank is 1-indexed per RRF spec.
     scores: dict[int, float] = {}
     for rank, chunk in enumerate(dense, start=1):
         scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
     for rank, chunk in enumerate(lexical, start=1):
         scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0.0) + 1.0 / (rrf_k + rank)
 
-    # Prefer the dense result's non-score fields when a chunk appears in
-    # both lists; fall back to lexical for chunks absent from dense.
     by_id: dict[int, RetrievedChunk] = {c.chunk_id: c for c in lexical}
     for chunk in dense:
         by_id[chunk.chunk_id] = chunk
 
-    # Sort by fused score DESC, break ties by chunk_id ASC (deterministic
-    # so two eval runs return the exact same fused ordering).
     ranked = sorted(scores.items(), key=lambda item: (-item[1], item[0]))
 
     fused: list[RetrievedChunk] = []
@@ -167,9 +137,6 @@ def _rrf_fuse(
             )
         )
     return fused
-
-
-# ── Store ─────────────────────────────────────────────────────────────
 
 
 class VectorStore:
@@ -204,15 +171,9 @@ class VectorStore:
                 self._rollback_if_alive()
             if self._conn is not None and not self._conn.closed:
                 return
-        # Short connect_timeout so a down DB fails fast — otherwise the eval
-        # loop and the Streamlit worker thread sit on the socket forever.
         self._conn = psycopg.connect(self._dsn, autocommit=False, connect_timeout=5)
-        # register_vector needs the `vector` type to exist, but on a fresh
-        # DB nothing has installed it yet — ensure_schema() would, but the
-        # caller can't reach it until __enter__ returns. Break the cycle by
-        # creating the extension here. Idempotent (IF NOT EXISTS) + cheap.
         with self._conn.cursor() as cur:
-            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            cur.execute("CREATE EXTENSION IF NOT EXISTS vector")  # Before register_vector.
         self._conn.commit()
         register_vector(self._conn)
 
@@ -226,8 +187,6 @@ class VectorStore:
 
     def __exit__(
         self,
-        # Required by the context-manager protocol, unused here — underscored
-        # to signal that. We just close the connection on any exit path.
         _exc_type: type[BaseException] | None,
         _exc: BaseException | None,
         _tb: TracebackType | None,
@@ -242,8 +201,6 @@ class VectorStore:
             raise RuntimeError("VectorStore not opened; use `with VectorStore(dsn) as store: ...`.")
         return self._conn
 
-    # ── Schema ────────────────────────────────────────────────────────
-
     def ensure_schema(self) -> None:
         """Apply schema.sql. Idempotent — every DDL statement is guarded.
 
@@ -251,14 +208,11 @@ class VectorStore:
         a thin execute-the-file wrapper. Additive changes (new tables,
         new indexes) are picked up on the next call because every DDL is
         guarded with IF NOT EXISTS. Destructive changes (drop column,
-        change column type) need explicit migration handling, which is
-        out of scope for P1.
+        change column type) are not handled here.
         """
         with self.conn.cursor() as cur:
             cur.execute(SCHEMA_PATH.read_text())
         self.conn.commit()
-
-    # ── Documents ─────────────────────────────────────────────────────
 
     def upsert_document(self, doc: DocumentRow) -> int:
         """Insert or refresh a document by `doc_path`; return its id.
@@ -267,10 +221,6 @@ class VectorStore:
         this can be composed with `upsert_chunks` atomically (see
         `replace_document_chunks`).
         """
-        # ON CONFLICT DO UPDATE / EXCLUDED: on doc_path collision, update
-        # the row from the values that would have been inserted. EXCLUDED
-        # is a Postgres pseudo-row bound to that pending insert, only
-        # available inside the DO UPDATE clause.
         with self.conn.cursor() as cur:
             cur.execute(
                 """
@@ -287,10 +237,8 @@ class VectorStore:
                 (doc.source_id, doc.doc_path, doc.title, doc.num_pages, doc.content_hash),
             )
             row = cur.fetchone()
-            assert row is not None  # RETURNING guarantees a row on INSERT/UPDATE
+            assert row is not None
             return row[0]
-
-    # ── Chunks ────────────────────────────────────────────────────────
 
     def upsert_chunks(self, document_id: int, chunks: list[ChunkRow]) -> None:
         """Bulk-insert chunks; on `(document_id, chunk_set_id, chunk_index)` conflict, replace.
@@ -402,8 +350,6 @@ class VectorStore:
             self._rollback_if_alive()
             raise
 
-    # ── Retrieval ─────────────────────────────────────────────────────
-
     # Column list shared by both retrievers so their SELECT bodies stay
     # in lockstep — any new field on `RetrievedChunk` needs updating in
     # one place. `{score_expr}` is the only per-caller substitution.
@@ -420,19 +366,13 @@ class VectorStore:
     ) -> list[RetrievedChunk]:
         """Top-k cosine-similarity search over chunks of a given chunk set.
 
-        Uses pgvector's `<=>` cosine-distance operator (0 = identical
-        direction, 1 = orthogonal, 2 = opposite). Returned `score`
-        is `1 - distance` = cosine similarity in [-1, 1] (higher is
-        closer), which matches the more common downstream convention.
+        Returned `score` is cosine similarity in [-1, 1], where higher is
+        closer.
         """
         if len(query_embedding) != EMBEDDING_DIM:
             raise ValueError(
                 f"query embedding dim {len(query_embedding)} ≠ expected {EMBEDDING_DIM}"
             )
-        # Explicit ::vector cast: on INSERT the destination column type
-        # tells psycopg to adapt the Python list as a vector, but as a
-        # bare `%s` parameter the type is inferred as double precision[]
-        # and pgvector's <=> operator has no such overload.
         sql = f"""
             SELECT
                 {self._SELECT_COLUMNS},
@@ -454,27 +394,10 @@ class VectorStore:
         query_text: str,
         k: int,
     ) -> list[RetrievedChunk]:
-        """Top-k BM25-alike search via Postgres FTS (ts_rank_cd + GIN index).
+        """Return full-text matches ordered by relevance.
 
-        `websearch_to_tsquery` (not `to_tsquery`) accepts free-form English
-        text — never raises on operator-looking punctuation, and lets a
-        caller type quoted phrases ("query optimizer") or `OR` to broaden
-        explicitly. Unquoted multi-word input is AND-joined (same as
-        `plainto_tsquery`), so a long question must have every stem land
-        in a chunk to match — precision-biased by default. If P3 numbers
-        underwhelm, the first thing to try is app-level OR-joining of
-        lexemes via `to_tsquery` so lexical fires on partial-term matches
-        and dense keeps supplying the recall branch.
-
-        `ts_rank_cd` weights term proximity (BM25-inspired). Normalization
-        flag `32` is `rank / (rank + 1)` — a monotonic squash that bounds
-        the score into [0, 1); it does NOT penalize document length. RRF
-        downstream only reads rank order, so the squash is harmless here.
-
-        Returned `score` is `ts_rank_cd` (in [0, 1) after the flag-32
-        squash); NOT comparable to `dense_search`'s cosine score. Callers
-        that want a unified score across both use `hybrid_search`, which
-        fuses by rank via RRF instead.
+        Scores are meaningful only within this result list. Hybrid search
+        combines lexical and dense results by rank rather than raw score.
         """
         sql = f"""
             SELECT
@@ -516,20 +439,10 @@ class VectorStore:
         surfaces the number.
         """
         _validate_rrf_params(rrf_k=rrf_k, top_k=k)
-        # Pull a wider pool per source than the final `k` so RRF has more
-        # fusion opportunities before truncation. With a tight per-source
-        # pool of `k`, heavy dense/lexical overlap collapses the fused
-        # unique set to roughly `k`, which (a) hurts recall@k vs the
-        # dense-only baseline and (b) makes P3's effective top-k size
-        # vary query-by-query while P1/P2 are always exactly `k`.
-        # 2x–3x per source is standard practice; `max(k*2, 20)` floors it
-        # so very small `k` still gets a meaningful candidate pool.
-        pool = max(k * 2, 20)
+        pool = max(k * 2, 20)  # Wider than k so overlap cannot shrink the fused list.
         dense = self.dense_search(chunk_set_id, query_embedding, k=pool)
         lexical = self.lexical_search(chunk_set_id, query_text, k=pool)
         return _rrf_fuse(dense, lexical, rrf_k=rrf_k, top_k=k)
-
-    # ── Smoke / observability helpers ─────────────────────────────────
 
     def count_chunks(self, chunk_set_id: str | None = None) -> int:
         """Total chunks in the store, optionally filtered by chunk_set_id."""
