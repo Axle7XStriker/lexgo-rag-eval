@@ -1,13 +1,34 @@
-"""Pure-function metrics for the eval loop.
+"""Pure-function metrics for the eval loop — no I/O, no side effects.
 
 Two families of helpers:
   1. Per-Q&A metrics — `citation_precision_programmatic`, `recall_at_k`.
      Citation precision is always defined (every combination of empty /
-     non-empty model & gold citation sets carries a signal). `recall_at_k`
-     returns `None` only for out-of-corpus (no gold docs means no retrieval
-     ground truth). The aggregator skips `None`s from denominators.
+     non-empty model and gold page sets carries a signal). `recall_at_k`
+     returns `None` only when there is no gold page. The aggregator skips
+     `None`s from denominators.
   2. `QAResult` + `RunMetrics` dataclasses — the frozen record shapes
      `evals/run.py` persists per Q&A and aggregates at the end of a run.
+
+Design notes worth remembering:
+  - Kept adjacent to the aggregator so the record shape and the code that
+    reads it don't drift. If either grows enough to justify a split, move
+    the aggregator to `evals/aggregate.py` and keep the dataclasses here.
+  - Only `recall_at_k` is exposed as the retrieval headline. The unit is a
+    page on a document. A retrieved chunk covers every page in its inclusive
+    range. An earlier `hit_rate_at_k` counted repeated gold docs and was
+    dropped.
+  - Percentiles use `statistics.quantiles(..., method="inclusive")` so
+    single-item inputs return that item's value (numpy would raise).
+    Small-sample p95 is a rough number by construction — we surface it
+    for anomaly detection, not for capacity planning.
+  - `total_generate_judge_cost_usd` is exactly what it says: the Anthropic
+    generate + judge spend. Voyage embed spend is logged per-call in
+    `logs/llm_calls.jsonl` but not aggregated here — the field name is
+    honest about that scope so external reports don't misquote it.
+  - `total_rerank_cost_usd` is Cohere Rerank spend only (0.0 for P1-P3,
+    non-zero for P4). `total_generate_judge_rerank_cost_usd` sums all three
+    LLM-ish spend categories. Voyage embed cost still lives per-call in
+    `logs/llm_calls.jsonl` and is not aggregated.
 """
 
 from __future__ import annotations
@@ -19,11 +40,11 @@ from typing import Any
 
 from src.qa_schema import QAType
 
-DEFAULT_K = 5
+DEFAULT_K = 5  # Fixed headline k. QAResult.recall_at_5 is this value, not retriever.top_k.
 
 _PAGE = re.compile(r"^\d+$")
 _RANGE = re.compile(r"^(\d+)\s*-\s*(\d+)$")
-_MAX_RANGE_PAGES = 40
+_MAX_RANGE_PAGES = 40  # Wider than the widest gold range (22 pages, 526-547).
 
 
 @dataclass(frozen=True)
@@ -146,7 +167,7 @@ class QAResult:
     judge_input_tokens: int
     judge_output_tokens: int
     judge_cost_usd: float
-    rerank_cost_usd: float = 0.0
+    rerank_cost_usd: float = 0.0  # Default preserves pre-P4 result rows.
     error: str | None = None
     model_citation_spans: tuple[PageSpan, ...] = ()
     retrieved_page_spans_top10: tuple[PageSpan, ...] = ()
@@ -182,8 +203,6 @@ class RunMetrics:
     total_generate_judge_cost_usd: float = 0.0
     total_rerank_cost_usd: float = 0.0
     total_generate_judge_rerank_cost_usd: float = 0.0
-
-
 
 
 def citation_precision_programmatic(
@@ -233,9 +252,6 @@ def recall_at_k(
     return covered / len(gold)
 
 
-# ── Aggregation ───────────────────────────────────────────────────────
-
-
 def _mean_or_none(values: list[float]) -> float | None:
     """Arithmetic mean of `values`, or `None` for an empty list."""
     if not values:
@@ -275,17 +291,13 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
     n_evaluated = len(evaluated)
     n_skipped = n_records - n_evaluated
 
-    # Accuracy: mean of `judge_answer_correct` treating True/False as 1/0.
-    # `None` (judge failed even though the record was 'evaluated') is
-    # excluded from the denominator so a malformed judge reply doesn't
-    # skew the overall accuracy in either direction.
+    # A judge failure is unknown, not an incorrect answer.
     verdicts: list[bool] = [
         r.judge_answer_correct for r in evaluated if r.judge_answer_correct is not None
     ]
     accuracy_overall = _rate_or_none(verdicts)
 
     accuracy_by_type: dict[QAType, float] = {}
-    # Group by QAType; only types with >= 1 non-None verdict get a row.
     by_type: dict[QAType, list[bool]] = {}
     for r in evaluated:
         if r.judge_answer_correct is None:
@@ -296,12 +308,9 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
         if rate is not None:
             accuracy_by_type[qa_type] = rate
 
-    # Citation precision — programmatic mean over every evaluated record.
     prec_values = [r.citation_precision_programmatic for r in evaluated]
     citation_precision_programmatic_mean = _mean_or_none(prec_values)
 
-    # Citation precision — judge-based (secondary). Rate over Q&As where the
-    # judge produced a verdict at all.
     cite_judge_bools: list[bool] = [
         r.judge_citations_semantically_valid
         for r in evaluated
@@ -309,7 +318,6 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
     ]
     citation_precision_judge_rate = _rate_or_none(cite_judge_bools)
 
-    # Retrieval recall over in-corpus Q&As.
     recall_values = [r.recall_at_5 for r in evaluated if r.recall_at_5 is not None]
     mean_recall_at_k = _mean_or_none(recall_values)
 
@@ -342,9 +350,6 @@ def aggregate(results: list[QAResult], *, k: int = DEFAULT_K) -> RunMetrics:
         total_rerank_cost_usd=total_rerank,
         total_generate_judge_rerank_cost_usd=total_gen + total_judge + total_rerank,
     )
-
-
-# ── Serialization helpers ─────────────────────────────────────────────
 
 
 def _span_dict(span: PageSpan) -> dict[str, Any]:

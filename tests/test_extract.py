@@ -1,7 +1,6 @@
 """PDF extraction tests.
 
-Fully offline — every fixture PDF is synthesized in-memory via PyMuPDF (see
-`tests/_pdf_fixtures.py`) so the test suite carries no binary blobs. Covers:
+Covers:
 page count / order, whitespace-only pages preserved, content_hash stability +
 sensitivity, NULL stripping, and the failure modes `extract_pdf` must raise on.
 """
@@ -49,7 +48,6 @@ class TestExtractHappyPath:
         assert extract_pdf(p1).content_hash != extract_pdf(p2).content_hash
 
     def test_whitespace_only_page_preserves_page_number(self, tmp_path: Path) -> None:
-        # Middle page blank — page numbers must remain 1/2/3, not collapse to 1/2.
         path = tmp_path / "gap.pdf"
         write_pdf(path, ["First.", "\x00", "Third."])
         doc = extract_pdf(path)
@@ -60,13 +58,7 @@ class TestExtractHappyPath:
 
 
 class TestExtractFailureModes:
-    """extract_pdf must raise on missing / non-PDF / encrypted / all-blank inputs.
-
-    Assertions intentionally check the exception TYPE only (not the exact
-    message string) — the message text is an implementation detail of
-    `extract_pdf` and testing it here would just re-assert what the source
-    already declares.
-    """
+    """extract_pdf must raise on missing / non-PDF / encrypted / all-blank inputs."""
 
     def test_missing_file_raises_filenotfound(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):

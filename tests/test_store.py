@@ -43,48 +43,29 @@ def _chunk(chunk_id: int, *, score: float = 0.0, doc_path: str | None = None) ->
 
 class TestRRFFuseMath:
     def test_disjoint_lists_ranked_by_position(self) -> None:
-        """No chunk in both lists: fused rank = per-source rank; sums are strictly
-        smaller for later positions. Verifies the base RRF formula per source."""
         dense = [_chunk(1), _chunk(2), _chunk(3)]
         lexical = [_chunk(101), _chunk(102), _chunk(103)]
-        # Interleaved by rank: rank-1 from each ties, then rank-2 from each, ...
-        # Tie-break is chunk_id ASC, so dense (1) < lexical (101).
         fused = _rrf_fuse(dense, lexical, rrf_k=60, top_k=6)
         assert [c.chunk_id for c in fused] == [1, 101, 2, 102, 3, 103]
-        # Verify the actual score at rank 1 = 1/(60+1) ≈ 0.01639.
         assert abs(fused[0].score - 1.0 / 61) < 1e-9
         assert abs(fused[1].score - 1.0 / 61) < 1e-9
-        # Rank 2 in each: 1/62 each.
         assert abs(fused[2].score - 1.0 / 62) < 1e-9
 
     def test_chunk_in_both_lists_sums_scores(self) -> None:
-        """A chunk ranked in both sources gets the sum of its per-source
-        reciprocals — the whole point of RRF."""
         dense = [_chunk(1), _chunk(2)]
-        # Same chunk_id=2 appears in both; expected fused = 1/(60+2) + 1/(60+1).
         lexical = [_chunk(2), _chunk(99)]
         fused = _rrf_fuse(dense, lexical, rrf_k=60, top_k=4)
         by_id = {c.chunk_id: c for c in fused}
         assert abs(by_id[2].score - (1.0 / 62 + 1.0 / 61)) < 1e-9
-        # chunk 2 has the highest fused score → ranks first.
         assert fused[0].chunk_id == 2
 
     def test_tie_break_by_chunk_id_ascending(self) -> None:
-        """Same fused score → chunk_id ASC. Determinism matters — two eval
-        runs must return the same ordering for the same DB state.
-
-        Constructed tie:
-          chunk 5: 1/61 (dense@1) + 1/62 (lexical@2)
-          chunk 3: 1/62 (dense@2) + 1/61 (lexical@1)
-        → identical fused scores; tie-break by chunk_id ASC → [3, 5].
-        """
         dense_tie = [_chunk(5), _chunk(3)]
         lexical_tie = [_chunk(3), _chunk(5)]
         fused_tie = _rrf_fuse(dense_tie, lexical_tie, rrf_k=60, top_k=2)
         assert [c.chunk_id for c in fused_tie] == [3, 5]
 
     def test_top_k_truncates(self) -> None:
-        """`top_k` caps output; higher-scoring chunks survive."""
         dense = [_chunk(i) for i in range(1, 11)]
         lexical: list[RetrievedChunk] = []
         fused = _rrf_fuse(dense, lexical, rrf_k=60, top_k=3)
@@ -104,50 +85,34 @@ class TestRRFFuseMath:
             _rrf_fuse([_chunk(1)], [], rrf_k=rrf_k, top_k=top_k)
 
     def test_empty_both_returns_empty(self) -> None:
-        """Neither source returned anything → empty fusion; no crash."""
         assert _rrf_fuse([], [], rrf_k=60, top_k=10) == []
 
     def test_empty_dense_only_lexical_survives(self) -> None:
-        """Dense empty + lexical populated → lexical result set, in order."""
         lexical = [_chunk(1), _chunk(2)]
         fused = _rrf_fuse([], lexical, rrf_k=60, top_k=5)
         assert [c.chunk_id for c in fused] == [1, 2]
         assert abs(fused[0].score - 1.0 / 61) < 1e-9
 
     def test_empty_lexical_only_dense_survives(self) -> None:
-        """Lexical empty + dense populated → dense result set, in order."""
         dense = [_chunk(1), _chunk(2)]
         fused = _rrf_fuse(dense, [], rrf_k=60, top_k=5)
         assert [c.chunk_id for c in fused] == [1, 2]
         assert abs(fused[0].score - 1.0 / 61) < 1e-9
 
     def test_dense_provenance_wins_on_overlap(self) -> None:
-        """When a chunk appears in both lists, the dense list's `RetrievedChunk`
-        deterministically supplies the fused result's non-score fields."""
         dense_chunk = _chunk(42, doc_path="fixture/from_dense.pdf")
         lexical_chunk = _chunk(42, doc_path="fixture/from_lexical.pdf")
         fused = _rrf_fuse([dense_chunk], [lexical_chunk], rrf_k=60, top_k=1)
         assert fused[0].doc_path == "fixture/from_dense.pdf"
 
     def test_rrf_k_smaller_sharpens_rank_gap(self) -> None:
-        """Smaller `rrf_k` widens the score gap between rank 1 and rank 2.
-
-        Sanity-check that the knob has the documented effect — a future
-        refactor that swaps in a fixed rrf_k constant would break this.
-        """
         dense = [_chunk(1), _chunk(2)]
         gap_60 = _rrf_fuse(dense, [], rrf_k=60, top_k=2)
         gap_10 = _rrf_fuse(dense, [], rrf_k=10, top_k=2)
-        # Score gap between rank 1 and rank 2, per rrf_k:
-        # rrf_k=60 → 1/61 - 1/62 ≈ 0.000264
-        # rrf_k=10 → 1/11 - 1/12 ≈ 0.007576
         assert (gap_10[0].score - gap_10[1].score) > (gap_60[0].score - gap_60[1].score)
 
     def test_returned_chunks_carry_fused_score_not_source_score(self) -> None:
-        """Ensures the RRF score replaces the incoming (cosine / ts_rank_cd)
-        score — otherwise the demo UI + eval reporter would surface the
-        wrong number."""
-        dense = [_chunk(1, score=0.99)]  # incoming cosine — must be overwritten
+        dense = [_chunk(1, score=0.99)]
         fused = _rrf_fuse(dense, [], rrf_k=60, top_k=1)
         assert fused[0].score != 0.99
         assert abs(fused[0].score - 1.0 / 61) < 1e-9
@@ -155,7 +120,6 @@ class TestRRFFuseMath:
 
 class TestHybridSearch:
     def test_runs_both_branches_and_fuses_results(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Both branches ran, were pulled at the widened pool size, and RRF-fused."""
         store = VectorStore("unused")
         query_embedding = [0.1, 0.2]
         calls: list[tuple] = []
@@ -179,15 +143,10 @@ class TestHybridSearch:
             rrf_k=60,
         )
 
-        # Widened per-source pool: max(k*2, 20) = max(4, 20) = 20 for k=2.
-        # Pulling > k per source so RRF has more fusion opportunities before
-        # truncation to final k; see hybrid_search's comment for the rationale.
         assert calls == [
             ("dense", "test_pipeline", query_embedding, 20),
             ("lexical", "test_pipeline", "what is merge sort?", 20),
         ]
-        # Final result truncated to k=2; chunk_id=2 appears in both branches
-        # so it ranks first (sum of two reciprocals).
         assert [chunk.chunk_id for chunk in fused] == [2, 1]
 
     @pytest.mark.parametrize(
@@ -201,12 +160,6 @@ class TestHybridSearch:
     def test_per_source_pool_formula(
         self, monkeypatch: pytest.MonkeyPatch, k: int, expected_pool: int
     ) -> None:
-        """Pool = max(k*2, 20) — guards the widened fetch against regression.
-
-        Smaller `k` than the floor still gets a meaningful candidate pool
-        (otherwise k=1 would pull a single candidate per source and never
-        exercise fusion); larger `k` scales linearly.
-        """
         store = VectorStore("unused")
         pool_calls: list[int] = []
 
@@ -341,7 +294,6 @@ def seeded_store(clean_store: VectorStore) -> VectorStore:
 
 class TestLexicalSearchReal:
     def test_single_term_match_returns_chunk(self, seeded_store: VectorStore) -> None:
-        """A term that appears in exactly one chunk returns that chunk."""
         hits = seeded_store.lexical_search(_CHUNK_SET_ID, "collision", k=5)
         assert len(hits) == 1
         assert "collision" in hits[0].text
@@ -349,14 +301,12 @@ class TestLexicalSearchReal:
         assert hits[0].score > 0
 
     def test_multi_term_match_ranks_chunks(self, seeded_store: VectorStore) -> None:
-        """A shared term returns every matching chunk ranked with a positive score."""
         hits = seeded_store.lexical_search(_CHUNK_SET_ID, "quicksort", k=5)
         chunk_indexes = sorted(h.chunk_index for h in hits)
         assert chunk_indexes == [0, 3]
         assert all(h.score > 0 for h in hits)
 
     def test_no_match_returns_empty_list(self, seeded_store: VectorStore) -> None:
-        """A term absent from every chunk returns [], not an error."""
         hits = seeded_store.lexical_search(_CHUNK_SET_ID, "zebra", k=5)
         assert hits == []
 
@@ -366,29 +316,20 @@ class TestLexicalSearchReal:
         plainto_tsquery would also not raise here; the point is to lock in
         the parser we picked and prove quoted-phrase + OR syntax reach FTS.
         """
-        # Quoted phrase: matches chunk 1 as an exact-ish phrase lookup.
         quoted = seeded_store.lexical_search(_CHUNK_SET_ID, '"hash table"', k=5)
         assert any("hash table" in h.text for h in quoted)
-        # Explicit OR: broadens recall across two chunks.
         or_query = seeded_store.lexical_search(_CHUNK_SET_ID, "quicksort OR transaction", k=5)
         or_indexes = {hit.chunk_index for hit in or_query}
         assert 2 in or_indexes
         assert or_indexes & {0, 3}
 
     def test_chunk_set_id_filter_isolates_rows(self, seeded_store: VectorStore) -> None:
-        """A query against an unknown chunk_set_id returns nothing even when the
-        lexeme matches rows under a different tag — the WHERE clause composes."""
         hits = seeded_store.lexical_search("nonexistent_chunk_set_id", "quicksort", k=5)
         assert hits == []
 
 
 class TestHybridSearchReal:
     def test_fuses_dense_and_lexical_end_to_end(self, seeded_store: VectorStore) -> None:
-        """Hybrid returns a non-empty fused list over a real DB; chunks come from
-        both branches when they disagree."""
-        # Query embedding aligned with chunk 2's one-hot vector so dense ranks
-        # chunk 2 near the top; lexical hits chunk 0 and chunk 3 on 'quicksort'.
-        # Fused list must include chunks from both branches.
         query_embedding = [0.0] * EMBEDDING_DIM
         query_embedding[2] = 1.0
 
@@ -407,7 +348,6 @@ class TestHybridSearchReal:
         assert all(h.score <= 2.0 / (60 + 1) + 1e-9 for h in fused)
 
     def test_hybrid_filters_by_chunk_set_id(self, seeded_store: VectorStore) -> None:
-        """An unknown chunk_set_id returns empty from both branches → empty fusion."""
         fused = seeded_store.hybrid_search(
             "nonexistent_chunk_set_id",
             [0.1] * EMBEDDING_DIM,

@@ -1,9 +1,4 @@
-"""Shared pytest fixtures for the test suite.
-
-Currently just the real-Postgres fixtures (`db_dsn`, `clean_store`). They use
-a dedicated test database so cleanup can never truncate application data.
-Tests skip gracefully when that database isn't available.
-"""
+"""Shared pytest fixtures for the test suite."""
 
 from __future__ import annotations
 
@@ -50,17 +45,7 @@ def db_dsn() -> str:
 
 @pytest.fixture
 def clean_store(db_dsn: str) -> Iterator[VectorStore]:
-    """VectorStore against a fresh schema; wipes `chunks` + `documents` on entry.
-
-    A hard TRUNCATE isolates the test from any pre-existing rows (e.g. from
-    a prior `make ingest` run).
-      - TRUNCATE removes all rows in one shot (faster than DELETE and doesn't
-        write per-row WAL).
-      - RESTART IDENTITY resets the SERIAL sequences so `documents.id` starts
-        at 1 again — makes test assertions on ids stable across runs.
-      - CASCADE follows the chunks→documents foreign key; without it the
-        TRUNCATE on `documents` would be refused while chunks reference it.
-    """
+    """VectorStore against a fresh schema; wipes `chunks` + `documents` on entry."""
     with VectorStore(db_dsn) as store:
         store.ensure_schema()
         with store.conn.cursor() as cur:

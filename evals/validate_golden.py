@@ -138,7 +138,11 @@ def build_report(records: list[QARecord], errors: list[LineError]) -> Validation
 
 
 def _bar(count: int, target: int, width: int = 20) -> str:
-    """Return an ASCII progress bar of the form `[========------------]`."""
+    """Return an ASCII progress bar of the form `[========------------]`.
+
+    `filled` cells reflect count/target (clamped to width). A zero target
+    returns an all-empty bar rather than crashing.
+    """
     if target <= 0:
         return "[" + "-" * width + "]"
     filled = min(width, round(count / target * width))

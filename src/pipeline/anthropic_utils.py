@@ -1,9 +1,4 @@
-"""Shared helpers for Anthropic client wrappers (ClaudeGenerator, ClaudeJudge).
-
-Both wrappers share the same retry policy, cost lookup, and provider label.
-Kept here so a change (new retryable exception, price adjustment, provider
-rename) is a one-file edit that both wrappers pick up.
-"""
+"""Shared helpers for Anthropic client wrappers (ClaudeGenerator, ClaudeJudge)."""
 
 from __future__ import annotations
 
@@ -42,8 +37,6 @@ def is_retryable(exc: BaseException) -> bool:
     if isinstance(exc, RateLimitError | APIConnectionError | APITimeoutError):
         return True
     if isinstance(exc, APIStatusError):
-        # `status_code` is set on typed APIStatusError subclasses; guard with
-        # getattr in case a subclass without one slips through.
         code = getattr(exc, "status_code", None)
         return isinstance(code, int) and code >= 500
     return False

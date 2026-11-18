@@ -1,4 +1,4 @@
-"""End-to-end test for `evals.run.main` — fully offline via fake deps.
+"""End-to-end test for `evals.run.main`.
 
 Verifies the eval loop's plumbing without any live API or DB:
   - Load qa.jsonl from tmp_path.
@@ -6,10 +6,6 @@ Verifies the eval loop's plumbing without any live API or DB:
   - Run `evals.run.main()`.
   - Assert `results.jsonl` shape, `manifest.json` contents, `summary.md`
     contains the expected metric strings, exit code is 0.
-
-The fakes are constructed locally (not shared with test_query.py) to keep
-each test file's readability high and because the eval-run wiring exercises
-slightly different call surfaces (judge, run_id, etc.).
 """
 
 from __future__ import annotations
@@ -31,8 +27,6 @@ from src.pipeline.query import PROMPT_VERSION
 from src.pipeline.rerank import RerankResult
 from src.pipeline.store import RetrievedChunk
 from tests.test_pipeline_config import TEST_PIPELINE_CFG
-
-# ── Prompt fixture ────────────────────────────────────────────────────
 
 
 @pytest.fixture(autouse=True)
@@ -67,9 +61,6 @@ MC: {model_citations_block}
     monkeypatch.setattr(prompts_module, "PROMPTS_DIR", prompts_dir)
     yield
     prompts_module.load_prompt.cache_clear()
-
-
-# ── Fakes ─────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -132,7 +123,6 @@ class _FakeGenerator:
         max_tokens: int = 1024,
         run_id: str | None = None,
     ) -> GenerateResult:
-        # Match on question substring embedded in the user body (Q: ...).
         for q, reply in self.replies_by_question.items():
             if q in user:
                 return GenerateResult(
@@ -194,7 +184,6 @@ class _FakeJudge:
             correct = model_answer.strip() == OUT_OF_CORPUS_SENTINEL
             cite_valid = True
         else:
-            # Case-insensitive substring match — good enough for the fake.
             correct = gold_answer.lower()[:20] in model_answer.lower()
             cite_valid = bool(set(model_citation_doc_paths) & set(gold_citation_doc_paths))
         return JudgeResult(
@@ -205,9 +194,6 @@ class _FakeJudge:
             output_tokens=15,
             cost_usd=0.0009,
         )
-
-
-# ── Helpers ───────────────────────────────────────────────────────────
 
 
 def _write_qa_jsonl(path: Path, records: list[dict]) -> None:
@@ -317,18 +303,11 @@ def _inject_fake_deps(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[_FakeStore, _FakeGenerator, _FakeJudge]:
-    """Swap the real dep constructors for fakes so `run.main()` runs offline."""
+    """Swap the real dep constructors for fakes."""
     settings = _make_settings_stub(tmp_path)
     monkeypatch.setattr(run_module, "get_settings", lambda: settings)
     monkeypatch.setattr(run_module, "_git_sha", lambda: "deadbeef1234")
-    # Decouple the eval-loop test from whatever the real P1 config happens
-    # to be — force the loop to consume `TEST_PIPELINE_CFG` regardless of
-    # the CLI `--pipeline` arg.
     monkeypatch.setattr(run_module, "get_pipeline", lambda _key: TEST_PIPELINE_CFG)
-    # `configure_logging` binds structlog's PrintLogger to the current
-    # `sys.stderr`. Under pytest capture, that wrapper closes at test teardown
-    # — subsequent tests then crash if any logger.warning() call fires against
-    # the cached logger. No-op here to keep structlog on its ambient config.
     monkeypatch.setattr(run_module, "configure_logging", lambda _lvl: None)
 
     fake_store = _FakeStore(
@@ -342,7 +321,6 @@ def _inject_fake_deps(
     )
     fake_gen = _FakeGenerator(
         replies_by_question={
-            # Match on distinctive substrings of each question.
             "worst-case complexity of merge sort": (
                 "Merge sort has worst-case time complexity O(n log n) [1]."
             ),
@@ -353,10 +331,7 @@ def _inject_fake_deps(
                 "Without a balance invariant a BST can degenerate into a linked list [2]."
             ),
             "transformer models allocate": OUT_OF_CORPUS_SENTINEL,
-            "amortized cost of table doubling": (
-                # Model gets it wrong on purpose so accuracy < 100%.
-                "Table doubling has amortized cost O(log n) [3]."
-            ),
+            "amortized cost of table doubling": ("Table doubling has amortized cost O(log n) [3]."),
         },
     )
     fake_judge = _FakeJudge()
@@ -366,9 +341,6 @@ def _inject_fake_deps(
     monkeypatch.setattr(run_module, "ClaudeGenerator", lambda **_k: fake_gen)
     monkeypatch.setattr(run_module, "ClaudeJudge", lambda **_k: fake_judge)
     return fake_store, fake_gen, fake_judge
-
-
-# ── Tests ─────────────────────────────────────────────────────────────
 
 
 class TestMainHappyPath:
@@ -391,7 +363,6 @@ class TestMainHappyPath:
         assert len(run_dirs) == 1
         run_dir = run_dirs[0]
 
-        # results.jsonl: one line per record, all 5 present.
         result_lines = (run_dir / "results.jsonl").read_text().splitlines()
         assert len(result_lines) == 5
         results = [json.loads(li) for li in result_lines]
@@ -411,17 +382,12 @@ class TestMainHappyPath:
         }
         assert len(results[0]["retrieved_page_spans_top10"]) == 5
 
-        # Fake generator matches question → correct answers for f001/x001/p001/o001,
-        # wrong on a001 → 4/5 = 80% accuracy.
         correct_flags = [r["judge_answer_correct"] for r in results]
         assert correct_flags == [True, True, True, True, False]
 
-        # manifest.json: has git_sha, prompt versions, config, metrics.
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert manifest["git_sha"] == "deadbeef1234"
         assert manifest["prompt_versions"] == {"answer": "v1", "judge": "v1"}
-        # Pipeline config is fully nested + self-describing — every field on
-        # the injected TEST_PIPELINE_CFG round-trips into the manifest.
         pipeline_cfg = manifest["config"]["pipeline"]
         assert pipeline_cfg["tag"] == TEST_PIPELINE_CFG.tag
         assert pipeline_cfg["key"] == TEST_PIPELINE_CFG.key
@@ -431,27 +397,22 @@ class TestMainHappyPath:
         assert pipeline_cfg["retriever"]["kind"] == TEST_PIPELINE_CFG.retriever.kind
         assert pipeline_cfg["retriever"]["top_k"] == TEST_PIPELINE_CFG.retriever.top_k
         assert pipeline_cfg["reranker"] is None
-        # Provider identities kept separately — not part of pipeline identity.
         assert manifest["config"]["models"]["chat_model"] == "claude-haiku-5-5"
         assert manifest["golden_set"]["n_records_loaded"] == 5
         assert manifest["totals"]["n_evaluated"] == 5
         assert manifest["totals"]["n_skipped"] == 0
         assert manifest["metrics"]["accuracy_overall"] == pytest.approx(0.8)
 
-        # summary.md: contains headline metric strings + per-type breakdown.
         summary = (run_dir / "summary.md").read_text()
         assert "Eval run" in summary
         assert "accuracy (overall)" in summary
-        assert "80.0%" in summary  # overall accuracy
+        assert "80.0%" in summary
         assert "factual" in summary
         assert "adversarial" in summary
-        # No skipped section should list any Q&As.
         assert "_none_" in summary
 
-        # llm_calls.jsonl snapshot exists (empty here — fakes don't call log_llm_call).
         assert (run_dir / "llm_calls.jsonl").exists()
 
-        # Stdout summary block printed.
         captured = capsys.readouterr()
         assert "eval summary" in captured.out
         assert "80.0%" in captured.out
@@ -467,7 +428,6 @@ class TestMainMalformedGolden:
     ) -> None:
         qa_path = tmp_path / "evals" / "golden" / "qa.jsonl"
         qa_path.parent.mkdir(parents=True, exist_ok=True)
-        # Two valid records + one line of garbage → parse error → refuse to run.
         with qa_path.open("w", encoding="utf-8") as f:
             for rec in _valid_records()[:2]:
                 f.write(json.dumps(rec) + "\n")
@@ -479,7 +439,6 @@ class TestMainMalformedGolden:
 
         captured = capsys.readouterr()
         assert "Cannot evaluate" in captured.out
-        # No run directory should have been created.
         settings = run_module.get_settings()
         assert not any((settings.evals_dir).glob("eval_*"))
 
@@ -514,12 +473,7 @@ class TestMainSkipRecovery:
         capsys: pytest.CaptureFixture[str],
         _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
     ) -> None:
-        """A raised exception from the generator becomes a skipped QAResult, run still exits 0."""
 
-        # `_inject_fake_deps` is depended on for its side effects — it wires
-        # get_settings, _git_sha, VectorStore, etc. via monkeypatch. Below we
-        # override just the generator with one that raises on every call, so
-        # the rest of the eval loop still runs (pipeline_failed skip path).
         class _Boom:
             def generate(self, **kwargs):
                 raise RuntimeError("boom")
@@ -531,7 +485,6 @@ class TestMainSkipRecovery:
         monkeypatch.setattr(sys, "argv", ["evals.run", "--qa-path", str(qa_path)])
 
         exit_code = run_module.main()
-        # User's decision: skips reported, exit 0.
         assert exit_code == 0
 
         settings = run_module.get_settings()
@@ -549,7 +502,6 @@ class TestMainSkipRecovery:
         assert manifest["totals"]["n_skipped"] == 2
 
         summary = (run_dir / "summary.md").read_text()
-        # Skipped section lists each Q&A ID.
         assert "`f001`" in summary
         assert "`x001`" in summary
 
@@ -560,11 +512,6 @@ class TestMainSkipRecovery:
         capsys: pytest.CaptureFixture[str],
         _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
     ) -> None:
-        """A raised exception from the judge becomes a skipped QAResult BUT the
-        model_answer, programmatic metrics, and generator cost are preserved —
-        the pipeline output still cost us money and is worth keeping for audit.
-        Exit code is 0; aggregate accuracy denominator excludes the skipped row.
-        """
 
         class _BoomJudge:
             def judge(self, **kwargs):
@@ -586,7 +533,6 @@ class TestMainSkipRecovery:
         assert all(r["error"] is not None for r in results)
         assert all("judge_failed" in r["error"] for r in results)
 
-        # Judge fields are None; pipeline output + programmatic metrics survive.
         for r in results:
             assert r["judge_answer_correct"] is None
             assert r["judge_citations_semantically_valid"] is None
@@ -594,21 +540,16 @@ class TestMainSkipRecovery:
             assert r["model_answer"] != ""
             assert r["recall_at_5"] is not None
             assert r["citation_precision_programmatic"] is not None
-            # Generator cost preserved (we paid for it); judge cost zero.
             assert r["generate_cost_usd"] > 0
             assert r["judge_cost_usd"] == 0.0
 
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert manifest["totals"]["n_evaluated"] == 0
         assert manifest["totals"]["n_skipped"] == 2
-        # accuracy_overall is None (no successfully scored records).
         assert manifest["metrics"]["accuracy_overall"] is None
 
 
 class TestMainWithReranker:
-    """Pipeline configured with a reranker: CohereReranker is constructed,
-    called per Q&A, and its cost + model land in manifest + summary."""
-
     def test_rerank_wired_through_eval_loop(
         self,
         tmp_path: Path,
@@ -616,7 +557,6 @@ class TestMainWithReranker:
         capsys: pytest.CaptureFixture[str],
         _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
     ) -> None:
-        # Swap the eval-loop's PipelineConfig for one WITH a reranker.
         rerank_cfg = replace(
             TEST_PIPELINE_CFG,
             reranker=RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=3),
@@ -627,7 +567,7 @@ class TestMainWithReranker:
         monkeypatch.setattr(run_module, "CohereReranker", lambda **_k: fake_reranker)
 
         qa_path = tmp_path / "evals" / "golden" / "qa.jsonl"
-        _write_qa_jsonl(qa_path, _valid_records()[:3])  # 3 in-corpus records
+        _write_qa_jsonl(qa_path, _valid_records()[:3])
         monkeypatch.setattr(sys, "argv", ["evals.run", "--qa-path", str(qa_path)])
 
         exit_code = run_module.main()
@@ -636,15 +576,12 @@ class TestMainWithReranker:
         settings = run_module.get_settings()
         run_dir = next((settings.evals_dir).glob("eval_*"))
 
-        # Reranker was called once per record.
         assert len(fake_reranker.calls) == 3
         assert all(call["top_n"] == 3 for call in fake_reranker.calls)
 
-        # Per-Q&A rerank_cost_usd lands on each results.jsonl row.
         results = [json.loads(li) for li in (run_dir / "results.jsonl").read_text().splitlines()]
         assert all(r["rerank_cost_usd"] == 0.001 for r in results)
 
-        # Manifest exposes reranker config + aggregate rerank totals.
         manifest = json.loads((run_dir / "manifest.json").read_text())
         assert all(call["run_id"] == manifest["run_id"] for call in fake_reranker.calls)
         reranker_cfg = manifest["config"]["pipeline"]["reranker"]
@@ -653,14 +590,11 @@ class TestMainWithReranker:
             "model": "rerank-english-v3.0",
             "top_n": 3,
         }
-        # 3 Q&As × $0.001 = $0.003.
         assert manifest["totals"]["cost_usd_rerank"] == pytest.approx(0.003)
-        # All-LLM total includes rerank.
         assert manifest["totals"]["cost_usd_generate_judge_rerank"] == pytest.approx(
             manifest["totals"]["cost_usd_generate_judge"] + 0.003
         )
 
-        # summary.md surfaces the rerank cost row and the reranker metadata line.
         summary = (run_dir / "summary.md").read_text()
         assert "cost — rerank" in summary
         assert "reranker:" in summary
@@ -711,11 +645,6 @@ class TestMainWithReranker:
         monkeypatch: pytest.MonkeyPatch,
         _inject_fake_deps: tuple[_FakeStore, _FakeGenerator, _FakeJudge],
     ) -> None:
-        """TEST_PIPELINE_CFG has reranker=None → CohereReranker never constructed.
-
-        Verifies the "only build when needed" branch. Important for the
-        "optional reranker" claim in the eval loop's docstring.
-        """
         constructed: list[dict] = []
 
         def _fail_if_called(**kwargs):
@@ -734,14 +663,10 @@ class TestMainWithReranker:
         assert exit_code == 0
         assert constructed == []
 
-        # Also: results.jsonl rerank_cost_usd field is 0.0 for the P1-P3 path.
         settings = run_module.get_settings()
         run_dir = next((settings.evals_dir).glob("eval_*"))
         results = [json.loads(li) for li in (run_dir / "results.jsonl").read_text().splitlines()]
         assert all(r["rerank_cost_usd"] == 0.0 for r in results)
 
-        # And summary.md renders the reranker metadata line as "n/a" — every
-        # pipeline could configure a reranker; absence is a choice, not a
-        # missing field. Keeps side-by-side summary diffs legible.
         summary = (run_dir / "summary.md").read_text()
         assert "- reranker: n/a" in summary

@@ -1,18 +1,6 @@
-"""Author page — hand-curate the 100-Q&A golden set.
+"""Author page for the hand-curated golden set.
 
-LLM generation of Q&As is prohibited (see CLAUDE.md) — this UI is the tool
-the human uses to enter every record. Structure:
-
-  1. Progress dashboard — live counts vs the 40/25/20/10/5 target distribution.
-  2. Errors expander — surfaces any invalid records in qa.jsonl with line numbers.
-  3. "Add" tab — form to enter a new Q&A. Auto-generates the ID, auto-derives
-     `sources` from citations, validates via pydantic, atomic-writes on save.
-  4. "Browse / edit / delete" tab — filterable table; click a row to edit
-     in-place or delete with two-step confirm.
-
-Every mutation goes through the same read → mutate → atomic-rewrite → rerun
-loop. Never append-mode: keeping one write path means fewer surprises when
-we're 80 records deep with two weeks of authoring on the line.
+The page does not generate questions. Every save rewrites qa.jsonl atomically.
 """
 
 from __future__ import annotations
@@ -42,8 +30,6 @@ from src.ui_helpers import load_settings_or_stop, render_page_header, render_sid
 REPO_ROOT = Path(__file__).resolve().parents[1]
 QA_PATH = REPO_ROOT / "evals" / "golden" / "qa.jsonl"
 
-# Sorted list of every corpus doc_path — feeds the citation dropdown.
-# Sorted so the dropdown groups by source_id (A1 lectures → A2 recitations → ... → B3).
 CORPUS_DOC_PATHS: list[str] = sorted(entry.dest_path for entry in MANIFEST)
 
 st.set_page_config(page_title="lexgo — author", page_icon="✍️", layout="wide")
@@ -56,10 +42,6 @@ render_page_header(
     "`evals/golden/qa.jsonl` and is the load-bearing artifact of the whole eval.",
 )
 
-# Consume any flash message left by the previous rerun (see `_save_and_rerun`).
-# st.success/warning called before st.rerun() never render — the delta queue is
-# discarded when the rerun aborts the script — so we defer confirmation into the
-# next run and pop it here as a toast.
 _flash = st.session_state.pop("author_flash", None)
 if _flash:
     st.toast(_flash["message"], icon=_flash.get("icon"))
@@ -68,25 +50,13 @@ QA_PATH.parent.mkdir(parents=True, exist_ok=True)
 if not QA_PATH.exists():
     QA_PATH.touch()
 
-# ── Load state ─────────────────────────────────────────────────────
-# Capture mtime BEFORE reading so `_save_and_rerun` can detect an intervening
-# write (another tab of this page, or a shell edit). Optimistic-concurrency —
-# cheap because a single Streamlit rerun is short-lived.
-_load_mtime_ns = QA_PATH.stat().st_mtime_ns if QA_PATH.exists() else 0
+_load_mtime_ns = QA_PATH.stat().st_mtime_ns if QA_PATH.exists() else 0  # Save compares this.
 records, load_errors = load_jsonl(QA_PATH)
-# Reuse the just-parsed records instead of re-parsing the file inside
-# `validate_golden(path)` — every widget interaction reruns this whole script.
 report = build_report(records, load_errors)
 
 
-# ── Progress dashboard ─────────────────────────────────────────────
 def render_progress_dashboard() -> None:
-    """Render 6 tiles (5 QAType + 1 total) with st.metric + st.progress.
-
-    Each tile shows `<count> / <target>`, a signed delta (e.g. `+2`, `-3`,
-    or `on target`), and a proportional progress bar clamped to [0, 1].
-    Reads from the outer `report` closure so callers don't need to pass it.
-    """
+    """Render progress against the golden-set distribution targets."""
     cols = st.columns(len(TARGET_DISTRIBUTION) + 1)
     for i, (qa_type, target) in enumerate(TARGET_DISTRIBUTION.items()):
         count = report.counts.get(qa_type, 0)
@@ -105,9 +75,7 @@ def render_progress_dashboard() -> None:
             label="**total**",
             value=f"{report.total_records} / {GOLDEN_TOTAL}",
             delta=f"{total_delta:+d}" if total_delta != 0 else "complete",
-            # Overshoot is a design-violating failure mode (breaks the 40/25/20/10/5
-            # split), so a positive delta should render RED, not green. Undershoot
-            # is neutral (still in progress).
+            # A positive delta violates the fixed distribution.
             delta_color=(
                 "normal" if total_delta == 0 else ("inverse" if total_delta > 0 else "off")
             ),
@@ -131,7 +99,6 @@ if report.errors or report.duplicate_ids:
 st.divider()
 
 
-# ── Helpers ────────────────────────────────────────────────────────
 def _empty_citation_row() -> dict[str, Any]:
     """Seed row for the citation editor. Uses the first manifest path as the
     default doc_path selection so the dropdown always renders a valid value."""
@@ -139,11 +106,7 @@ def _empty_citation_row() -> dict[str, Any]:
 
 
 def _citation_editor(key: str, initial: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """st.data_editor for citations. Returns current rows; empty rows dropped downstream.
-
-    `source_id` is auto-derived from `doc_path` on save (via Citation.source_id) —
-    users pick the specific PDF, source_id is inferred from its filename prefix.
-    """
+    """st.data_editor for citations. Returns current rows; empty rows dropped downstream."""
     edited = st.data_editor(
         initial,
         key=key,
@@ -186,7 +149,6 @@ def _build_record(
     notes: str | None,
     created_at: datetime | None = None,
 ) -> QARecord:
-    # Drop rows that are missing either required field.
     kept = [
         r
         for r in citation_rows
@@ -200,7 +162,6 @@ def _build_record(
         )
         for row in kept
     ]
-    # `sources` on QARecord is a derived @cached_property computed from citations.
     now = datetime.now(UTC)
     return QARecord(
         id=id_,
@@ -252,11 +213,9 @@ def _record_widget_salt(record: QARecord) -> str:
     return f"{record.id}_{int(record.created_at.timestamp())}"
 
 
-# ── Tabs ───────────────────────────────────────────────────────────
 tab_add, tab_browse = st.tabs(["➕ Add", "📋 Browse / edit / delete"])
 
 
-# ─────────────────────────── ADD TAB ───────────────────────────────
 with tab_add:
     st.markdown("#### New Q&A")
     st.caption(
@@ -283,11 +242,8 @@ with tab_add:
         citation_rows: list[dict[str, Any]] = []
     else:
         st.markdown("**Citations** — one row per source cited. Empty rows are ignored.")
-        # `st.data_editor` preserves its own state under `key="add_citations_editor"`
-        # across reruns, so we only need a fresh seed on the very first render.
         citation_rows = _citation_editor("add_citations_editor", [_empty_citation_row()])
 
-    # Preview derived sources (auto-computed from doc_path filename prefix).
     if citation_rows:
         preview_sources = sorted(
             {
@@ -324,7 +280,6 @@ with tab_add:
         submitted = st.form_submit_button("Save Q&A", type="primary")
 
     if submitted:
-        # ID: freshly computed from currently loaded records for this type.
         new_id = next_id_for_type(records, add_type)
         try:
             new_record = _build_record(
@@ -343,7 +298,6 @@ with tab_add:
             _save_and_rerun(new_records, f"Saved {new_record.id}")
 
 
-# ─────────────────────────── BROWSE TAB ─────────────────────────────
 with tab_browse:
     if not records:
         st.info("No records yet. Add your first Q&A on the ➕ Add tab.")
@@ -399,7 +353,6 @@ with tab_browse:
             key="browse_table",
         )
 
-        # st.dataframe returns a state object with .selection when on_select is set.
         selected_rows: list[int] = (
             getattr(selection_state, "selection", {}).get("rows", [])
             if hasattr(selection_state, "selection")
@@ -412,10 +365,6 @@ with tab_browse:
             st.info("Select a row above to edit or delete.")
         else:
             selected_record = filtered[selected_rows[0]]
-            # salt includes created_at so a delete+re-add of the same id yields
-            # fresh widget state (Streamlit's session_state persists per-key —
-            # a stale key would silently show the old text and let a Save overwrite
-            # the newly-added record with abandoned edits).
             salt = _record_widget_salt(selected_record)
             st.markdown(f"#### Edit `{selected_record.id}`")
 
@@ -474,7 +423,6 @@ with tab_browse:
             pending_delete = st.session_state.get("pending_delete_id")
 
             if save_clicked:
-                # If type unchanged, keep the id. If changed, mint a new one for the new type.
                 keep_id = (
                     selected_record.id
                     if edit_type == selected_record.type

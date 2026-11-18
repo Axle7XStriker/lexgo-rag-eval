@@ -1,20 +1,6 @@
-"""Pinned corpus manifest — the source docs behind the RAG eval.
+"""Pinned corpus manifest for the two courses.
 
-Two source courses. 6.006 has four buckets (A1..A4); 6.830 has five (B1..B5).
-Filenames are prefixed with their source_id so `ls corpus/` and
-`grep A2 evals/golden/qa.jsonl` are both self-documenting. Zero-padded
-lecture numbers preserve alphanumeric sort.
-
-Kinds:
-  - "ocw_resource_page": URL points to an OCW resource landing page; the
-    fetcher parses its HTML for the actual (hashed) PDF asset URL.
-  - "direct_pdf": URL points directly at the PDF bytes (third-party mirrors).
-
-`urls` is a tuple of fallback URLs; the fetcher tries them in order and
-takes the first that returns a valid PDF (magic bytes `%PDF`).
-
-`optional=True` means the fetcher logs the miss and exits 0 anyway — for
-entries where inclusion of the document in the corpus is not required.
+Filenames start with the source id so a directory listing groups by bucket.
 """
 
 from dataclasses import dataclass
@@ -111,20 +97,16 @@ def _ocw_830_quiz(n: int, sol: bool) -> ManifestEntry:
     )
 
 
-# ── A1: 6.006 lectures 1-24 (full F11 set; typed PDFs only — the `_orig`
-# handwritten scans are skipped for cleaner text extraction downstream)
-_A1: list[ManifestEntry] = [_ocw_006_lec(n) for n in range(1, 25)]
+_A1: list[ManifestEntry] = [  # Typed PDFs only. Handwritten scans are not fetched.
+    _ocw_006_lec(n) for n in range(1, 25)
+]
 
-# ── A2: 6.006 recitations 1-24. OCW does not publish PDFs for rec03, rec04,
-# rec17, rec22, rec23 — marked optional so their absence doesn't fail the run.
-_OPTIONAL_A2 = {3, 4, 17, 22, 23}
+_OPTIONAL_A2 = {3, 4, 17, 22, 23}  # OCW does not publish these recitations.
 _A2: list[ManifestEntry] = [_ocw_006_rec(n, optional=n in _OPTIONAL_A2) for n in range(1, 25)]
 
-# ── A3: 6.006 PS1-PS7 with solutions (14 PDFs)
 _A3: list[ManifestEntry] = [_ocw_006_ps(n, sol) for n in range(1, 8) for sol in (False, True)]
 
-# ── A4: CLRS 3rd ed textbook. Copyrighted; not distributed from this repo.
-_A4: list[ManifestEntry] = [
+_A4: list[ManifestEntry] = [  # Copyrighted. Not fetched by this repo.
     ManifestEntry(
         source_id=SourceId.A4,
         description="Cormen, Leiserson, Rivest, Stein — Introduction to Algorithms, 3rd ed (CLRS)",
@@ -135,11 +117,10 @@ _A4: list[ManifestEntry] = [
     ),
 ]
 
-# ── B1: 6.830 lectures. Enumerated against the OCW lecture-notes index —
-# lec08 is genuinely skipped in the published materials (jumps 07/07b → 09/09_selinger).
-# Sub-lecture PDFs (07b, 09_selinger, 20b) are published and verified.
 _B1_LECTURES: list[tuple[str, str]] = [
-    (f"mit6_830f10_lec{n:02d}", f"lec{n:02d}") for n in range(1, 21) if n != 8
+    (f"mit6_830f10_lec{n:02d}", f"lec{n:02d}")
+    for n in range(1, 21)
+    if n != 8  # No OCW PDF.
 ] + [
     ("mit6_830f10_lec07b", "lec07b"),
     ("mit6_830f10_lec09_selinger", "lec09_selinger"),
@@ -147,14 +128,10 @@ _B1_LECTURES: list[tuple[str, str]] = [
 ]
 _B1: list[ManifestEntry] = [_ocw_830_lec(slug, stem) for slug, stem in _B1_LECTURES]
 
-# MIT CSAIL 6.830 paper cache — verified to host every paper we need.
-# Kept as the primary URL for every paper below; third-party mirrors are fallbacks.
-_MIT_6830_CACHE = "https://people.csail.mit.edu/tdanford/6830papers"
+_MIT_6830_CACHE = "https://people.csail.mit.edu/tdanford/6830papers"  # Papers try this first.
 
-# ── B2: 6.830 exams (2 quizzes × {problems, solutions})
 _B2: list[ManifestEntry] = [_ocw_830_quiz(n, sol) for n in (1, 2) for sol in (False, True)]
 
-# ── B3: 5 papers on query proc / transactions / concurrency / column stores
 _B3: list[ManifestEntry] = [
     ManifestEntry(
         source_id=SourceId.B3,
@@ -199,8 +176,7 @@ _B3: list[ManifestEntry] = [
     ),
 ]
 
-# ── B4: Red Book 4th ed (Hellerstein & Stonebraker). Copyrighted; not distributed.
-_B4: list[ManifestEntry] = [
+_B4: list[ManifestEntry] = [  # Copyrighted. Not fetched by this repo.
     ManifestEntry(
         source_id=SourceId.B4,
         description="Hellerstein & Stonebraker — Readings in Database Systems, 4th ed (Red Book)",
@@ -211,9 +187,7 @@ _B4: list[ManifestEntry] = [
     ),
 ]
 
-# ── B5: Ramakrishnan & Gehrke, Database Management Systems, 3rd ed.
-# User-supplied URL; kept optional so a takedown / 404 never breaks CI.
-_B5: list[ManifestEntry] = [
+_B5: list[ManifestEntry] = [  # Not on OCW. Optional so a dead mirror does not fail the fetch.
     ManifestEntry(
         source_id=SourceId.B5,
         description="Ramakrishnan & Gehrke — Database Management Systems, 3rd ed (DMS)",

@@ -6,11 +6,6 @@ Two layers of coverage:
     missing/required behavior.
   - Manifest helpers (`_select_manifest_entries`, `_is_required`) — pure,
     no DB.
-
-Voyage is always mocked; ingest tests are not part of the eval suite, so no
-live embedding API is needed. Postgres is real — mocking the DB would defeat
-the invariants ingest relies on (ON CONFLICT, transaction commits, unique
-constraint enforcement).
 """
 
 from __future__ import annotations
@@ -30,9 +25,6 @@ from src.pipeline.store import EMBEDDING_DIM, VectorStore
 from src.qa_schema import SourceId
 from tests._pdf_fixtures import write_pdf
 
-# P1 config + derived chunk_set_id + chunker are shared by every
-# _process_entry call below — resolved once at import time so tests read
-# cleanly and any accidental config change registers in one place.
 _P1_CFG = get_pipeline("p1")
 _P1_CHUNK_SET_ID = _P1_CFG.chunk_set_id
 
@@ -50,12 +42,6 @@ class _QuietLogger:
     def debug(self, *args: Any, **kwargs: Any) -> None: ...
 
 
-# `db_dsn` and `clean_store` fixtures live in tests/conftest.py — any test
-# in this directory inherits them. See conftest for the Postgres-skip shape.
-
-# ── Fake embedder ─────────────────────────────────────────────────────
-
-
 @dataclass
 class _FakeEmbedder:
     """Stand-in for VoyageEmbedder that returns deterministic vectors + counts calls."""
@@ -70,7 +56,6 @@ class _FakeEmbedder:
         self.calls += 1
         assert self.texts_seen is not None
         self.texts_seen.extend(texts)
-        # Deterministic non-zero vectors; correct dim matters (upsert_chunks checks).
         return [[float((i % 7) + 1) / 10.0] * EMBEDDING_DIM for i, _ in enumerate(texts)]
 
 
@@ -86,9 +71,6 @@ def _make_entry(dest_path: str, *, optional: bool = False) -> ManifestEntry:
     )
 
 
-# ── Unit tests (no DB) ────────────────────────────────────────────────
-
-
 class TestEntrySelection:
     """_select_manifest_entries: full manifest / source_id filter / doc_path filter / miss."""
 
@@ -97,15 +79,11 @@ class TestEntrySelection:
         assert len(entries) == len(MANIFEST)
 
     def test_source_id_filter(self) -> None:
-        # Compare against the expected slice from MANIFEST directly — asserting
-        # `all(e.source_id == A1)` would pass even if we silently dropped most
-        # A1 entries, since it doesn't verify we got them all.
         expected = [e for e in MANIFEST if e.source_id == SourceId.A1]
         entries = ingest_mod._select_manifest_entries("A1")
         assert entries == expected
 
     def test_doc_path_filter(self) -> None:
-        # Pick a real manifest entry so we know it matches.
         target = MANIFEST[0].dest_path
         entries = ingest_mod._select_manifest_entries(target)
         assert len(entries) == 1
@@ -152,9 +130,6 @@ class TestExitCodeLogic:
         assert ingest_mod._any_required_failed([self._result(required.dest_path, "extract_failed")])
 
     def test_optional_extract_failed_does_not_fail(self) -> None:
-        # The specific regression: previously any extract_failed row exited 1
-        # regardless of optional status, contradicting the required-vs-optional
-        # policy applied to `missing`.
         optional = next((e for e in MANIFEST if e.optional), None)
         if optional is None:
             pytest.skip("no optional entries in manifest")
@@ -169,9 +144,6 @@ class TestExitCodeLogic:
         assert not ingest_mod._any_required_failed([self._result(optional.dest_path, "missing")])
 
 
-# ── Integration tests (require DB) ────────────────────────────────────
-
-
 class TestProcessEntryIntegration:
     """Full extract → chunk → embed → upsert cycle against a real Postgres."""
 
@@ -181,15 +153,13 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # `monkeypatch.setattr` auto-restores `CORPUS_ROOT` at test teardown —
-        # no manual save/restore dance needed and no leak if the test errors.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path)
         entry = _make_entry("nothing/nope.pdf", optional=False)
         embedder = _FakeEmbedder()
         result = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -199,7 +169,6 @@ class TestProcessEntryIntegration:
         )
         assert result.status == "missing"
         assert embedder.calls == 0
-        # Missing REQUIRED must exit non-zero when this result feeds the summary.
         assert ingest_mod._is_required(entry.dest_path) is True
 
     def test_first_run_ingests_second_run_skips(
@@ -217,7 +186,7 @@ class TestProcessEntryIntegration:
         first = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -230,14 +199,12 @@ class TestProcessEntryIntegration:
         first_calls = embedder.calls
         assert first_calls > 0
 
-        # Sanity: chunks landed under the expected chunk_set_id.
         assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == first.num_chunks
 
-        # Second run — same file, unchanged → skipped, zero embed calls.
         second = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -255,11 +222,7 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """P3 ingest after P1 is a no-op: same ChunkerConfig → same chunk_set_id"""
         p3_cfg = get_pipeline("p3")
-        # Precondition: the two pipelines really do share a chunk set. If this
-        # equality ever breaks (someone tunes P3's chunker in isolation),
-        # the test below becomes a false pass — fail loudly instead.
         assert _P1_CFG.chunk_set_id == p3_cfg.chunk_set_id, (
             "P1 and P3 are expected to share a chunk set — their ChunkerConfig "
             "fields must be equal for the dedup refactor to behave as designed."
@@ -271,11 +234,10 @@ class TestProcessEntryIntegration:
         entry = _make_entry("test/A1_fake.pdf")
 
         embedder = _FakeEmbedder()
-        # P1 ingests first — populates the shared chunk set.
         first = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -287,17 +249,13 @@ class TestProcessEntryIntegration:
         p1_calls = embedder.calls
         assert p1_calls > 0
 
-        # P3 next — same chunker config → `_fetch_existing` sees chunks
-        # already present for the shared chunk_set_id → skip, zero embed cost.
-        # (`chunk_fixed(doc, p3_cfg.chunker)` yields byte-identical chunks
-        # to `_p1_chunker`, but we won't reach the chunker here at all.)
         def _p3_chunker(doc):
             return chunk_fixed(doc, p3_cfg.chunker)
 
         second = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=p3_cfg,
             chunker=_p3_chunker,
             force=False,
@@ -307,7 +265,6 @@ class TestProcessEntryIntegration:
         )
         assert second.status == "skipped_unchanged"
         assert embedder.calls == p1_calls, "P3 run must not call embed when P1 already ingested"
-        # Row count unchanged — no duplicate rows under a different tag.
         assert clean_store.count_chunks(p3_cfg.chunk_set_id) == first.num_chunks
 
     def test_force_reembeds(
@@ -325,7 +282,7 @@ class TestProcessEntryIntegration:
         first = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -339,7 +296,7 @@ class TestProcessEntryIntegration:
         second = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=True,
@@ -365,7 +322,7 @@ class TestProcessEntryIntegration:
         result = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -373,8 +330,8 @@ class TestProcessEntryIntegration:
             log_path=tmp_path / "llm_calls.jsonl",
             logger=_QuietLogger(),
         )
-        assert result.status == "ingested"  # dry-run reports success shape
-        assert result.tokens_embedded > 0  # reports the pre-flight estimate
+        assert result.status == "ingested"
+        assert result.tokens_embedded > 0
         assert result.cost_usd == 0.0
         assert embedder.calls == 0
         assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == 0
@@ -384,11 +341,6 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Semantic chunkers embed sentences internally, so a --dry-run must NOT
-        # invoke the chunker at all — otherwise the "no Voyage calls" contract
-        # documented on --dry-run would silently break and the summary would
-        # under-report spend as $0. The chunker here raises if called so we
-        # get a loud failure if the short-circuit regresses.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
         dest = tmp_path / "corpus" / "test/A1_fake.pdf"
         write_pdf(dest, ["Beta " * 100])
@@ -403,7 +355,7 @@ class TestProcessEntryIntegration:
         result = ingest_mod._process_entry(
             entry,
             store=None,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=p2_cfg,
             chunker=_boom_chunker,
             force=False,
@@ -412,8 +364,8 @@ class TestProcessEntryIntegration:
             logger=_QuietLogger(),
         )
         assert result.status == "ingested"
-        assert result.num_chunks == 0  # chunking is skipped in this path
-        assert result.tokens_embedded > 0  # raw-text estimate reported
+        assert result.num_chunks == 0
+        assert result.tokens_embedded > 0
         assert result.cost_usd == 0.0
         assert embedder.calls == 0
 
@@ -422,8 +374,6 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # The M1 contract: --dry-run must be usable on a laptop with no
-        # docker up. store=None mirrors what main() passes in that case.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
         dest = tmp_path / "corpus" / "test/A1_fake.pdf"
         write_pdf(dest, ["Delta " * 100])
@@ -433,7 +383,7 @@ class TestProcessEntryIntegration:
         result = ingest_mod._process_entry(
             entry,
             store=None,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -452,17 +402,11 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Guards C3: a doc row whose content_hash matches but has ZERO chunks
-        # for _P1_CHUNK_SET_ID must NOT be skipped. This is the partial-failure
-        # recovery path AND the future P2/P3/P4-after-P1 path.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
         dest = tmp_path / "corpus" / "test/A1_fake.pdf"
         write_pdf(dest, ["Gamma " * 100])
         entry = _make_entry("test/A1_fake.pdf")
 
-        # Seed the docs table with a matching content_hash but zero chunks —
-        # simulates a prior partial failure. Use extract_pdf to get the
-        # canonical hash so we're not duplicating the hashing logic here.
         from src.pipeline.extract import extract_pdf
 
         doc = extract_pdf(dest)
@@ -482,7 +426,7 @@ class TestProcessEntryIntegration:
         result = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -490,7 +434,7 @@ class TestProcessEntryIntegration:
             log_path=tmp_path / "llm_calls.jsonl",
             logger=_QuietLogger(),
         )
-        assert result.status == "ingested"  # NOT skipped_unchanged
+        assert result.status == "ingested"
         assert embedder.calls == 1
         assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == result.num_chunks
 
@@ -500,19 +444,15 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Guards C2: v1 of a doc ingests as N chunks, v2 as fewer. The DB
-        # must NOT retain the tail chunks from v1 — retrieval would surface
-        # them as stale hits.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
         dest = tmp_path / "corpus" / "test/A1_fake.pdf"
-        # v1: big doc → many chunks.
         write_pdf(dest, ["Big content page. " * 400] * 3)
         entry = _make_entry("test/A1_fake.pdf")
         embedder = _FakeEmbedder()
         v1 = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -525,12 +465,11 @@ class TestProcessEntryIntegration:
         v1_count = clean_store.count_chunks(_P1_CHUNK_SET_ID)
         assert v1_count == v1.num_chunks
 
-        # v2: same path, much smaller content → fewer chunks.
         write_pdf(dest, ["Tiny."])
         v2 = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -540,7 +479,6 @@ class TestProcessEntryIntegration:
         )
         assert v2.status == "ingested"
         assert v2.num_chunks < v1_count, "test setup should produce fewer v2 chunks"
-        # The load-bearing assertion: total chunks == v2's chunks, not v1_count.
         assert clean_store.count_chunks(_P1_CHUNK_SET_ID) == v2.num_chunks
 
     def test_partial_failure_leaves_docrow_absent(
@@ -549,16 +487,11 @@ class TestProcessEntryIntegration:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        # Guards C1: if the chunk write path fails, the document row's new
-        # content_hash must NOT be committed. Otherwise the next run's
-        # idempotency check would silently skip a doc with no chunks.
         monkeypatch.setattr(ingest_mod, "CORPUS_ROOT", tmp_path / "corpus")
         dest = tmp_path / "corpus" / "test/A1_fake.pdf"
         write_pdf(dest, ["Zeta " * 100])
         entry = _make_entry("test/A1_fake.pdf")
 
-        # Embedder that produces WRONG-DIMENSION vectors — upsert_chunks
-        # raises ValueError at the dim guard, mid-transaction.
         class _BadDimEmbedder:
             calls = 0
 
@@ -566,13 +499,13 @@ class TestProcessEntryIntegration:
                 self, texts: list[str], *, run_id: str | None = None
             ) -> list[list[float]]:
                 self.calls += 1
-                return [[0.1] * 4 for _ in texts]  # dim=4, not EMBEDDING_DIM
+                return [[0.1] * 4 for _ in texts]
 
         embedder = _BadDimEmbedder()
         result = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -582,7 +515,6 @@ class TestProcessEntryIntegration:
         )
         assert result.status == "error"
 
-        # Neither the doc row NOR any chunks should be committed.
         with clean_store.conn.cursor() as cur:
             cur.execute("SELECT COUNT(*) FROM documents WHERE doc_path = %s", (entry.dest_path,))
             row = cur.fetchone()
@@ -602,7 +534,7 @@ class TestProcessEntryIntegration:
         result = ingest_mod._process_entry(
             entry,
             store=clean_store,
-            embedder=embedder,  # type: ignore[arg-type]
+            embedder=embedder,
             cfg=_P1_CFG,
             chunker=_p1_chunker,
             force=False,
@@ -611,18 +543,8 @@ class TestProcessEntryIntegration:
             logger=_QuietLogger(),
         )
         assert result.status == "missing"
-        # This entry isn't in the real manifest, so _is_required returns True
-        # by default. The optional flag on the manifest entry is what would
-        # spare it in the real summary — the process_entry step logs the
-        # difference (warning vs error) but returns the same "missing" status.
 
 
-# ── Structural guard ──────────────────────────────────────────────────
-
-
-# Structural guard: _FakeEmbedder must expose the same duck-typed method
-# ingest calls. If VoyageEmbedder.embed_documents signature drifts, this
-# test catches it before an integration run tries to embed 71 PDFs.
 def test_fake_embedder_signature_matches_real() -> None:
     import inspect
 

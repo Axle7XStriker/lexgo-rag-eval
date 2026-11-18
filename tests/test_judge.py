@@ -1,10 +1,6 @@
-"""ClaudeJudge tests. Fully offline via a fake `anthropic.Anthropic` client.
+"""ClaudeJudge tests.
 
-Mirrors tests/test_generate.py: dependency-injection seam via `client=`,
-tenacity's `wait` zeroed with monkeypatch for retry tests. The Anthropic
-client fake + error factories are imported from `tests/_anthropic_fakes`.
-
-Scope: judge-specific behavior only — the strict-JSON contract, judge
+Covers: judge-specific behavior only — the strict-JSON contract, judge
 prompt loading, and the `operation="judge_answer"` log record. Retry,
 pricing, and the `is_retryable` policy live in test_generate.py; both
 classes route through the shared helpers in `src.pipeline.anthropic_utils`.
@@ -31,8 +27,6 @@ from tests._anthropic_fakes import (
     read_log,
 )
 
-# ── Fixtures / helpers ────────────────────────────────────────────────
-
 
 @pytest.fixture
 def log_path(tmp_path: Path) -> Path:
@@ -41,14 +35,8 @@ def log_path(tmp_path: Path) -> Path:
 
 @pytest.fixture(autouse=True)
 def _judge_prompt_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the judge's prompt loader at a minimal fixture prompt in tmp_path.
-
-    Keeps tests decoupled from the shipped `prompts/judge/v1.md` wording so
-    a prompt-content edit doesn't break unit tests here.
-    """
+    """Point the judge's prompt loader at a minimal fixture prompt in tmp_path."""
     prompt_path = tmp_path / "prompts" / "judge" / "v1.md"
-    # exist_ok=True: if another autouse fixture ever also creates prompts/
-    # under this tmp_path, the second one shouldn't blow up on FileExistsError.
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(
         """---
@@ -127,9 +115,6 @@ def _judge_kwargs(**overrides) -> dict:
     return base
 
 
-# ── Tests ─────────────────────────────────────────────────────────────
-
-
 class TestHappyPath:
     """A successful judge() parses the JSON reply into a JudgeResult."""
 
@@ -157,7 +142,6 @@ class TestHappyPath:
         assert r.cost_usd == pytest.approx(cost_for("claude-haiku-5-5", 180, 25))
 
     def test_handles_surrounding_whitespace(self, log_path: Path) -> None:
-        """Leading/trailing whitespace in the reply is stripped before json.loads."""
         payload = (
             "\n\n  "
             + json.dumps(
@@ -185,7 +169,6 @@ class TestHappyPath:
         assert r.citations_semantically_valid is True
 
     def test_forwards_request_shape(self, log_path: Path) -> None:
-        """judge() sends the substituted prompt as system + user to the SDK."""
         client = FakeClient(messages=FakeMessagesAPI(responses=[_canned_verdict()]))
         j = _make_judge(client=client, log_path=log_path)
         j.judge(
@@ -200,18 +183,13 @@ class TestHappyPath:
         assert len(client.messages.calls) == 1
         call = client.messages.calls[0]
         assert call["model"] == "claude-haiku-5-5"
-        # Max_tokens 1024 leaves headroom for a verbose rationale + JSON
-        # envelope so a borderline Q&A doesn't truncate into JudgeParseError.
         assert call["thinking"] == {"type": "disabled"}
         assert call["max_tokens"] == 1024
-        # Sentinel substituted from the code constant, not a raw literal.
         assert OUT_OF_CORPUS_SENTINEL in call["system"]
         assert "{out_of_corpus_sentinel}" not in call["system"]
-        # User body contains substituted placeholders.
         assert "Q: Q?" in call["messages"][0]["content"]
         assert "GA: GA" in call["messages"][0]["content"]
         assert "MA: MA" in call["messages"][0]["content"]
-        # Empty citation lists render as `(none)` — unambiguous for the model.
         assert "GC: (none)" in call["messages"][0]["content"]
         assert "MC: (none)" in call["messages"][0]["content"]
 
@@ -224,8 +202,6 @@ class TestParseErrors:
             messages=FakeMessagesAPI(
                 responses=[
                     FakeMessage(
-                        # Bare token — obviously not JSON, and doesn't share
-                        # substrings with the JudgeParseError message.
                         content=[FakeTextBlock(text="???")],
                         usage=FakeUsage(input_tokens=1, output_tokens=1),
                     )
@@ -237,7 +213,6 @@ class TestParseErrors:
             j.judge(**_judge_kwargs())
 
     def test_missing_required_key(self, log_path: Path) -> None:
-        """A reply missing `rationale` raises JudgeParseError with the field named."""
         bad = json.dumps({"answer_correct": True, "citations_semantically_valid": True})
         client = FakeClient(
             messages=FakeMessagesAPI(
@@ -254,7 +229,6 @@ class TestParseErrors:
             j.judge(**_judge_kwargs())
 
     def test_wrong_type_answer_correct(self, log_path: Path) -> None:
-        """`answer_correct: "yes"` (string, not bool) raises JudgeParseError."""
         bad = json.dumps(
             {
                 "answer_correct": "yes",
@@ -277,7 +251,6 @@ class TestParseErrors:
             j.judge(**_judge_kwargs())
 
     def test_empty_rationale_rejected(self, log_path: Path) -> None:
-        """A blank / whitespace-only rationale defeats the audit column — reject it."""
         bad = json.dumps(
             {
                 "answer_correct": True,
@@ -300,12 +273,11 @@ class TestParseErrors:
             j.judge(**_judge_kwargs())
 
     def test_empty_response_content_rejected(self, log_path: Path) -> None:
-        """Zero text blocks → text=='' → not valid JSON → JudgeParseError."""
         client = FakeClient(
             messages=FakeMessagesAPI(
                 responses=[
                     FakeMessage(
-                        content=[],  # no text blocks at all
+                        content=[],
                         usage=FakeUsage(input_tokens=1, output_tokens=0),
                     )
                 ]
@@ -316,7 +288,6 @@ class TestParseErrors:
             j.judge(**_judge_kwargs())
 
     def test_non_object_reply(self, log_path: Path) -> None:
-        """A JSON array reply is well-formed JSON but not the required object shape."""
         client = FakeClient(
             messages=FakeMessagesAPI(
                 responses=[
@@ -332,7 +303,6 @@ class TestParseErrors:
             j.judge(**_judge_kwargs())
 
     def test_parse_error_still_logs(self, log_path: Path) -> None:
-        """A malformed reply is still a paid API call — cost accounting stays honest."""
         client = FakeClient(
             messages=FakeMessagesAPI(
                 responses=[
@@ -378,7 +348,6 @@ class TestLogging:
         assert r["cost_usd"] == pytest.approx(cost_for("claude-haiku-5-5", 222, 44), abs=1e-6)
 
     def test_exactly_one_log_per_call(self, log_path: Path) -> None:
-        """Even after multiple judge() calls, count == calls (no double logging)."""
         client = FakeClient(
             messages=FakeMessagesAPI(
                 responses=[_canned_verdict(), _canned_verdict(), _canned_verdict()]

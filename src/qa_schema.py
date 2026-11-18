@@ -5,10 +5,7 @@ reads from this file. The whole eval's credibility rides on these records
 being internally consistent, so validation is strict and enforced in one
 place.
 
-Storage: `evals/golden/qa.jsonl` — one record per line, hand-authored (LLM
-generation prohibited, per CLAUDE.md). Rewrites go through
-`save_jsonl_atomic` — never append-mode after the first write — so add/
-edit/delete share one code path and a crash can never leave a half-file.
+Storage: `evals/golden/qa.jsonl`
 """
 
 from __future__ import annotations
@@ -28,15 +25,15 @@ SCHEMA_VERSION = 1
 
 
 class SourceId(StrEnum):
-    A1 = "A1"  # 6.006 lectures (full F11 set)
-    A2 = "A2"  # 6.006 recitations (full F11 set)
-    A3 = "A3"  # 6.006 problem sets + solutions
-    A4 = "A4"  # 6.006 textbook — CLRS 3rd ed
-    B1 = "B1"  # 6.830 lectures
-    B2 = "B2"  # 6.830 quizzes + solutions
-    B3 = "B3"  # 6.830 papers: query proc / txn / concurrency / column stores
-    B4 = "B4"  # 6.830 textbook — Red Book 4th ed
-    B5 = "B5"  # 6.830 textbook — Ramakrishnan/Gehrke DMS 3rd ed
+    A1 = "A1"
+    A2 = "A2"
+    A3 = "A3"
+    A4 = "A4"
+    B1 = "B1"
+    B2 = "B2"
+    B3 = "B3"
+    B4 = "B4"
+    B5 = "B5"
 
 
 SOURCE_LABELS: dict[SourceId, str] = {
@@ -67,9 +64,8 @@ TARGET_DISTRIBUTION: dict[QAType, int] = {
     QAType.OUT_OF_CORPUS: 10,
     QAType.ADVERSARIAL: 5,
 }
-GOLDEN_TOTAL = sum(TARGET_DISTRIBUTION.values())  # 100
+GOLDEN_TOTAL = sum(TARGET_DISTRIBUTION.values())
 
-# Single-letter type prefix used in QARecord.id (grep-friendly at a glance).
 ID_PREFIX_FOR_TYPE: dict[QAType, str] = {
     QAType.FACTUAL: "f",
     QAType.CROSS_SOURCE_SYNTHESIS: "x",
@@ -79,10 +75,7 @@ ID_PREFIX_FOR_TYPE: dict[QAType, str] = {
 }
 
 
-# doc_path is relative to corpus/ and must match the filename pattern used by
-# scripts/corpus_manifest.py: <course>/<kind>/<source_id>_<slug>.pdf. The
-# source_id is derived from the filename's 2-char prefix (A1 / B3 / ...) — we
-# never store it on disk, so there's exactly one source of truth per citation.
+# doc_path is relative to corpus/
 DOC_PATH_PATTERN = re.compile(r"^6\.(?:006|830)/[a-z_]+/(A[1-4]|B[1-5])_[a-z0-9_]+\.pdf$")
 
 
@@ -126,7 +119,7 @@ class Citation(BaseModel):
         cost is a single regex match; negligible.
         """
         m = DOC_PATH_PATTERN.match(self.doc_path)
-        if not m:  # unreachable — the validator would have fired
+        if not m:
             raise ValueError(f"cannot derive source_id from {self.doc_path!r}")
         return SourceId(m.group(1))
 
@@ -137,7 +130,6 @@ class QARecord(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: int = Field(default=SCHEMA_VERSION)
-    # Type-prefixed slug: f001, x012, p003, o004, a002. Prefix ↔ type is enforced below.
     id: str = Field(pattern=r"^[fxpoa]\d{3}$")
     type: QAType
     # question / gold_answer share the same 800-char ceiling. Bounds catch the
@@ -168,7 +160,6 @@ class QARecord(BaseModel):
 
     @model_validator(mode="after")
     def _cross_field_invariants(self) -> QARecord:
-        # 1. ID prefix must match type
         expected_prefix = ID_PREFIX_FOR_TYPE[self.type]
         if self.id[0] != expected_prefix:
             raise ValueError(
@@ -178,17 +169,14 @@ class QARecord(BaseModel):
 
         cited_sources = {c.source_id for c in self.gold_citations}
 
-        # 2. out_of_corpus: no citations
         if self.type == QAType.OUT_OF_CORPUS:
             if self.gold_citations:
                 raise ValueError("out_of_corpus questions must have no citations")
             return self
 
-        # 3. everything else: at least one citation
         if not self.gold_citations:
             raise ValueError(f"type {self.type.value} requires at least one citation")
 
-        # 4. cross_source_synthesis: >= 2 distinct source buckets
         if self.type == QAType.CROSS_SOURCE_SYNTHESIS and len(cited_sources) < 2:
             raise ValueError(
                 "cross_source_synthesis requires >= 2 distinct source_ids in citations"
@@ -197,11 +185,8 @@ class QARecord(BaseModel):
         return self
 
 
-# ── JSONL persistence ─────────────────────────────────────────────────
-
-
 class LineError(NamedTuple):
-    line_no: int  # 1-indexed
+    line_no: int
     raw: str
     error: str
 
@@ -245,8 +230,7 @@ def save_jsonl_atomic(path: Path, records: list[QARecord], *, backup: bool = Tru
 
     Writes to <path>.tmp, fsyncs, then os.replaces — a crash mid-write can
     never leave a half-file. If `backup` and path already exists, copies
-    the old file to <path>.bak first (cheap paranoia against a schema bug
-    destroying 100 hand-authored records).
+    the old file to <path>.bak first.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     if backup and path.exists():
@@ -256,9 +240,7 @@ def save_jsonl_atomic(path: Path, records: list[QARecord], *, backup: bool = Tru
     tmp = path.with_suffix(path.suffix + ".tmp")
     with tmp.open("w", encoding="utf-8") as f:
         for r in records:
-            # exclude_none keeps optional fields (currently `quote`, `notes`) out
-            # of the JSONL when unset — smaller diffs, less visual noise.
-            f.write(r.model_dump_json(exclude_none=True))
+            f.write(r.model_dump_json(exclude_none=True))  # Omit unset quote and notes.
             f.write("\n")
         f.flush()
         os.fsync(f.fileno())

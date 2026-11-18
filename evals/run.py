@@ -17,8 +17,8 @@ Design notes worth remembering:
     Same shape as `scripts/ingest.py` opens one embedder + store for the
     document loop.
   - Pipelines are registered in `src.pipeline.pipeline_config.PIPELINES`;
-    `--pipeline` accepts any key from that registry. Adding P2..P4 is a
-    one-line dict entry, not a change here.
+    `--pipeline` accepts any key from that registry. A new pipeline is a
+    registry entry, not a change here.
   - Malformed golden file is FATAL. Same contract as `make validate`:
     refuse to run against a broken qa.jsonl rather than silently evaluating
     the parseable subset.
@@ -111,11 +111,10 @@ def _run_one(
     reranker_config: RerankerConfig | None,
     run_id: str,
 ) -> QAResult:
-    """Evaluate one record end-to-end. Never raises — catches → error field.
+    """Evaluate one record. Pipeline and judge failures become `QAResult.error`.
 
-    Returns a `QAResult` with `error` set to a short string when any step
-    raises after its own retries have been exhausted. The caller decides
-    what to do with that (log + continue is the current policy).
+    Setup before those calls can still raise. The caller logs a recorded
+    error and continues.
     """
     gold_doc_paths = [c.doc_path for c in record.gold_citations]
     gold = gold_pages([(c.doc_path, c.page_or_section) for c in record.gold_citations])
@@ -134,9 +133,7 @@ def _run_one(
             run_id=run_id,
         )
     except Exception as e:
-        # Everything from `answer_question` (embed, retrieve, rerank, generate)
-        # is already retried at the provider client level. A raised exception
-        # here is a terminal failure for this Q&A — record it and move on.
+        # Provider clients already retried. This failure is terminal for the question.
         elapsed_ms = (time.perf_counter() - started) * 1000
         cause = e.cause if isinstance(e, QueryExecutionError) else e
         rerank_cost_usd = e.rerank_cost_usd if isinstance(e, QueryExecutionError) else 0.0
@@ -184,10 +181,7 @@ def _run_one(
             run_id=run_id,
         )
     except Exception as e:
-        # Judge failure is recoverable: the pipeline output is preserved,
-        # programmatic metrics are still computed, but accuracy is unknown
-        # for this Q&A. The record lands with error set so the operator
-        # notices; aggregate metrics drop it from the accuracy denominator.
+        # Keep the pipeline output. Accuracy stays unknown and leaves the denominator.
         elapsed_ms = query_result.latency_ms
         return QAResult(
             qa_id=record.id,
@@ -264,8 +258,7 @@ def _snapshot_llm_calls(source: Path, dest: Path, run_id: str) -> int:
             try:
                 rec = json.loads(stripped)
             except json.JSONDecodeError:
-                # A corrupted line elsewhere in the log is not our problem.
-                continue
+                continue  # A bad line in the shared log is not this run's record.
             if rec.get("run_id") == run_id:
                 fout.write(stripped + "\n")
                 written += 1
@@ -345,6 +338,7 @@ def _write_summary_md(
     lines.append(f"- embedding model: `{models['embedding_model']}`")
     lines.append(f"- chunker: `{chunker_cfg['algorithm']}` ({_chunker_summary(chunker_cfg)})")
     lines.append(f"- retriever: `{retriever_cfg['kind']}`, top_k={retriever_cfg['top_k']}")
+    # Always show the row so a pipeline without a reranker reads as n/a.
     if reranker_cfg is not None:
         lines.append(
             f"- reranker: `{reranker_cfg['provider']}`/`{reranker_cfg['model']}`, "
@@ -377,7 +371,9 @@ def _write_summary_md(
     lines.append(f"| cost — generate | ${metrics.total_generate_cost_usd:.4f} |")
     lines.append(f"| cost — judge | ${metrics.total_judge_cost_usd:.4f} |")
     lines.append(f"| cost — generate + judge | ${metrics.total_generate_judge_cost_usd:.4f} |")
-    lines.append(f"| cost — rerank | ${metrics.total_rerank_cost_usd:.4f} |")
+    lines.append(  # 0.0 still shows that this run did not rerank.
+        f"| cost — rerank | ${metrics.total_rerank_cost_usd:.4f} |"
+    )
     lines.append(
         f"| cost — generate + judge + rerank | "
         f"${metrics.total_generate_judge_rerank_cost_usd:.4f} |"
@@ -428,15 +424,13 @@ def main() -> int:
     )
     parser.add_argument(
         "--log-level",
-        default=settings.log_level,
+        default=settings.log_level,  # Settings reads .env; os.environ would miss it.
     )
     args = parser.parse_args()
 
     configure_logging(args.log_level)
     logger = get_logger("evals.run")
 
-    # Load + strict-validate the golden file up front — refuse to run against
-    # a broken qa.jsonl.
     records, per_line_errors = load_jsonl(args.qa_path)
     if per_line_errors:
         print(f"\nCannot evaluate: {args.qa_path} has {len(per_line_errors)} parse/schema errors:")
@@ -555,6 +549,8 @@ def main() -> int:
             "answer": ANSWER_PROMPT_VERSION,
             "judge": JUDGE_PROMPT_VERSION,
         },
+        # Pipeline identity stays in config.pipeline. Model ids sit beside it
+        # because a model change does not mint a new pipeline tag.
         "config": {
             "pipeline": pipeline_to_manifest_dict(cfg),
             "models": {

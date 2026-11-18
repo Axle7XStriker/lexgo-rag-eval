@@ -1,7 +1,6 @@
 """Tests for the CLI validator + its manifest cross-check.
 
-Separate from test_qa_schema — those tests exercise the pydantic model in
-isolation; these exercise the eval-run-time invariants (distribution,
+Covers: the eval-run-time invariants (distribution,
 duplicate ids, unknown doc_paths).
 """
 
@@ -13,9 +12,6 @@ from evals.validate_golden import KNOWN_DOC_PATHS, validate_golden
 from scripts.corpus_manifest import MANIFEST
 from src.qa_schema import Citation, QARecord, QAType, save_jsonl_atomic
 
-# Pick two real corpus paths from the manifest (any two will do — they're
-# guaranteed to exist by construction). Using .pop() on a set is order-nondeterministic;
-# sort first for a stable test.
 _SORTED_KNOWN = sorted(KNOWN_DOC_PATHS)
 _A_PATH = next(p for p in _SORTED_KNOWN if "/A1_" in p or "A1_" in p.split("/")[-1])
 _B_PATH = next(p for p in _SORTED_KNOWN if "/B1_" in p or "B1_" in p.split("/")[-1])
@@ -45,9 +41,8 @@ def test_validator_clean_report(tmp_path: Path) -> None:
 
 def test_validator_flags_unknown_doc_path(tmp_path: Path) -> None:
     path = tmp_path / "qa.jsonl"
-    # Well-formatted doc_path that isn't in the manifest.
     fake_but_valid = "6.006/lectures/A1_lec99.pdf"
-    assert fake_but_valid not in KNOWN_DOC_PATHS  # sanity
+    assert fake_but_valid not in KNOWN_DOC_PATHS
     save_jsonl_atomic(path, [_factual("f001", fake_but_valid)], backup=False)
     report = validate_golden(path)
     assert not report.is_clean
@@ -65,15 +60,6 @@ def test_validator_flags_duplicate_ids(tmp_path: Path) -> None:
 
 
 def test_every_manifest_entry_is_citable(tmp_path: Path) -> None:
-    # Drift guard for DOC_PATH_PATTERN vs manifest naming: constructing a
-    # Citation for every manifest dest_path (via `_factual`) fires the
-    # schema regex; a new source whose dest_path shape the regex rejects
-    # raises ValidationError here loudly.
-    #
-    # The save+validate round-trip additionally exercises the golden-set
-    # cross-field rules on a batch that size. (KNOWN_DOC_PATHS is derived
-    # from MANIFEST in the same module the test imports from, so a
-    # membership check would be tautological — omitted intentionally.)
     records = [_factual(f"f{i:03d}", e.dest_path) for i, e in enumerate(MANIFEST)]
     path = tmp_path / "qa.jsonl"
     save_jsonl_atomic(path, records, backup=False)

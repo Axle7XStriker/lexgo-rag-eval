@@ -1,12 +1,11 @@
-"""Schema-invariant tests. Small, but every one enforces a rule that would
-cost 100 re-authorings if broken — treat as load-bearing.
+"""Schema-invariant tests.
 
-Grouped into pytest classes by concern:
-  - TestCitation: doc_path format, source_id derivation, extra-field rejection
-  - TestQARecordInvariants: cross-field rules on QARecord (id prefix, per-type shape)
-  - TestQARecordDerivedSources: `sources` computed property
-  - TestPersistence: load/save JSONL round-trip, atomic backup
-  - TestHelpers: next_id_for_type, distribution + enum coverage
+Covers:
+  - doc_path format, source_id derivation, extra-field rejection
+  - cross-field rules on QARecord (id prefix, per-type shape)
+  - `sources` computed property
+  - load/save JSONL round-trip, atomic backup
+  - next_id_for_type, distribution + enum coverage
 """
 
 from __future__ import annotations
@@ -28,10 +27,6 @@ from src.qa_schema import (
     next_id_for_type,
     save_jsonl_atomic,
 )
-
-# ── Fixture helpers ───────────────────────────────────────────────────
-# Kept as functions (not @pytest.fixture) so tests can mutate the dict
-# before validation to exercise negative paths.
 
 
 def _valid_factual(id_: str = "f001") -> dict:
@@ -82,22 +77,18 @@ def _valid_out_of_corpus() -> dict:
     }
 
 
-# ─────────────────────────────────────────────────────────────────────
 class TestCitation:
     """Citation validates its doc_path, derives source_id, and forbids extras."""
 
     def test_doc_path_format_enforced(self) -> None:
-        # Wrong course prefix
         with pytest.raises(ValidationError, match="doc_path"):
             Citation.model_validate(
                 {"doc_path": "6.999/lectures/A1_lec01.pdf", "page_or_section": "x"}
             )
-        # Missing source_id prefix on the filename
         with pytest.raises(ValidationError, match="doc_path"):
             Citation.model_validate(
                 {"doc_path": "6.006/lectures/lec01.pdf", "page_or_section": "x"}
             )
-        # Bogus source_id prefix on the filename
         with pytest.raises(ValidationError, match="doc_path"):
             Citation.model_validate(
                 {"doc_path": "6.006/lectures/Z9_lec01.pdf", "page_or_section": "x"}
@@ -110,12 +101,10 @@ class TestCitation:
     def test_source_id_not_serialized(self) -> None:
         c = Citation(doc_path="6.006/lectures/A1_lec03.pdf", page_or_section="slide 12")
         dumped = c.model_dump()
-        # source_id is derived — the disk representation is doc_path only.
         assert "source_id" not in dumped
         assert dumped["doc_path"] == "6.006/lectures/A1_lec03.pdf"
 
     def test_rejects_explicit_source_id(self) -> None:
-        # extra="forbid" catches attempts to override the derived source_id.
         with pytest.raises(ValidationError):
             Citation.model_validate(
                 {
@@ -128,10 +117,10 @@ class TestCitation:
     @pytest.mark.parametrize(
         "doc_path",
         [
-            "6.006/lectures/A0_lec01.pdf",  # A[1-4] range: 0 rejected
-            "6.006/lectures/A5_lec01.pdf",  # A[1-4] range: 5 rejected
-            "6.830/lectures/B6_lec01.pdf",  # B[1-5] range: 6 rejected
-            "6.830/lectures/B0_lec01.pdf",  # B[1-5] range: 0 rejected
+            "6.006/lectures/A0_lec01.pdf",
+            "6.006/lectures/A5_lec01.pdf",
+            "6.830/lectures/B6_lec01.pdf",
+            "6.830/lectures/B0_lec01.pdf",
         ],
     )
     def test_doc_path_rejects_out_of_range_ids(self, doc_path: str) -> None:
@@ -139,7 +128,6 @@ class TestCitation:
             Citation.model_validate({"doc_path": doc_path, "page_or_section": "x"})
 
 
-# ─────────────────────────────────────────────────────────────────────
 class TestQARecordInvariants:
     """QARecord's cross-field rules: id-prefix ↔ type + per-type citation shape."""
 
@@ -151,7 +139,7 @@ class TestQARecordInvariants:
         QARecord.model_validate(factory())
 
     def test_id_prefix_must_match_type(self) -> None:
-        data = _valid_factual(id_="p001")  # 'p' prefix, but type=factual
+        data = _valid_factual(id_="p001")
         with pytest.raises(ValidationError, match="does not match type"):
             QARecord.model_validate(data)
 
@@ -165,7 +153,6 @@ class TestQARecordInvariants:
 
     def test_cross_source_requires_two_distinct_sources(self) -> None:
         data = _valid_cross_source()
-        # One citation → only one source_id bucket → violates cross_source_synthesis.
         data["gold_citations"] = [
             {"doc_path": "6.830/lectures/B1_lec04.pdf", "page_or_section": "Lec 4"}
         ]
@@ -180,7 +167,7 @@ class TestQARecordInvariants:
 
     def test_gold_answer_min_length(self) -> None:
         data = _valid_factual()
-        data["gold_answer"] = "too short"  # < 50 chars
+        data["gold_answer"] = "too short"
         with pytest.raises(ValidationError):
             QARecord.model_validate(data)
 
@@ -190,17 +177,13 @@ class TestQARecordInvariants:
         QARecord.model_validate(data)
 
     def test_rejects_explicit_sources(self) -> None:
-        # `sources` is derived, not a field — extra="forbid" catches it.
         data = _valid_factual()
         data["sources"] = ["A1"]
         with pytest.raises(ValidationError):
             QARecord.model_validate(data)
 
 
-# ─────────────────────────────────────────────────────────────────────
 class TestQARecordDerivedSources:
-    """QARecord.sources is a derived @cached_property, not a stored field."""
-
     def test_single_source(self) -> None:
         r = QARecord.model_validate(_valid_factual())
         assert r.sources == [SourceId.A1]
@@ -215,15 +198,11 @@ class TestQARecordDerivedSources:
 
     def test_sources_not_serialized(self) -> None:
         r = QARecord.model_validate(_valid_factual())
-        # `sources` must NOT appear on disk — grep-by-bucket uses `doc_path` instead.
         assert "sources" not in r.model_dump()
 
     def test_sources_recomputed_on_copy_with_new_citations(self) -> None:
-        # Regression guard: cached_property on a Pydantic v2 model must NOT carry
-        # a stale cached value across model_copy(update=...). If this ever fails,
-        # switch `sources` to @property (recompute-on-access) — cost is negligible.
         r = QARecord.model_validate(_valid_cross_source())
-        assert r.sources == [SourceId.B1, SourceId.B2]  # warm the cache
+        assert r.sources == [SourceId.B1, SourceId.B2]
         r2 = r.model_copy(
             update={
                 "gold_citations": [
@@ -239,7 +218,6 @@ class TestQARecordDerivedSources:
         )
 
 
-# ─────────────────────────────────────────────────────────────────────
 class TestPersistence:
     """JSONL load/save round-trip, error reporting, and atomic backup."""
 
@@ -272,13 +250,12 @@ class TestPersistence:
         assert path.with_suffix(".jsonl.bak").exists()
 
 
-# ─────────────────────────────────────────────────────────────────────
 class TestHelpers:
     """next_id_for_type + module-level invariants (distribution, enum coverage)."""
 
     def test_next_id_for_type_gap_ok(self) -> None:
         r1 = QARecord.model_validate(_valid_factual("f001"))
-        r2 = QARecord.model_validate(_valid_factual("f003"))  # gap OK — we take max+1
+        r2 = QARecord.model_validate(_valid_factual("f003"))
         assert next_id_for_type([r1, r2], QAType.FACTUAL) == "f004"
 
     def test_next_id_for_empty_type_starts_at_001(self) -> None:

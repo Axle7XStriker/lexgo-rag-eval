@@ -1,22 +1,4 @@
-"""Anthropic Claude generator with retry, prompt versioning, and per-call cost logging.
-
-One class, `ClaudeGenerator`. One method: `generate(system, user, prompt_version)`.
-
-Design notes worth remembering:
-  - Mirrors `VoyageEmbedder` line-for-line (see `src/pipeline/embed.py`): sync
-    client, `SecretStr` key, `tenacity` retries on transient exceptions only,
-    fail-fast on unknown model in `__init__`, exactly one `log_llm_call` per
-    API call, dependency-injection seam via `client=` for tests.
-  - Shared with `ClaudeJudge`: `is_retryable`, `cost_for`, `PRICING`, and
-    `PROVIDER` live in `src.pipeline.anthropic_utils` so a change there
-    (new retryable exception, price adjustment) is a one-file edit.
-  - Thinking is disabled. Haiku 5.5 turns adaptive thinking on by default
-    and those tokens count toward `max_tokens`; leaving it on can consume
-    the 1024-token answer budget before any text is returned.
-  - Sampling parameters are omitted. Haiku 5.5 returns 400 if `temperature`,
-    `top_p`, or `top_k` is sent.
-  - Prompt prefill is not used. Haiku 5.5 rejects a trailing assistant turn.
-"""
+"""Anthropic Claude generator with retry, prompt versioning, and per-call cost logging."""
 
 from __future__ import annotations
 
@@ -46,7 +28,7 @@ DEFAULT_MAX_TOKENS = 1024
 
 @dataclass(frozen=True)
 class GenerateResult:
-    """Return shape of `ClaudeGenerator.generate` — the pipeline reads all four."""
+    """Return shape of `ClaudeGenerator.generate"""
 
     text: str
     input_tokens: int
@@ -55,11 +37,7 @@ class GenerateResult:
 
 
 class ClaudeGenerator:
-    """Sync Anthropic client wrapper with retry, cost accounting, and per-call logging.
-
-    Not thread-safe (the underlying `Anthropic` client isn't documented as
-    such). Fine for the batch eval loop and single-request Streamlit path.
-    """
+    """Sync Anthropic client wrapper with retry, cost accounting, and per-call logging."""
 
     def __init__(
         self,
@@ -69,8 +47,6 @@ class ClaudeGenerator:
         log_path: Path,
         client: Anthropic | None = None,
     ) -> None:
-        # Fail fast on unknown models: a silent $0 per-call cost would poison
-        # the blog's cost story with no visible signal.
         if model not in PRICING:
             raise ValueError(
                 f"unknown Anthropic model {model!r}; add its price to "
@@ -79,7 +55,6 @@ class ClaudeGenerator:
             )
         self._model = model
         self._log_path = log_path
-        # `client` injection is the seam tests use — no HTTP mock required.
         self._client = client or Anthropic(api_key=api_key.get_secret_value())
 
     @property
@@ -95,7 +70,6 @@ class ClaudeGenerator:
         max_tokens: int = DEFAULT_MAX_TOKENS,
         run_id: str | None = None,
     ) -> GenerateResult:
-        """One Anthropic messages.create call. Wraps _call for tenacity retries."""
         return self._call(
             system=system,
             user=user,
@@ -119,7 +93,7 @@ class ClaudeGenerator:
         max_tokens: int,
         run_id: str | None,
     ) -> GenerateResult:
-        """One API call. Wrapped in tenacity — do not call directly from tests."""
+        """One Anthropic messages.create call. Wraps _call for tenacity retries."""
         started = time.perf_counter()
         response = self._client.messages.create(
             model=self._model,
@@ -130,10 +104,9 @@ class ClaudeGenerator:
         )
         elapsed_ms = (time.perf_counter() - started) * 1000
 
-        # Concatenate every text block. Joining is safer than indexing
-        # content[0]: a split answer, or a thinking block ahead of the text,
-        # still leaves us with the reply.
-        text_parts = [b.text for b in response.content if getattr(b, "type", None) == "text"]
+        text_parts = [  # Keep every text block. A split response is still one answer.
+            b.text for b in response.content if getattr(b, "type", None) == "text"
+        ]
         text = "".join(text_parts)
 
         input_tokens = int(getattr(response.usage, "input_tokens", 0) or 0)
@@ -154,8 +127,6 @@ class ClaudeGenerator:
             extra={
                 "max_tokens": max_tokens,
                 "thinking": "disabled",
-                # stop_reason is load-bearing for debugging refusal / max_tokens
-                # truncation — cheap to record, expensive to reconstruct later.
                 "stop_reason": getattr(response, "stop_reason", None),
             },
         )
@@ -174,5 +145,4 @@ def make_generator(
     log_path: Path,
     client: Anthropic | None = None,
 ) -> ClaudeGenerator:
-    """Convenience factory. Kept thin — most callers instantiate directly."""
     return ClaudeGenerator(api_key=api_key, model=model, log_path=log_path, client=client)

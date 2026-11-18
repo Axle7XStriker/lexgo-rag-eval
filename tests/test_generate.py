@@ -1,10 +1,14 @@
-"""ClaudeGenerator tests. Fully offline via a fake `anthropic.Anthropic` client.
+"""ClaudeGenerator tests.
 
-Mirrors tests/test_embed.py: dependency-injection seam via `client=`,
-tenacity's `wait` zeroed with monkeypatch for retry tests.
-
-The fake `Anthropic` client + error factories live in `tests/_anthropic_fakes.py`
-so `test_judge.py` shares the same wire fakes.
+Covers:
+    - Text generation
+    - Request shape
+    - Multiple text blocks
+    - Logging
+    - Retry
+    - Validation
+    - Pricing
+    - Retryable predicate
 """
 
 from __future__ import annotations
@@ -36,8 +40,6 @@ from tests._anthropic_fakes import (
     timeout_error,
 )
 
-# ── Fixtures / helpers ────────────────────────────────────────────────
-
 
 @pytest.fixture
 def log_path(tmp_path: Path) -> Path:
@@ -58,14 +60,10 @@ def _make_generator(
     )
 
 
-# ── Tests ─────────────────────────────────────────────────────────────
-
-
 class TestHappyPath:
     """A successful generate() returns the text and logs one record."""
 
     def test_returns_text_and_tokens(self, log_path: Path) -> None:
-        """Returns joined answer text + usage counts + cost derived from PRICING."""
         msg = FakeMessage(
             content=[FakeTextBlock(text="the answer is 42 [1]")],
             usage=FakeUsage(input_tokens=120, output_tokens=8),
@@ -78,12 +76,9 @@ class TestHappyPath:
         assert result.text == "the answer is 42 [1]"
         assert result.input_tokens == 120
         assert result.output_tokens == 8
-        # Cost derived from PRICING via cost_for so a price change here needs
-        # no test update — the source of truth is src/pricing.py.
         assert result.cost_usd == pytest.approx(cost_for("claude-haiku-5-5", 120, 8))
 
     def test_forwards_request_shape(self, log_path: Path) -> None:
-        """generate() forwards model, system, max_tokens, thinking, and messages to the SDK."""
         client = FakeClient()
         g = _make_generator(client=client, log_path=log_path)
         g.generate(
@@ -101,7 +96,6 @@ class TestHappyPath:
         assert call["messages"] == [{"role": "user", "content": "USER BODY"}]
 
     def test_multiple_text_blocks_are_joined(self, log_path: Path) -> None:
-        """Multiple text blocks are concatenated (defensive against future model tiers)."""
         msg = FakeMessage(
             content=[FakeTextBlock(text="part one "), FakeTextBlock(text="part two")],
             usage=FakeUsage(input_tokens=1, output_tokens=1),
@@ -116,7 +110,6 @@ class TestLogging:
     """Every successful call writes exactly one llm_calls.jsonl record."""
 
     def test_log_record_shape(self, log_path: Path) -> None:
-        """One successful call writes exactly one log record with all the expected fields."""
         msg = FakeMessage(
             content=[FakeTextBlock(text="hi")],
             usage=FakeUsage(input_tokens=200, output_tokens=50),
@@ -148,7 +141,6 @@ class TestLogging:
         assert r["cost_usd"] == pytest.approx(cost_for("claude-haiku-5-5", 200, 50), abs=1e-6)
 
     def test_no_log_on_failure(self, log_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-        """Exceptions during .create() must NOT write a log line — else cost accounting corrupts."""
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
             "wait",
@@ -186,7 +178,6 @@ class TestRetry:
         exc_factory,
         label: str,
     ) -> None:
-        """Each transient failure class triggers a retry; the second attempt succeeds."""
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
             "wait",
@@ -212,7 +203,6 @@ class TestRetry:
     def test_gives_up_after_max_attempts(
         self, log_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """A persistent transient failure re-raises after tenacity's attempt budget is exhausted."""
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
             "wait",
@@ -243,8 +233,6 @@ class TestRetry:
         exc_factory,
         label: str,
     ) -> None:
-        """Deterministic errors (auth / 400 / 404) surface after exactly one attempt."""
-        # Wait zeroed so if a retry mistakenly happens we still finish fast.
         monkeypatch.setattr(
             generate_module.ClaudeGenerator._call.retry,
             "wait",
@@ -260,15 +248,11 @@ class TestRetry:
         g = _make_generator(client=client, log_path=log_path)
         with pytest.raises(exc_factory().__class__):
             g.generate(system="s", user="u", prompt_version="v1")
-        # Deterministic errors must not retry — exactly one attempt.
         assert state["n"] == 1
 
 
 class TestValidation:
-    """Constructor guards on unknown model."""
-
     def test_unknown_model_rejected_at_init(self, log_path: Path) -> None:
-        """Unknown model raises at init — silent $0 cost would poison the eval numbers."""
         with pytest.raises(ValueError, match="unknown Anthropic model"):
             _make_generator(
                 client=FakeClient(),
@@ -278,55 +262,41 @@ class TestValidation:
 
 
 class TestPricing:
-    """Cost table stays honest; missing model degrades gracefully."""
-
     def test_haiku_present(self) -> None:
-        """The currently-used chat model is in PRICING with non-zero input+output rates."""
         assert "claude-haiku-5-5" in PRICING
         assert PRICING["claude-haiku-5-5"]["input"] > 0
         assert PRICING["claude-haiku-5-5"]["output"] > 0
 
     def test_output_more_expensive_than_input(self) -> None:
-        """Sanity: output rate > input rate for every Claude tier (catches an accidental swap)."""
         for rates in PRICING.values():
             assert rates["output"] > rates["input"]
 
     def test_unknown_model_zero_cost(self) -> None:
-        """Unknown model returns 0.0 cost (and logs a warning), rather than raising."""
         assert cost_for("model-that-does-not-exist", 1_000_000, 1_000_000) == 0.0
 
     def test_cost_calc(self) -> None:
-        """1M input + 1M output = (input_rate + output_rate) USD; expected derived from PRICING."""
         rates = PRICING["claude-haiku-5-5"]
         expected = rates["input"] + rates["output"]
         assert cost_for("claude-haiku-5-5", 1_000_000, 1_000_000) == pytest.approx(expected)
 
 
 class TestRetryablePredicate:
-    """The is_retryable predicate is load-bearing — test it directly too."""
-
     def test_rate_limit_retryable(self) -> None:
-        """Anthropic's RateLimitError is transient — worth retrying."""
         assert is_retryable(rate_limit()) is True
 
     def test_connection_retryable(self) -> None:
-        """A dropped connection is transient — worth retrying."""
         assert is_retryable(connection_error()) is True
 
     def test_timeout_retryable(self) -> None:
-        """APITimeoutError is transient — worth retrying (subclass of APIConnectionError)."""
         assert is_retryable(timeout_error()) is True
 
     @pytest.mark.parametrize("status", [500, 502, 503, 504, 599])
     def test_5xx_retryable(self, status: int) -> None:
-        """5xx server errors are transient — retry across the whole 5xx range."""
         assert is_retryable(server_error(status)) is True
 
     @pytest.mark.parametrize("status", [400, 401, 403, 404, 422])
     def test_4xx_not_retryable(self, status: int) -> None:
-        """4xx errors indicate a deterministic client mistake — retrying can't fix them."""
         assert is_retryable(server_error(status)) is False
 
     def test_random_exception_not_retryable(self) -> None:
-        """Non-Anthropic exceptions (a bug in our own code) must not silently retry."""
         assert is_retryable(RuntimeError("nope")) is False

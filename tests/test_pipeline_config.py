@@ -1,6 +1,6 @@
 """Pipeline-config registry tests.
 
-Load-bearing invariants:
+Covers:
   - `get_pipeline` errors are actionable — listing valid keys.
   - `PipelineConfig.tag` is a hybrid `<readable>_<hash>` and is unique per
     config. The mutation-safety test enumerates every mutable field and
@@ -29,8 +29,6 @@ from src.pipeline.pipeline_config import (
     pipeline_to_manifest_dict,
 )
 
-# ── Shared test fixture ───────────────────────────────────────────────
-
 TEST_PIPELINE_CFG = PipelineConfig(
     key="test",
     chunker=ChunkerConfig(
@@ -56,8 +54,6 @@ class TestGetPipeline:
         msg = str(exc_info.value)
         assert "'p9'" in msg
         assert "valid keys" in msg
-        # Every registered key should appear in the error — the message is
-        # the debugging surface, not just a "not found" signal.
         for key in PIPELINES:
             assert key in msg
 
@@ -75,28 +71,17 @@ class TestTagFormat:
     def test_unknown_algorithm_raises(self) -> None:
         cfg = PipelineConfig(
             key="pX",
-            # Bypass the Literal check with a cast-through-object so the test
-            # exercises the runtime `raise` in `_readable_prefix` (which
-            # exists precisely for the Literal drift case).
             chunker=ChunkerConfig(algorithm="fixed", target_tokens=1, overlap_tokens=0),
             retriever=RetrieverConfig(kind="dense", top_k=1),
             reranker=None,
         )
-        broken = replace(cfg, chunker=replace(cfg.chunker, algorithm="mystery"))  # type: ignore[arg-type]
+        broken = replace(cfg, chunker=replace(cfg.chunker, algorithm="mystery"))
         with pytest.raises(ValueError, match=r"unknown chunker\.algorithm"):
             _ = broken.tag
 
 
 class TestTagChangesOnFieldMutation:
-    """Load-bearing safety: mutating any single field must change the tag.
-
-    This is what makes the hash-suffix design trustworthy against future
-    field additions — a new `ChunkerConfig` field that isn't included in
-    `_readable_prefix` still lands in the hash, so the tag still changes.
-    If someone adds a field and BOTH omits it from `_readable_prefix` AND
-    breaks this test's iteration, it's a genuine bug — the test forces the
-    contributor to notice.
-    """
+    """Load-bearing safety: mutating any single field must change the tag."""
 
     def _all_tags_distinct(self, cfgs: list[PipelineConfig]) -> None:
         tags = [c.tag for c in cfgs]
@@ -137,10 +122,6 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_retriever_rrf_k(self) -> None:
-        # P3's fusion knob. rrf_k is None on dense pipelines (P1/P2), so
-        # None→60 must change the tag — otherwise a hybrid config added
-        # later would silently collide with an existing dense tag on the
-        # same top_k. Also exercise 60→30 to prove tuning re-hashes.
         base = TEST_PIPELINE_CFG
         variants = [
             base,
@@ -174,9 +155,6 @@ class TestTagChangesOnFieldMutation:
         assert base.tag != forked.tag
 
     def test_chunker_algorithm(self) -> None:
-        # Swapping algorithm implies swapping the surrounding fixed/semantic
-        # knobs to keep the config coherent. The hash MUST catch the shift
-        # even when both configs are otherwise well-formed for their algorithm.
         base = TEST_PIPELINE_CFG
         semantic = replace(base, chunker=replace(base.chunker, algorithm="semantic"))
         self._all_tags_distinct([base, semantic])
@@ -207,9 +185,6 @@ class TestTagChangesOnFieldMutation:
         self._all_tags_distinct(variants)
 
     def test_retriever_kind(self) -> None:
-        # `kind` is a Literal["dense", "hybrid"]; both are valid runtime
-        # values so no `type: ignore` is needed. P3 (hybrid) will lean on
-        # this — a `dense`↔`hybrid` swap MUST produce a fresh pipeline tag.
         base = TEST_PIPELINE_CFG
         variants = [
             base,
@@ -229,13 +204,9 @@ class TestTagChangesOnFieldMutation:
         )
 
     def test_reranker_provider(self) -> None:
-        # `provider` is currently Literal["cohere"] (single value). Cast
-        # through `type: ignore` to prove the hash includes this field even
-        # before a second provider joins the Literal — same trick as
-        # `test_unknown_algorithm_raises` uses for algorithm drift.
         base = TEST_PIPELINE_CFG
         rr_a = RerankerConfig(provider="cohere", model="rerank-english-v3.0", top_n=5)
-        rr_b = replace(rr_a, provider="voyage")  # type: ignore[arg-type]
+        rr_b = replace(rr_a, provider="voyage")
         self._all_tags_distinct(
             [
                 replace(base, reranker=rr_a),
@@ -245,17 +216,6 @@ class TestTagChangesOnFieldMutation:
 
 
 class TestTagMutationCoverage:
-    """Meta-guard: every field on every config dataclass has a mutation test
-    above. Introspects `dataclasses.fields()` so adding a new field without
-    a corresponding test fails CI loudly — the docstring's "safety net"
-    claim is only true if we enforce it here.
-
-    `PipelineConfig`'s sub-dataclass fields (`chunker`/`retriever`/`reranker`)
-    are covered transitively: any nested-field mutation test also mutates
-    the outer PipelineConfig field that holds the sub-config. Only the
-    scalar `key` needs a direct top-level test (it has one).
-    """
-
     _COVERED_CHUNKER_FIELDS: ClassVar[set[str]] = {
         "algorithm",
         "target_tokens",
@@ -302,8 +262,7 @@ class TestChunkSetId:
     Load-bearing properties:
       - Pipelines with equal `ChunkerConfig` derive the SAME id.
       - Pipelines with different `ChunkerConfig` derive DIFFERENT ids.
-      - Retriever / reranker mutations leave the id unchanged — the chunk
-        set is independent of retrieval choice.
+      - The chunk set is independent of retrieval choice.
       - Any `ChunkerConfig` field mutation rotates the id — a change to
         chunking must force a fresh ingest.
     """
@@ -356,10 +315,6 @@ class TestChunkSetId:
 
 class TestManifestSerialization:
     def test_round_trips_through_json(self) -> None:
-        # Manifest is written with `json.dumps`, so every field must be
-        # JSON-serializable via `default=str` (which the module uses in its
-        # hash payload too). Guards against a future dataclass field type
-        # that would break both.
         raw = pipeline_to_manifest_dict(TEST_PIPELINE_CFG)
         payload = json.dumps(raw, default=str)
         parsed = json.loads(payload)
@@ -371,7 +326,6 @@ class TestManifestSerialization:
         assert parsed["reranker"] is None
 
     def test_stores_derived_ids_at_top_level(self) -> None:
-        # Manifest readers should not have to reproduce either derivation.
         d = pipeline_to_manifest_dict(TEST_PIPELINE_CFG)
         assert d["tag"] == TEST_PIPELINE_CFG.tag
         assert d["chunk_set_id"] == TEST_PIPELINE_CFG.chunk_set_id

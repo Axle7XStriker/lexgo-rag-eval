@@ -1,10 +1,4 @@
-"""Shared Streamlit widgets and startup helpers.
-
-Both `pages/1_Demo.py` and `pages/2_Author.py` need the same settings
-bootstrap and sidebar. Putting them here avoids two page files drifting apart.
-Per-page browser-tab icons live on each page's `st.set_page_config(page_icon=...)`
-call — filenames stay plain so `git`, `ls`, and shell completion stay ergonomic.
-"""
+"""Shared Streamlit widgets and startup helpers."""
 
 from __future__ import annotations
 
@@ -32,7 +26,6 @@ def load_settings_or_stop() -> Settings:
 
 
 def render_sidebar(settings: Settings) -> None:
-    """Consistent sidebar across all pages: model IDs + config health."""
     with st.sidebar:
         st.subheader("Config")
         st.write(f"**Chat:** `{settings.chat_model}`")
