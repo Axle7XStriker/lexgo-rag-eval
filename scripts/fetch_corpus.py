@@ -131,6 +131,7 @@ def _extract_pdf_href(html: str, base_url: str, prefer_containing: str | None = 
     tolerates a `?query` suffix. If `prefer_containing` is given, prefers the
     first href whose path contains that string (case-insensitive).
     """
+    # findall returns three groups per match. Keep the one group that is set.
     hrefs = [g for triple in _PDF_HREF_RE.findall(html) for g in triple if g]
     if not hrefs:
         raise FetchError(f"no .pdf href found on {base_url}")

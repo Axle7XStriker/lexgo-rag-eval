@@ -45,6 +45,7 @@ render_page_header(
 
 @st.cache_resource
 def _get_embedder(_settings: Settings) -> VoyageEmbedder:
+    """The leading underscore keeps Settings out of the cache key."""
     return VoyageEmbedder(
         api_key=_settings.voyage_api_key,
         model=_settings.embedding_model,
@@ -54,6 +55,7 @@ def _get_embedder(_settings: Settings) -> VoyageEmbedder:
 
 @st.cache_resource
 def _get_generator(_settings: Settings) -> ClaudeGenerator:
+    """The leading underscore keeps Settings out of the cache key."""
     return ClaudeGenerator(
         api_key=_settings.anthropic_api_key,
         model=_settings.chat_model,
@@ -63,6 +65,7 @@ def _get_generator(_settings: Settings) -> ClaudeGenerator:
 
 @st.cache_resource
 def _get_reranker(_settings: Settings, model: str) -> CohereReranker:
+    """The leading underscore keeps Settings out of the cache key. `model` stays in it."""
     return CohereReranker(
         api_key=_settings.cohere_api_key,
         model=model,
@@ -72,7 +75,11 @@ def _get_reranker(_settings: Settings, model: str) -> CohereReranker:
 
 @st.cache_resource
 def _get_store(database_url: str) -> VectorStore:
-    """Open the store once. The cached resource outlives a single query."""
+    """Open one store for the life of the cache.
+
+    `__enter__` has no matching `__exit__`. A per-query `with` would close
+    the connection the cache still holds.
+    """
     store = VectorStore(database_url)
     store.__enter__()
     return store
@@ -144,7 +151,7 @@ if submitted:
         except psycopg.Error as exc:
             _get_store.clear()
             _logger.exception("demo_db_error", run_id=run_id)
-            st.error(f"Database error ({type(exc).__name__}).")
+            st.error(f"Database error ({type(exc).__name__}).")  # str(exc) can hold the DSN.
             st.info("Run `make db-up && make ingest`, then retry.")
         except Exception as exc:
             _logger.exception("demo_query_error", run_id=run_id)
