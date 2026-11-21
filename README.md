@@ -4,8 +4,6 @@
 
 > Rigorously evaluating multi-source RAG over MIT 6.006 (Algorithms) + MIT 6.830 (Database Systems) course materials. Comparing dense / semantic-chunked / hybrid / hybrid+rerank retrieval strategies against 100 hand-curated golden Q&As.
 
----
-
 ## Reproduce
 
 Requires Python 3.12, [uv](https://docs.astral.sh/uv/), and Postgres with pgvector for ingest and eval.
@@ -33,8 +31,6 @@ The Streamlit app ships two pages:
   `evals/golden/qa.jsonl` with atomic file-rewrite semantics.
 
 `make help` lists all targets.
-
----
 
 ## System
 
@@ -65,8 +61,6 @@ flowchart LR
 **Query.** The question is embedded and matched against those chunks, by vector search or by vector search fused with full text. An optional rerank step reorders the matches. The chat model then writes an answer and cites the chunks it used. If nothing is retrieved, the answer says the question is outside the materials.
 
 **Eval and app.** Eval sends each golden question down that query path and asks a judge whether the answer matches the gold answer. Citation precision and recall compare page spans. The demo runs the same query path and shows the answer, the citations, and the retrieved chunks. The author page edits the golden set.
-
----
 
 ## Results
 
